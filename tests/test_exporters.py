@@ -61,6 +61,29 @@ def test_json_exporter(tmp_path: Path, sample_entries: list[LogEntry]) -> None:
     assert entry1["timestamp"] == "2023-01-01T12:00:00"
 
 
+def test_json_exporter_ensure_ascii(tmp_path: Path) -> None:
+    """Test JSON exporter honors ensure_ascii setting."""
+    output_file = tmp_path / "logs_ascii.json"
+    entries = [
+        LogEntry(
+            timestamp=datetime(2023, 1, 1, 12, 0, 0),
+            pid=1001,
+            tid=2001,
+            level="I",
+            tag="Unicode",
+            message="テスト",
+            raw="raw log line",
+            meta={},
+        )
+    ]
+
+    exporter = JsonLogExporter(indent=2, ensure_ascii=True)
+    exporter.export(entries, output_file)
+
+    content = output_file.read_text(encoding="utf-8")
+    assert "\\u30c6" in content
+
+
 def test_csv_exporter(tmp_path: Path, sample_entries: list[LogEntry]) -> None:
     """Test exporting logs to CSV."""
     output_file = tmp_path / "logs.csv"
