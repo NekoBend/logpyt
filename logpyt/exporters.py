@@ -54,8 +54,14 @@ class JsonLogExporter:
                 if not first:
                     f.write(",\n")
 
-                # Use model_dump_json for efficient serialization
-                f.write(entry.model_dump_json(indent=self.indent))
+                # Use json.dumps to honor ensure_ascii
+                f.write(
+                    json.dumps(
+                        entry.model_dump(mode="json"),
+                        ensure_ascii=self.ensure_ascii,
+                        indent=self.indent,
+                    )
+                )
                 first = False
             f.write("\n]")
 
