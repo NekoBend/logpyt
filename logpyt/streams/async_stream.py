@@ -461,12 +461,9 @@ class AsyncLogStream:
     async def pause(self) -> None:
         """Pause dispatching of log entries."""
         async with self._state_lock:
-            if self._state == StreamState.RUNNING:
-                self._state = StreamState.PAUSED
-                # Trigger callback manually if needed, or use _set_state
+            should_pause = self._state == StreamState.RUNNING
 
-        # Using _set_state is safer for callbacks
-        if self.state == StreamState.RUNNING:
+        if should_pause:
             await self._set_state(StreamState.PAUSED)
 
     async def resume(self) -> None:
