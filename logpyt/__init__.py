@@ -36,11 +36,13 @@ from .exceptions import (
     LogStreamStderrError,
     LogStreamTimeoutError,
 )
+from .exporters import export_logs
 from .filters import AdvancedFilter, Filter
 from .groupers import LogGrouper
 from .models import LogEntry
 from .parsers import LogParser, ThreadTimeLogParser
-from .streams import LogStream, StreamHandle
+from .readers import LogFileReader, read_file
+from .streams import AsyncLogStream, AsyncStreamHandle, LogStream, StreamHandle
 from .utils import enable_debug, list_devices, resolve_adb
 
 __all__ = [
@@ -50,9 +52,14 @@ __all__ = [
     "LogGrouper",
     "LogStream",
     "StreamHandle",
+    "AsyncLogStream",
+    "AsyncStreamHandle",
     "resolve_adb",
     "list_devices",
     "enable_debug",
+    "read_file",
+    "LogFileReader",
+    "export_logs",
     "Filter",
     "AdvancedFilter",
     "LogStreamError",
