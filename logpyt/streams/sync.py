@@ -574,12 +574,15 @@ class LogStream:
             if self._process:
                 self._process.terminate()
         finally:
-            # If this is the main thread (stdout) and we exit, we should probably ensure
-            # the state transitions to STOPPED if it wasn't KILLED.
-            # However, both threads run independently.
-            # We'll let the process exit determine the final state usually,
-            # but here we just finish the thread.
-            pass
+            if source == "stdout" and self.group_by:
+                flushed = self.group_by.flush()
+                if flushed:
+                    try:
+                        self._callback_queue.put_nowait((flushed, source))
+                    except queue.Full:
+                        logging.getLogger("logpyt").warning(
+                            "LogStream callback queue is full. Dropping grouped log entries."
+                        )
 
     def _callback_loop(self) -> None:
         """Internal loop to process callbacks."""
