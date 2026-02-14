@@ -204,6 +204,7 @@ class LogStream:
         reconnect_delay: float = 1.0,
         max_queue_size: int = 10000,
         read_timeout: float | None = None,
+        queue_full_warning_interval: float = 5.0,
     ) -> None:
         """Initialize the LogStream.
 
@@ -233,6 +234,8 @@ class LogStream:
             reconnect_delay: Delay in seconds before reconnecting.
             max_queue_size: Maximum size of the callback queue. Defaults to 10000.
             read_timeout: Timeout in seconds for reading from the stream.
+            queue_full_warning_interval: Minimum interval in seconds between
+                repeated queue-full warnings. Defaults to 5.0.
         """
         self.adb_path = adb_path or resolve_adb()
         self.device_id = device_id
@@ -242,6 +245,7 @@ class LogStream:
         self.reconnect_delay = reconnect_delay
         self.max_queue_size = max_queue_size
         self.read_timeout = read_timeout
+        self._queue_full_warning_interval = max(0.0, queue_full_warning_interval)
 
         # Handle grouper shortcut
         self.group_by = group_by
@@ -290,6 +294,8 @@ class LogStream:
         self._last_activity: float = 0.0
         self._activity_lock = threading.Lock()
         self._watchdog_thread: threading.Thread | None = None
+        self._last_queue_full_warning: dict[str, float] = {}
+        self._queue_warning_lock = threading.Lock()
 
     @property
     def state(self) -> StreamState:
@@ -546,6 +552,24 @@ class LogStream:
 
             time.sleep(1.0)
 
+    def _warn_queue_full_once(self, message: str) -> None:
+        """Emit queue-full warning with optional rate limiting."""
+        interval = self._queue_full_warning_interval
+        if interval <= 0.0:
+            logging.getLogger("logpyt").warning(message)
+            return
+
+        now = time.monotonic()
+        should_log = False
+        with self._queue_warning_lock:
+            last = self._last_queue_full_warning.get(message)
+            if last is None or (now - last) >= interval:
+                self._last_queue_full_warning[message] = now
+                should_log = True
+
+        if should_log:
+            logging.getLogger("logpyt").warning(message)
+
     def _read_loop(self, pipe: TextIO | None, source: str) -> None:
         """Internal loop to read from a pipe."""
         if pipe is None:
@@ -580,7 +604,7 @@ class LogStream:
                     try:
                         self._callback_queue.put_nowait((flushed, source))
                     except queue.Full:
-                        logging.getLogger("logpyt").warning(
+                        self._warn_queue_full_once(
                             "LogStream callback queue is full. Dropping grouped log entries."
                         )
 
@@ -643,7 +667,7 @@ class LogStream:
             try:
                 self._callback_queue.put_nowait((items_to_emit, source))
             except queue.Full:
-                logging.getLogger("logpyt").warning(
+                self._warn_queue_full_once(
                     "LogStream callback queue is full. Dropping log entry."
                 )
 

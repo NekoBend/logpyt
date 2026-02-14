@@ -1,5 +1,6 @@
 """Tests for log stream."""
 
+import logging
 import time
 from datetime import datetime
 from unittest.mock import Mock
@@ -280,3 +281,32 @@ def test_read_timeout(mock_popen, mocker) -> None:
 
     # Verify terminate was called
     process_mock.terminate.assert_called()
+
+
+def test_queue_full_warning_rate_limited(caplog, mocker) -> None:
+    """Test queue-full warnings are rate-limited in sync stream."""
+    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+
+    stream = LogStream(max_queue_size=1, queue_full_warning_interval=60.0)
+
+    # Fill queue to force queue.Full for subsequent puts.
+    dummy_entry = LogEntry(
+        timestamp=datetime.now(),
+        pid=1,
+        tid=1,
+        level="I",
+        tag="T",
+        message="M",
+        raw="M",
+    )
+    stream._callback_queue.put_nowait(([dummy_entry], "stdout"))
+
+    with caplog.at_level(logging.WARNING, logger="logpyt"):
+        stream._process_line("line one\n", "stdout")
+        stream._process_line("line two\n", "stdout")
+        stream._process_line("line three\n", "stdout")
+
+    queue_warnings = [
+        rec for rec in caplog.records if "callback queue is full" in rec.message
+    ]
+    assert len(queue_warnings) == 1
