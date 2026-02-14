@@ -1,5 +1,6 @@
 """Tests for LogFileReader and read_file."""
 
+import logging
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -135,3 +136,35 @@ def test_read_file_not_found() -> None:
     # Act & Assert
     with pytest.raises(FileNotFoundError):
         list(read_file(non_existent_file))
+
+
+def test_log_file_reader_parse_error_logging_throttled(
+    tmp_path: Path, caplog, monkeypatch
+) -> None:
+    """Test parse-error logging is throttled to avoid log storms."""
+    log_file = tmp_path / "throttle.log"
+    log_file.write_text("bad1\nbad2\nbad3\nbad4\nbad5\n", encoding="utf-8")
+
+    mock_parser = MagicMock()
+    mock_parser.parse_stdout.side_effect = ValueError("Parsing failed")
+
+    # Keep monotonic time fixed so all errors fall into the same interval.
+    monkeypatch.setattr("logpyt.readers.time.monotonic", lambda: 123.0)
+
+    reader = LogFileReader(
+        log_file,
+        parser=mock_parser,
+        parse_error_log_interval=60.0,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        entries = list(reader)
+
+    assert entries == []
+
+    error_logs = [r for r in caplog.records if "Failed to parse line:" in r.message]
+    summary_logs = [r for r in caplog.records if "Suppressed" in r.message]
+
+    assert len(error_logs) == 1
+    assert len(summary_logs) == 1
+    assert "4 parse errors" in summary_logs[0].message

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -28,6 +29,7 @@ class LogFileReader:
         file_path: str | Path,
         parser: LogParser | None = None,
         filter_by: Filter | None = None,
+        parse_error_log_interval: float = 5.0,
     ) -> None:
         """Initialize the reader.
 
@@ -37,10 +39,38 @@ class LogFileReader:
                 treats each line as a raw message.
             filter_by: Optional filter to apply to entries. Only entries
                 passing the filter will be yielded.
+            parse_error_log_interval: Minimum interval in seconds between
+                repeated parse error logs. Defaults to 5.0.
         """
         self.file_path = Path(file_path)
         self.parser = parser or LogParser()
         self.filter_by = filter_by
+        self._parse_error_log_interval = max(0.0, parse_error_log_interval)
+        self._last_parse_error_log_ts = 0.0
+        self._suppressed_parse_errors = 0
+
+    def _log_parse_error(self, line: str, error: Exception) -> None:
+        """Log parse errors with optional rate limiting."""
+        interval = self._parse_error_log_interval
+        if interval <= 0.0:
+            logger.error("Failed to parse line: %s - Error: %s", line.strip(), error)
+            return
+
+        now = time.monotonic()
+        if (now - self._last_parse_error_log_ts) >= interval:
+            if self._suppressed_parse_errors:
+                logger.warning(
+                    "Suppressed %d parse errors while reading %s.",
+                    self._suppressed_parse_errors,
+                    self.file_path,
+                )
+                self._suppressed_parse_errors = 0
+
+            logger.error("Failed to parse line: %s - Error: %s", line.strip(), error)
+            self._last_parse_error_log_ts = now
+            return
+
+        self._suppressed_parse_errors += 1
 
     def __iter__(self) -> Iterator[LogEntry]:
         """Iterate over log entries in the file.
@@ -63,10 +93,8 @@ class LogFileReader:
                     # We use parse_stdout as the default for file lines
                     entry = self.parser.parse_stdout(line)
                 except Exception as e:
-                    # Log the error instead of silently swallowing it
-                    logger.error(
-                        "Failed to parse line: %s - Error: %s", line.strip(), e
-                    )
+                    # Log parse errors with throttling to avoid log storms
+                    self._log_parse_error(line, e)
                     continue
 
                 # Apply filter if present
@@ -74,6 +102,14 @@ class LogFileReader:
                     continue
 
                 yield entry
+
+        if self._suppressed_parse_errors:
+            logger.warning(
+                "Suppressed %d parse errors while reading %s.",
+                self._suppressed_parse_errors,
+                self.file_path,
+            )
+            self._suppressed_parse_errors = 0
 
 
 def read_file(
