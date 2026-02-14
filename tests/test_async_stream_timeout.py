@@ -36,6 +36,7 @@ async def test_read_timeout_raises_exception():
             error_caught.set()
 
         stream = AsyncLogStream(
+            adb_path="adb",
             read_timeout=0.1,  # Short timeout
             on_error=on_error,
             auto_reconnect=False,

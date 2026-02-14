@@ -103,6 +103,20 @@ def test_thread_time_parser_message_with_colons() -> None:
     assert entry.level == "D"
 
 
+def test_thread_time_parser_with_wrapped_whitespace() -> None:
+    """Threadtime parser should still parse lines after trimming wrappers."""
+    parser = ThreadTimeLogParser(default_year=2026)
+    line = "  11-19 12:34:56.789  1234  5678 D MyTag   : Hello World   "
+    entry = parser.parse_stdout(line)
+
+    assert entry.pid == 1234
+    assert entry.tid == 5678
+    assert entry.level == "D"
+    assert entry.tag == "MyTag"
+    assert entry.message == "Hello World"
+    assert entry.timestamp.year == 2026
+
+
 def test_brief_log_parser_success() -> None:
     """Test parsing a valid brief log line."""
     from logpyt.parsers import BriefLogParser
@@ -204,3 +218,16 @@ def test_raw_log_parser_success() -> None:
     assert entry.tag == ""
     assert entry.meta["parser"] == "RawLogParser"
     assert isinstance(entry.timestamp, datetime)
+
+
+def test_brief_log_parser_non_brief_prefix_fallback() -> None:
+    """Brief parser should keep fallback semantics for non-brief lines."""
+    from logpyt.parsers import BriefLogParser
+
+    parser = BriefLogParser()
+    line = "X/not-brief( 2034): routeCall()"
+    entry = parser.parse_stdout(line)
+
+    assert entry.message == line
+    assert entry.level == "I"
+    assert "parser" not in entry.meta

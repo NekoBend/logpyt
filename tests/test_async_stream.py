@@ -316,3 +316,60 @@ async def test_auto_reconnect(mock_resolve_adb, mock_create_subprocess):
     ]
     # Should look like [RUNNING, RECONNECTING, RUNNING, ...]
     assert len(run_reconnect_seq) >= 3
+
+
+@pytest.mark.asyncio
+async def test_ingestion_not_blocked_by_slow_callback(
+    mock_resolve_adb, mock_create_subprocess, mock_process
+):
+    """Ensure parsing/ingestion continues while callback is awaiting."""
+    mock_process.stdout.readline.side_effect = [b"line-1\n", b"line-2\n", b""]
+    mock_process.stderr.readline.return_value = b""
+
+    callback_entered = asyncio.Event()
+    release_callback = asyncio.Event()
+
+    async def slow_callback(entry, handle):
+        if entry.message == "first":
+            callback_entered.set()
+            await release_callback.wait()
+
+    mock_parser = MagicMock()
+    mock_parser.parse_stdout.side_effect = [
+        LogEntry(
+            timestamp=datetime.now(),
+            pid=1,
+            tid=1,
+            level="D",
+            tag="T",
+            message="first",
+            raw="line-1",
+            meta={},
+        ),
+        LogEntry(
+            timestamp=datetime.now(),
+            pid=1,
+            tid=1,
+            level="D",
+            tag="T",
+            message="second",
+            raw="line-2",
+            meta={},
+        ),
+    ]
+
+    stream = AsyncLogStream(
+        parser=mock_parser,
+        stdout_callback=slow_callback,
+        callback_queue_size=8,
+    )
+
+    await stream.start()
+    await asyncio.wait_for(callback_entered.wait(), timeout=1.0)
+
+    # Ingestion should have parsed line-2 already, despite callback waiting.
+    await asyncio.sleep(0.05)
+    assert mock_parser.parse_stdout.call_count == 2
+
+    release_callback.set()
+    await stream.join(timeout=1.0)

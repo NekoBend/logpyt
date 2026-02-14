@@ -23,6 +23,8 @@ from .common import StreamState, build_pidof_command
 # Configure module logger
 logger = logging.getLogger(__name__)
 
+_DISPATCH_STOP = object()
+
 
 class AsyncPidMonitor:
     """Monitors PIDs for specific packages using ADB asynchronously."""
@@ -213,6 +215,7 @@ class AsyncLogStream:
         reconnect_delay: float = 1.0,
         pid_poll_interval: float = 5.0,
         read_timeout: float | None = None,
+        callback_queue_size: int = 1024,
     ) -> None:
         """Initialize the AsyncLogStream.
 
@@ -236,6 +239,8 @@ class AsyncLogStream:
             reconnect_delay: Delay in seconds before reconnecting.
             pid_poll_interval: Interval in seconds for PID monitoring.
             read_timeout: Timeout in seconds for reading from the stream.
+            callback_queue_size: Max buffered callback items per stream source.
+                Uses backpressure when full.
         """
         self.adb_path = adb_path or resolve_adb()
         self.device_id = device_id
@@ -245,6 +250,7 @@ class AsyncLogStream:
         self.reconnect_delay = reconnect_delay
         self.pid_poll_interval = pid_poll_interval
         self.read_timeout = read_timeout
+        self.callback_queue_size = callback_queue_size
 
         # Handle grouper shortcut
         self.group_by = group_by
@@ -284,11 +290,80 @@ class AsyncLogStream:
         self._stdout_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._connection_task: asyncio.Task[None] | None = None
+        self._stdout_dispatch_task: asyncio.Task[None] | None = None
+        self._stderr_dispatch_task: asyncio.Task[None] | None = None
+        self._stdout_dispatch_queue: asyncio.Queue[object] | None = None
+        self._stderr_dispatch_queue: asyncio.Queue[object] | None = None
         self._state = StreamState.IDLE
         self._state_lock = asyncio.Lock()
         self._handle = AsyncStreamHandle(self)
         self._stop_event = asyncio.Event()
         self._exceptions: list[Exception] = []
+
+    def _build_dispatch_queue(self) -> asyncio.Queue[object]:
+        """Create a callback dispatch queue with optional backpressure."""
+        if self.callback_queue_size <= 0:
+            return asyncio.Queue()
+        return asyncio.Queue(maxsize=self.callback_queue_size)
+
+    async def _dispatch_item(
+        self,
+        item: LogEntry | list[LogEntry],
+        source: str,
+        callback: AsyncLogCallback,
+    ) -> None:
+        """Dispatch an item to callback queue or directly when queue is unavailable."""
+        queue = (
+            self._stdout_dispatch_queue
+            if source == "stdout"
+            else self._stderr_dispatch_queue
+        )
+        if queue is None:
+            await callback(item, self._handle)
+            return
+        await queue.put(item)
+
+    async def _callback_dispatch_loop(
+        self,
+        queue: asyncio.Queue[object],
+        callback: AsyncLogCallback,
+    ) -> None:
+        """Consume queued callback items sequentially."""
+        while True:
+            item = await queue.get()
+            try:
+                if item is _DISPATCH_STOP:
+                    return
+                await callback(item, self._handle)
+            except Exception as e:
+                if self.on_error:
+                    await self.on_error(e)
+            finally:
+                queue.task_done()
+
+    async def _stop_dispatcher(self, source: str) -> None:
+        """Gracefully stop callback dispatcher for a source."""
+        queue = (
+            self._stdout_dispatch_queue
+            if source == "stdout"
+            else self._stderr_dispatch_queue
+        )
+        task = (
+            self._stdout_dispatch_task
+            if source == "stdout"
+            else self._stderr_dispatch_task
+        )
+        if queue is None or task is None:
+            return
+        await queue.put(_DISPATCH_STOP)
+        await queue.join()
+        await asyncio.gather(task, return_exceptions=True)
+        if source == "stdout":
+            self._stdout_dispatch_queue = None
+            self._stdout_dispatch_task = None
+        else:
+            self._stderr_dispatch_queue = None
+            self._stderr_dispatch_task = None
 
     @property
     def state(self) -> StreamState:
@@ -393,6 +468,26 @@ class AsyncLogStream:
                 name="AsyncLogStream-Stderr",
             )
 
+        if self.stdout_callback:
+            self._stdout_dispatch_queue = self._build_dispatch_queue()
+            self._stdout_dispatch_task = asyncio.create_task(
+                self._callback_dispatch_loop(
+                    self._stdout_dispatch_queue,
+                    self.stdout_callback,
+                ),
+                name="AsyncLogStream-StdoutDispatcher",
+            )
+
+        if self.stderr_callback:
+            self._stderr_dispatch_queue = self._build_dispatch_queue()
+            self._stderr_dispatch_task = asyncio.create_task(
+                self._callback_dispatch_loop(
+                    self._stderr_dispatch_queue,
+                    self.stderr_callback,
+                ),
+                name="AsyncLogStream-StderrDispatcher",
+            )
+
         if self._pid_monitor:
             await self._pid_monitor.start()
 
@@ -416,6 +511,12 @@ class AsyncLogStream:
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+        if self.stdout_callback:
+            await self._stop_dispatcher("stdout")
+
+        if self.stderr_callback:
+            await self._stop_dispatcher("stderr")
 
         if self._pid_monitor:
             await self._pid_monitor.stop()
@@ -546,7 +647,11 @@ class AsyncLogStream:
                     if flushed and self.stdout_callback:
                         for item in flushed:
                             try:
-                                await self.stdout_callback(item, self._handle)
+                                await self._dispatch_item(
+                                    item,
+                                    source="stdout",
+                                    callback=self.stdout_callback,
+                                )
                             except Exception as e:
                                 if self.on_error:
                                     await self.on_error(e)
@@ -588,7 +693,7 @@ class AsyncLogStream:
         if callback:
             for item in items_to_emit:
                 try:
-                    await callback(item, self._handle)
+                    await self._dispatch_item(item, source=source, callback=callback)
                 except Exception as e:
                     if self.on_error:
                         await self.on_error(e)

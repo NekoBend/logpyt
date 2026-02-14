@@ -126,6 +126,24 @@ class ThreadTimeLogParser(LogParser):
         r"^(\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d{3})\s+(\d+)\s+(\d+)\s+([A-Z])\s+(.*?):\s+(.*)$"
     )
 
+    def _parse_timestamp(self, date_str: str, time_str: str) -> datetime:
+        """Parse threadtime timestamp without strptime for hot-path performance."""
+        month = int(date_str[0:2])
+        day = int(date_str[3:5])
+        hour = int(time_str[0:2])
+        minute = int(time_str[3:5])
+        second = int(time_str[6:8])
+        microsecond = int(time_str[9:12]) * 1000
+        return datetime(
+            self.default_year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            microsecond,
+        )
+
     def parse_stdout(self, line: str) -> LogEntry:
         """Parse a line from stdout using threadtime format.
 
@@ -137,6 +155,9 @@ class ThreadTimeLogParser(LogParser):
         """
         # Strip whitespace from ends to ensure clean matching
         clean_line = line.strip()
+        if len(clean_line) < 24 or clean_line[2] != "-" or clean_line[5] != " ":
+            return super().parse_stdout(line)
+
         match = self._PATTERN.match(clean_line)
         if not match:
             return super().parse_stdout(line)
@@ -145,9 +166,8 @@ class ThreadTimeLogParser(LogParser):
 
         # Parse timestamp
         # Use configured default year
-        timestamp_str = f"{self.default_year}-{date_str} {time_str}"
         try:
-            timestamp = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S.%f")
+            timestamp = self._parse_timestamp(date_str, time_str)
         except ValueError:
             # Fallback if timestamp parsing fails, though regex ensures format
             timestamp = self._get_default_timestamp()
@@ -196,6 +216,14 @@ class BriefLogParser(LogParser):
             A LogEntry object.
         """
         clean_line = line.strip()
+        if (
+            len(clean_line) < 8
+            or clean_line[0] not in "VDIWEF"
+            or clean_line[1] != "/"
+            or ")" not in clean_line
+        ):
+            return super().parse_stdout(line)
+
         match = self._PATTERN.match(clean_line)
         if not match:
             return super().parse_stdout(line)
@@ -237,6 +265,9 @@ class ProcessLogParser(LogParser):
             A LogEntry object.
         """
         clean_line = line.strip()
+        if len(clean_line) < 5 or clean_line[0] not in "VDIWEF" or clean_line[1] != "(":
+            return super().parse_stdout(line)
+
         match = self._PATTERN.match(clean_line)
         if not match:
             return super().parse_stdout(line)
@@ -278,6 +309,14 @@ class TagLogParser(LogParser):
             A LogEntry object.
         """
         clean_line = line.strip()
+        if (
+            len(clean_line) < 5
+            or clean_line[0] not in "VDIWEF"
+            or clean_line[1] != "/"
+            or ":" not in clean_line
+        ):
+            return super().parse_stdout(line)
+
         match = self._PATTERN.match(clean_line)
         if not match:
             return super().parse_stdout(line)
