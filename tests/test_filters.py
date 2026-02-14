@@ -111,6 +111,31 @@ def test_message_contains_condition(sample_entry: LogEntry) -> None:
     assert c2.check(sample_entry) is False
 
 
+def test_message_contains_is_case_sensitive(sample_entry: LogEntry) -> None:
+    """MessageContains should remain case-sensitive."""
+    c = MessageContains("something")
+    assert c.check(sample_entry) is False
+
+
+def test_message_contains_treats_regex_chars_as_literals(sample_entry: LogEntry) -> None:
+    """Regex meta characters in pattern should be matched literally."""
+    entry = sample_entry.model_copy(update={"message": "a.b[c](d){e}?"})
+    c = MessageContains("a.b[c](d){e}?")
+    assert c.check(entry) is True
+
+
+def test_message_contains_empty_pattern_still_matches(sample_entry: LogEntry) -> None:
+    """Empty pattern should preserve Python substring semantics."""
+    c = MessageContains("")
+    assert c.check(sample_entry) is True
+
+
+def test_filter_message_contains_empty_list_matches_nothing(sample_entry: LogEntry) -> None:
+    """An explicitly empty message_contains list should match no entries."""
+    f = Filter(message_contains=[])
+    assert f(sample_entry) is False
+
+
 def test_crash_condition(sample_entry: LogEntry) -> None:
     """Test CrashCondition."""
     # Match

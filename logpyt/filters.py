@@ -2,11 +2,29 @@
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
+from functools import lru_cache
 from typing import Any
 
 from .models import LogEntry
+
+
+@lru_cache(maxsize=256)
+def _compile_contains_regex(patterns: tuple[str, ...]) -> re.Pattern[str] | None:
+    """Compile a cached regex for literal substring matching.
+
+    Args:
+        patterns: Literal substring patterns.
+
+    Returns:
+        Compiled regex pattern, or None when no patterns are provided.
+    """
+    if not patterns:
+        return None
+    escaped = "|".join(re.escape(pattern) for pattern in patterns)
+    return re.compile(escaped)
 
 
 class Condition(ABC):
@@ -112,9 +130,12 @@ class MessageContains(Condition):
             self.patterns = [patterns]
         else:
             self.patterns = list(patterns)
+        self._compiled_pattern = _compile_contains_regex(tuple(self.patterns))
 
     def check(self, entry: LogEntry) -> bool:
-        return any(pattern in entry.message for pattern in self.patterns)
+        if self._compiled_pattern is None:
+            return False
+        return self._compiled_pattern.search(entry.message) is not None
 
 
 class CrashCondition(Condition):
@@ -220,6 +241,11 @@ class Filter:
         self.tags = self._to_set(tag)
         self.levels = self._to_set(level)
         self.message_patterns = self._to_list(message_contains)
+        self._compiled_message_pattern = (
+            _compile_contains_regex(tuple(self.message_patterns))
+            if self.message_patterns is not None
+            else None
+        )
 
     def _to_set(self, value: str | list[str] | None) -> set[str] | None:
         if value is None:
@@ -256,8 +282,9 @@ class Filter:
             return False
 
         if self.message_patterns is not None:
-            msg = entry.message
-            if not any(p in msg for p in self.message_patterns):
+            if self._compiled_message_pattern is None:
+                return False
+            if self._compiled_message_pattern.search(entry.message) is None:
                 return False
 
         return True

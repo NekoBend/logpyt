@@ -231,3 +231,40 @@ def test_brief_log_parser_non_brief_prefix_fallback() -> None:
     assert entry.message == line
     assert entry.level == "I"
     assert "parser" not in entry.meta
+
+
+def test_thread_time_parser_missing_colon_separator_fallback() -> None:
+    """Threadtime parser should fallback for date-like lines without tag/message separator."""
+    parser = ThreadTimeLogParser()
+    line = "11-19 12:34:56.789  1234  5678 D MyTag Hello World"
+    entry = parser.parse_stdout(line)
+
+    assert entry.message == line
+    assert entry.level == "I"
+    assert "parser" not in entry.meta
+
+
+def test_brief_log_parser_missing_open_paren_fallback() -> None:
+    """Brief parser should fallback when mandatory opening parenthesis is missing."""
+    from logpyt.parsers import BriefLogParser
+
+    parser = BriefLogParser()
+    line = "D/HeadsetProfile 2034): routeCall()"
+    entry = parser.parse_stdout(line)
+
+    assert entry.message == line
+    assert entry.level == "I"
+    assert "parser" not in entry.meta
+
+
+def test_process_log_parser_missing_close_paren_fallback() -> None:
+    """Process parser should fallback when closing parenthesis is missing."""
+    from logpyt.parsers import ProcessLogParser
+
+    parser = ProcessLogParser()
+    line = "I(  596 System.exit called, status: 0"
+    entry = parser.parse_stdout(line)
+
+    assert entry.message == line
+    assert entry.level == "I"
+    assert "parser" not in entry.meta

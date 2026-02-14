@@ -155,7 +155,14 @@ class ThreadTimeLogParser(LogParser):
         """
         # Strip whitespace from ends to ensure clean matching
         clean_line = line.strip()
-        if len(clean_line) < 24 or clean_line[2] != "-" or clean_line[5] != " ":
+        if (
+            len(clean_line) < 24
+            or clean_line[2] != "-"
+            or clean_line[5] != " "
+            or not clean_line[0:2].isdigit()
+            or not clean_line[3:5].isdigit()
+            or ":" not in clean_line
+        ):
             return super().parse_stdout(line)
 
         match = self._PATTERN.match(clean_line)
@@ -220,7 +227,9 @@ class BriefLogParser(LogParser):
             len(clean_line) < 8
             or clean_line[0] not in "VDIWEF"
             or clean_line[1] != "/"
+            or "(" not in clean_line
             or ")" not in clean_line
+            or ":" not in clean_line
         ):
             return super().parse_stdout(line)
 
@@ -265,7 +274,12 @@ class ProcessLogParser(LogParser):
             A LogEntry object.
         """
         clean_line = line.strip()
-        if len(clean_line) < 5 or clean_line[0] not in "VDIWEF" or clean_line[1] != "(":
+        if (
+            len(clean_line) < 5
+            or clean_line[0] not in "VDIWEF"
+            or clean_line[1] != "("
+            or ")" not in clean_line
+        ):
             return super().parse_stdout(line)
 
         match = self._PATTERN.match(clean_line)
