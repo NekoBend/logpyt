@@ -405,9 +405,12 @@ def extract_json(text: str) -> Any | None:
         try:
             obj, _ = decoder.raw_decode(text, idx=start)
             return obj
-        except json.JSONDecodeError:
-            # Failed to parse from this position, move past it
+        except json.JSONDecodeError as exc:
+            # Failed to parse from this position.
+            # Heuristic: if decoder reports a later error position, skip there
+            # to reduce repeated scans over known-invalid spans.
             attempts += 1
-            idx = start + 1
+            next_idx = max(start + 1, exc.pos + 1)
+            idx = next_idx if next_idx < scan_limit else scan_limit
 
     return None

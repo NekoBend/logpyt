@@ -54,6 +54,10 @@ class LogGrouper:
         self.emit_mode = emit_mode
         self._buffer: list[LogEntry] = []
         self._last_key: tuple[Any, ...] | None = None
+        # Canonicalize frequently repeated keys to avoid repeated hash work
+        # in downstream dict/OrderedDict operations.
+        self._key_cache: OrderedDict[tuple[Any, ...], tuple[Any, ...]] = OrderedDict()
+        self._key_cache_max = 256
 
     def _get_key(self, entry: LogEntry) -> tuple[Any, ...]:
         """Extract grouping key from a log entry.
@@ -64,7 +68,16 @@ class LogGrouper:
         Returns:
             A tuple of values corresponding to the 'by' fields.
         """
-        return tuple(getattr(entry, field, None) for field in self.by)
+        raw_key = tuple(getattr(entry, field, None) for field in self.by)
+        cached_key = self._key_cache.get(raw_key)
+        if cached_key is not None:
+            self._key_cache.move_to_end(raw_key)
+            return cached_key
+
+        self._key_cache[raw_key] = raw_key
+        if len(self._key_cache) > self._key_cache_max:
+            self._key_cache.popitem(last=False)
+        return raw_key
 
     def process(self, entry: LogEntry) -> list[LogEntry | list[LogEntry]]:
         """Process a new log entry and update groups.
@@ -86,7 +99,7 @@ class LogGrouper:
 
         # Check if entry belongs to the current group
         # 1. Key must match
-        keys_match = current_key == self._last_key
+        keys_match = current_key is self._last_key or current_key == self._last_key
 
         # 2. Time difference must be within threshold
         last_entry = self._buffer[-1]
