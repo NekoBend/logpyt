@@ -84,6 +84,23 @@ def test_json_exporter_ensure_ascii(tmp_path: Path) -> None:
     assert "\\u30c6" in content
 
 
+def test_json_exporter_compact_without_indent(
+    tmp_path: Path, sample_entries: list[LogEntry]
+) -> None:
+    """Test JSON exporter writes compact JSON when indent is None."""
+    output_file = tmp_path / "logs_compact.json"
+    exporter = JsonLogExporter(indent=None)
+    exporter.export(sample_entries, output_file)
+
+    content = output_file.read_text(encoding="utf-8")
+    data = json.loads(content)
+
+    assert isinstance(data, list)
+    assert len(data) == 2
+    assert "\n" not in content
+    assert '": ' not in content
+
+
 def test_csv_exporter(tmp_path: Path, sample_entries: list[LogEntry]) -> None:
     """Test exporting logs to CSV."""
     output_file = tmp_path / "logs.csv"

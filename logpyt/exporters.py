@@ -48,22 +48,27 @@ class JsonLogExporter:
 
         with dest_path.open("w", encoding="utf-8") as f:
             # Stream the output as a JSON array to avoid loading all logs into memory
-            f.write("[\n")
+            compact_mode = self.indent is None
+            separators: tuple[str, str] | None = (",", ":") if compact_mode else None
+            write = f.write
+
+            write("[" if compact_mode else "[\n")
             first = True
             for entry in entries:
                 if not first:
-                    f.write(",\n")
+                    write("," if compact_mode else ",\n")
 
                 # Use json.dumps to honor ensure_ascii
-                f.write(
+                write(
                     json.dumps(
                         entry.model_dump(mode="json"),
                         ensure_ascii=self.ensure_ascii,
                         indent=self.indent,
+                        separators=separators,
                     )
                 )
                 first = False
-            f.write("\n]")
+            write("]" if compact_mode else "\n]")
 
 
 class CsvLogExporter:
@@ -98,17 +103,17 @@ class CsvLogExporter:
                 quotechar=self.quotechar,
             )
             writer.writeheader()
+            dumps = json.dumps
 
             for entry in entries:
                 row = entry.model_dump(mode="json")
                 # Serialize meta dictionary to JSON string for CSV compatibility
                 if "meta" in row and isinstance(row["meta"], dict):
-                    row["meta"] = json.dumps(row["meta"], ensure_ascii=False)
+                    row["meta"] = dumps(
+                        row["meta"], ensure_ascii=False, separators=(",", ":")
+                    )
 
-                # Ensure we only write fields defined in fieldnames
-                # (though LogEntry shouldn't have extra fields usually)
-                filtered_row = {k: row.get(k) for k in self.fieldnames}
-                writer.writerow(filtered_row)
+                writer.writerow(row)
 
 
 def export_logs(
