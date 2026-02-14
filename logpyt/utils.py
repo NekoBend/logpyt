@@ -32,6 +32,10 @@ class DeviceInfo(TypedDict, total=False):
 
 DeviceType = Literal["usb", "emulator", "device"]
 
+# Safeguards for pathological extract_json inputs.
+_EXTRACT_JSON_MAX_SCAN_CHARS = 1_000_000
+_EXTRACT_JSON_MAX_CANDIDATES = 4_096
+
 
 @functools.lru_cache(maxsize=1)
 def resolve_adb() -> str:
@@ -370,13 +374,23 @@ def extract_json(text: str) -> Any | None:
 
     Returns:
         The parsed JSON object (dict or list) if found, otherwise None.
+
+    Notes:
+        Scanning is bounded to protect against worst-case inputs with huge numbers
+        of JSON-like delimiters that repeatedly fail to parse.
     """
+    if not text:
+        return None
+
     decoder = json.JSONDecoder()
     idx = 0
-    while idx < len(text):
+    attempts = 0
+    scan_limit = min(len(text), _EXTRACT_JSON_MAX_SCAN_CHARS)
+
+    while idx < scan_limit and attempts < _EXTRACT_JSON_MAX_CANDIDATES:
         # Find next potential start
-        next_brace = text.find("{", idx)
-        next_bracket = text.find("[", idx)
+        next_brace = text.find("{", idx, scan_limit)
+        next_bracket = text.find("[", idx, scan_limit)
 
         if next_brace == -1 and next_bracket == -1:
             return None
@@ -393,6 +407,7 @@ def extract_json(text: str) -> Any | None:
             return obj
         except json.JSONDecodeError:
             # Failed to parse from this position, move past it
+            attempts += 1
             idx = start + 1
 
     return None

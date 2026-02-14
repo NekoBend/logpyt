@@ -160,6 +160,7 @@ class WindowedLogGrouper(LogGrouper):
         super().__init__(by, threshold_ms, emit_mode)
         self._buffers: OrderedDict[tuple[Any, ...], list[LogEntry]] = OrderedDict()
         self._heap: list[tuple[float, tuple[Any, ...]]] = []
+        self._expiries: dict[tuple[Any, ...], float] = {}
         self.max_groups = max_groups
 
     def process(self, entry: LogEntry) -> list[LogEntry | list[LogEntry]]:
@@ -183,18 +184,16 @@ class WindowedLogGrouper(LogGrouper):
 
             heapq.heappop(self._heap)
 
-            if key not in self._buffers:
+            current_expiry = self._expiries.get(key)
+            if current_expiry is None:
                 continue
 
-            buffer = self._buffers[key]
-            last_entry_ts = buffer[-1].timestamp.timestamp() * 1000.0
-            real_expiry = last_entry_ts + self.threshold_ms
+            # Skip stale heap entries (older expiries for the same key).
+            if expiry != current_expiry:
+                continue
 
-            if real_expiry < current_ts:
+            if current_expiry < current_ts:
                 emitted.extend(self._flush_key(key))
-            else:
-                # Re-push with updated expiry
-                heapq.heappush(self._heap, (real_expiry, key))
 
         # Add the current entry to its corresponding buffer
         if current_key in self._buffers:
@@ -209,9 +208,10 @@ class WindowedLogGrouper(LogGrouper):
 
             self._buffers[current_key] = [entry]
 
-            # Update heap with new expiry for this key
-            new_expiry = current_ts + self.threshold_ms
-            heapq.heappush(self._heap, (new_expiry, current_key))
+        # Update expiry for the key (lazy heap invalidation via _expiries map).
+        new_expiry = current_ts + self.threshold_ms
+        self._expiries[current_key] = new_expiry
+        heapq.heappush(self._heap, (new_expiry, current_key))
 
         return emitted
 
@@ -221,6 +221,7 @@ class WindowedLogGrouper(LogGrouper):
             return []
 
         buffer = self._buffers.pop(key)
+        self._expiries.pop(key, None)
         if not buffer:
             return []
 
@@ -243,4 +244,5 @@ class WindowedLogGrouper(LogGrouper):
         for key in keys:
             emitted.extend(self._flush_key(key))
         self._heap.clear()
+        self._expiries.clear()
         return emitted
