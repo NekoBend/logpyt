@@ -96,8 +96,7 @@ class AsyncPidMonitor:
                 for pid in pids:
                     new_map[pid] = package
 
-            async with self._lock:
-                self._pid_map = new_map
+            await self._update_pid_map(new_map)
 
             try:
                 await asyncio.wait_for(
@@ -105,6 +104,34 @@ class AsyncPidMonitor:
                 )
             except asyncio.TimeoutError:
                 continue
+
+    async def _update_pid_map(self, new_map: dict[int, str]) -> bool:
+        """Apply PID map changes in place.
+
+        This avoids replacing the full mapping object when there are no changes,
+        while preserving the same add/update/remove semantics.
+
+        Args:
+            new_map: Latest PID to package mapping snapshot.
+
+        Returns:
+            True if at least one mapping changed, False otherwise.
+        """
+        async with self._lock:
+            if self._pid_map == new_map:
+                return False
+
+            current_pids = set(self._pid_map)
+            new_pids = set(new_map)
+
+            for stale_pid in current_pids - new_pids:
+                del self._pid_map[stale_pid]
+
+            for pid, package in new_map.items():
+                if self._pid_map.get(pid) != package:
+                    self._pid_map[pid] = package
+
+            return True
 
     async def _resolve_pids(self, package: str) -> list[int]:
         """Resolve PIDs for a package using ADB."""

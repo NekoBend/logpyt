@@ -91,3 +91,32 @@ class TestPidMonitor:
 
         assert monitor._pid_map == {1234: "com.example.app"}
         mock_resolve.assert_called_with("com.example.app")
+
+    def test_update_pid_map_no_change_keeps_map_object(self, monitor):
+        monitor._pid_map = {1234: "com.example.app"}
+        original = monitor._pid_map
+
+        changed = monitor._update_pid_map({1234: "com.example.app"})
+
+        assert changed is False
+        assert monitor._pid_map is original
+        assert monitor._pid_map == {1234: "com.example.app"}
+
+    def test_update_pid_map_applies_add_remove_and_change(self, monitor):
+        monitor._pid_map = {
+            1111: "com.example.old",
+            2222: "com.example.app",
+        }
+
+        changed = monitor._update_pid_map(
+            {
+                2222: "com.example.app",  # unchanged
+                3333: "com.example.app",  # added
+            }
+        )
+
+        assert changed is True
+        assert monitor._pid_map == {
+            2222: "com.example.app",
+            3333: "com.example.app",
+        }

@@ -183,6 +183,43 @@ async def test_pid_monitor(mock_resolve_adb):
 
 
 @pytest.mark.asyncio
+async def test_async_pid_monitor_update_no_change_keeps_map_object():
+    """No-op update should keep existing map object and report no change."""
+    monitor = AsyncPidMonitor(adb_path="adb", device_id=None, packages=["pkg"])
+    monitor._pid_map = {1234: "pkg"}
+    original = monitor._pid_map
+
+    changed = await monitor._update_pid_map({1234: "pkg"})
+
+    assert changed is False
+    assert monitor._pid_map is original
+    assert monitor._pid_map == {1234: "pkg"}
+
+
+@pytest.mark.asyncio
+async def test_async_pid_monitor_update_applies_add_remove_and_change():
+    """Changed snapshot should be applied with add/remove semantics."""
+    monitor = AsyncPidMonitor(adb_path="adb", device_id=None, packages=["pkg"])
+    monitor._pid_map = {
+        1111: "old.pkg",
+        2222: "pkg",
+    }
+
+    changed = await monitor._update_pid_map(
+        {
+            2222: "pkg",
+            3333: "pkg",
+        }
+    )
+
+    assert changed is True
+    assert monitor._pid_map == {
+        2222: "pkg",
+        3333: "pkg",
+    }
+
+
+@pytest.mark.asyncio
 async def test_stream_with_pid_monitor(
     mock_resolve_adb, mock_create_subprocess, mock_process
 ):
