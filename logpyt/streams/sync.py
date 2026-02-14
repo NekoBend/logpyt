@@ -28,7 +28,13 @@ class PidMonitor:
     """Monitors PIDs for specific packages using ADB."""
 
     def __init__(
-        self, adb_path: str, device_id: str | None, packages: list[str]
+        self,
+        adb_path: str,
+        device_id: str | None,
+        packages: list[str],
+        poll_interval: float = 2.0,
+        max_poll_interval: float = 30.0,
+        poll_backoff_factor: float = 2.0,
     ) -> None:
         """Initialize the PID monitor.
 
@@ -36,10 +42,16 @@ class PidMonitor:
             adb_path: Path to ADB executable.
             device_id: Target device serial ID.
             packages: List of package names to monitor.
+            poll_interval: Base interval in seconds between PID polls.
+            max_poll_interval: Maximum poll interval in seconds when idle.
+            poll_backoff_factor: Multiplier applied after unchanged polls.
         """
         self.adb_path = adb_path
         self.device_id = device_id
         self.packages = list(set(packages))
+        self.poll_interval = max(0.1, poll_interval)
+        self.max_poll_interval = max(self.poll_interval, max_poll_interval)
+        self.poll_backoff_factor = max(1.0, poll_backoff_factor)
         self._pid_map: dict[int, str] = {}
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -76,6 +88,7 @@ class PidMonitor:
 
     def _run(self) -> None:
         """Internal loop to poll PIDs."""
+        current_interval = self.poll_interval
         while not self._stop_event.is_set():
             new_map: dict[int, str] = {}
             for package in self.packages:
@@ -83,9 +96,17 @@ class PidMonitor:
                 for pid in pids:
                     new_map[pid] = package
 
-            self._update_pid_map(new_map)
+            changed = self._update_pid_map(new_map)
 
-            self._stop_event.wait(2.0)
+            if changed:
+                current_interval = self.poll_interval
+            else:
+                current_interval = min(
+                    self.max_poll_interval,
+                    current_interval * self.poll_backoff_factor,
+                )
+
+            self._stop_event.wait(current_interval)
 
     def _update_pid_map(self, new_map: dict[int, str]) -> bool:
         """Apply PID map changes in place.
@@ -232,6 +253,9 @@ class LogStream:
         max_queue_size: int = 10000,
         read_timeout: float | None = None,
         queue_full_warning_interval: float = 5.0,
+        pid_poll_interval: float = 2.0,
+        pid_max_poll_interval: float = 30.0,
+        pid_poll_backoff_factor: float = 2.0,
     ) -> None:
         """Initialize the LogStream.
 
@@ -263,6 +287,9 @@ class LogStream:
             read_timeout: Timeout in seconds for reading from the stream.
             queue_full_warning_interval: Minimum interval in seconds between
                 repeated queue-full warnings. Defaults to 5.0.
+            pid_poll_interval: Base interval in seconds for PID monitoring.
+            pid_max_poll_interval: Maximum PID poll interval when idle.
+            pid_poll_backoff_factor: Backoff factor for unchanged PID snapshots.
         """
         self.adb_path = adb_path or resolve_adb()
         self.device_id = device_id
@@ -273,6 +300,9 @@ class LogStream:
         self.max_queue_size = max_queue_size
         self.read_timeout = read_timeout
         self._queue_full_warning_interval = max(0.0, queue_full_warning_interval)
+        self.pid_poll_interval = pid_poll_interval
+        self.pid_max_poll_interval = pid_max_poll_interval
+        self.pid_poll_backoff_factor = pid_poll_backoff_factor
 
         # Handle grouper shortcut
         self.group_by = group_by
@@ -305,7 +335,12 @@ class LogStream:
         self._pid_monitor: PidMonitor | None = None
         if isinstance(self.filter_by, Filter) and self.filter_by.packages:
             self._pid_monitor = PidMonitor(
-                self.adb_path, self.device_id, list(self.filter_by.packages)
+                self.adb_path,
+                self.device_id,
+                list(self.filter_by.packages),
+                poll_interval=self.pid_poll_interval,
+                max_poll_interval=self.pid_max_poll_interval,
+                poll_backoff_factor=self.pid_poll_backoff_factor,
             )
 
         self._process: subprocess.Popen[str] | None = None

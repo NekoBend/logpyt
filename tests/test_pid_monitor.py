@@ -120,3 +120,55 @@ class TestPidMonitor:
             2222: "com.example.app",
             3333: "com.example.app",
         }
+
+    @patch("logpyt.streams.sync.PidMonitor._resolve_pids")
+    def test_run_loop_adaptive_backoff_when_unchanged(self, mock_resolve):
+        monitor = PidMonitor(
+            adb_path="adb",
+            device_id=None,
+            packages=["com.example.app"],
+            poll_interval=1.0,
+            max_poll_interval=4.0,
+            poll_backoff_factor=2.0,
+        )
+        mock_resolve.return_value = []
+
+        intervals: list[float] = []
+
+        def side_effect_wait(timeout):
+            intervals.append(timeout)
+            if len(intervals) >= 3:
+                monitor._stop_event.set()
+
+        monitor._stop_event.wait = Mock(side_effect=side_effect_wait)
+
+        monitor._run()
+
+        assert intervals == [2.0, 4.0, 4.0]
+
+    @patch("logpyt.streams.sync.PidMonitor._resolve_pids")
+    @patch("logpyt.streams.sync.PidMonitor._update_pid_map")
+    def test_run_loop_resets_backoff_on_change(self, mock_update, mock_resolve):
+        monitor = PidMonitor(
+            adb_path="adb",
+            device_id=None,
+            packages=["com.example.app"],
+            poll_interval=1.0,
+            max_poll_interval=4.0,
+            poll_backoff_factor=2.0,
+        )
+        mock_resolve.return_value = []
+        mock_update.side_effect = [False, False, True]
+
+        intervals: list[float] = []
+
+        def side_effect_wait(timeout):
+            intervals.append(timeout)
+            if len(intervals) >= 3:
+                monitor._stop_event.set()
+
+        monitor._stop_event.wait = Mock(side_effect=side_effect_wait)
+
+        monitor._run()
+
+        assert intervals == [2.0, 4.0, 1.0]

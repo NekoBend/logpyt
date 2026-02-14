@@ -35,6 +35,8 @@ class AsyncPidMonitor:
         device_id: str | None,
         packages: list[str],
         poll_interval: float = 5.0,
+        max_poll_interval: float = 30.0,
+        poll_backoff_factor: float = 2.0,
     ) -> None:
         """Initialize the PID monitor.
 
@@ -43,11 +45,15 @@ class AsyncPidMonitor:
             device_id: Target device serial ID.
             packages: List of package names to monitor.
             poll_interval: Interval in seconds between PID polls.
+            max_poll_interval: Maximum poll interval in seconds when idle.
+            poll_backoff_factor: Multiplier applied after unchanged polls.
         """
         self.adb_path = adb_path
         self.device_id = device_id
         self.packages = list(set(packages))
-        self.poll_interval = poll_interval
+        self.poll_interval = max(0.1, poll_interval)
+        self.max_poll_interval = max(self.poll_interval, max_poll_interval)
+        self.poll_backoff_factor = max(1.0, poll_backoff_factor)
         self._pid_map: dict[int, str] = {}
         self._lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
@@ -89,6 +95,7 @@ class AsyncPidMonitor:
 
     async def _run(self) -> None:
         """Internal loop to poll PIDs."""
+        current_interval = self.poll_interval
         while not self._stop_event.is_set():
             new_map: dict[int, str] = {}
             for package in self.packages:
@@ -96,11 +103,19 @@ class AsyncPidMonitor:
                 for pid in pids:
                     new_map[pid] = package
 
-            await self._update_pid_map(new_map)
+            changed = await self._update_pid_map(new_map)
+
+            if changed:
+                current_interval = self.poll_interval
+            else:
+                current_interval = min(
+                    self.max_poll_interval,
+                    current_interval * self.poll_backoff_factor,
+                )
 
             try:
                 await asyncio.wait_for(
-                    self._stop_event.wait(), timeout=self.poll_interval
+                    self._stop_event.wait(), timeout=current_interval
                 )
             except asyncio.TimeoutError:
                 continue
@@ -241,6 +256,8 @@ class AsyncLogStream:
         auto_reconnect: bool = False,
         reconnect_delay: float = 1.0,
         pid_poll_interval: float = 5.0,
+        pid_max_poll_interval: float = 30.0,
+        pid_poll_backoff_factor: float = 2.0,
         read_timeout: float | None = None,
         callback_queue_size: int = 1024,
     ) -> None:
@@ -265,6 +282,8 @@ class AsyncLogStream:
             auto_reconnect: Whether to automatically reconnect when the process exits.
             reconnect_delay: Delay in seconds before reconnecting.
             pid_poll_interval: Interval in seconds for PID monitoring.
+            pid_max_poll_interval: Maximum PID poll interval when idle.
+            pid_poll_backoff_factor: Backoff factor for unchanged PID snapshots.
             read_timeout: Timeout in seconds for reading from the stream.
             callback_queue_size: Max buffered callback items per stream source.
                 Uses backpressure when full.
@@ -276,6 +295,8 @@ class AsyncLogStream:
         self.auto_reconnect = auto_reconnect
         self.reconnect_delay = reconnect_delay
         self.pid_poll_interval = pid_poll_interval
+        self.pid_max_poll_interval = pid_max_poll_interval
+        self.pid_poll_backoff_factor = pid_poll_backoff_factor
         self.read_timeout = read_timeout
         self.callback_queue_size = callback_queue_size
 
@@ -311,6 +332,8 @@ class AsyncLogStream:
                 self.device_id,
                 packages,
                 poll_interval=self.pid_poll_interval,
+                max_poll_interval=self.pid_max_poll_interval,
+                poll_backoff_factor=self.pid_poll_backoff_factor,
             )
 
         self._process: asyncio.subprocess.Process | None = None

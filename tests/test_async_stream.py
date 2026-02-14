@@ -220,6 +220,74 @@ async def test_async_pid_monitor_update_applies_add_remove_and_change():
 
 
 @pytest.mark.asyncio
+@patch("logpyt.streams.async_stream.AsyncPidMonitor._resolve_pids", new_callable=AsyncMock)
+async def test_async_pid_monitor_run_loop_adaptive_backoff_when_unchanged(mock_resolve):
+    """Poll interval should back off up to max when snapshots do not change."""
+    monitor = AsyncPidMonitor(
+        adb_path="adb",
+        device_id=None,
+        packages=["pkg"],
+        poll_interval=1.0,
+        max_poll_interval=4.0,
+        poll_backoff_factor=2.0,
+    )
+    mock_resolve.return_value = []
+
+    intervals: list[float] = []
+
+    async def fake_wait_for(awaitable, timeout):
+        close = getattr(awaitable, "close", None)
+        if callable(close):
+            close()
+        intervals.append(timeout)
+        if len(intervals) >= 3:
+            monitor._stop_event.set()
+            return True
+        raise asyncio.TimeoutError
+
+    with patch("logpyt.streams.async_stream.asyncio.wait_for", side_effect=fake_wait_for):
+        await monitor._run()
+
+    assert intervals == [2.0, 4.0, 4.0]
+
+
+@pytest.mark.asyncio
+@patch("logpyt.streams.async_stream.AsyncPidMonitor._resolve_pids", new_callable=AsyncMock)
+@patch("logpyt.streams.async_stream.AsyncPidMonitor._update_pid_map", new_callable=AsyncMock)
+async def test_async_pid_monitor_run_loop_resets_backoff_on_change(
+    mock_update, mock_resolve
+):
+    """Poll interval should reset to base quickly when a change is detected."""
+    monitor = AsyncPidMonitor(
+        adb_path="adb",
+        device_id=None,
+        packages=["pkg"],
+        poll_interval=1.0,
+        max_poll_interval=4.0,
+        poll_backoff_factor=2.0,
+    )
+    mock_resolve.return_value = []
+    mock_update.side_effect = [False, False, True]
+
+    intervals: list[float] = []
+
+    async def fake_wait_for(awaitable, timeout):
+        close = getattr(awaitable, "close", None)
+        if callable(close):
+            close()
+        intervals.append(timeout)
+        if len(intervals) >= 3:
+            monitor._stop_event.set()
+            return True
+        raise asyncio.TimeoutError
+
+    with patch("logpyt.streams.async_stream.asyncio.wait_for", side_effect=fake_wait_for):
+        await monitor._run()
+
+    assert intervals == [2.0, 4.0, 1.0]
+
+
+@pytest.mark.asyncio
 async def test_stream_with_pid_monitor(
     mock_resolve_adb, mock_create_subprocess, mock_process
 ):
