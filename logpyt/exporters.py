@@ -27,11 +27,11 @@ class LogExporter(Protocol):
 class JsonLogExporter:
     """Exports log entries to a JSON file."""
 
-    def __init__(self, indent: int | None = 4, ensure_ascii: bool = False) -> None:
+    def __init__(self, indent: int | None = None, ensure_ascii: bool = False) -> None:
         """Initialize the JSON exporter.
 
         Args:
-            indent: Number of spaces for indentation. Defaults to 4.
+            indent: Number of spaces for indentation. Defaults to None (compact).
             ensure_ascii: If True, non-ASCII characters are escaped. Defaults to False.
         """
         self.indent = indent
