@@ -35,6 +35,7 @@ class PidMonitor:
         poll_interval: float = 2.0,
         max_poll_interval: float = 30.0,
         poll_backoff_factor: float = 2.0,
+        max_resolves_per_cycle: int = 32,
     ) -> None:
         """Initialize the PID monitor.
 
@@ -45,6 +46,7 @@ class PidMonitor:
             poll_interval: Base interval in seconds between PID polls.
             max_poll_interval: Maximum poll interval in seconds when idle.
             poll_backoff_factor: Multiplier applied after unchanged polls.
+            max_resolves_per_cycle: Maximum packages to resolve per poll cycle.
         """
         self.adb_path = adb_path
         self.device_id = device_id
@@ -52,10 +54,12 @@ class PidMonitor:
         self.poll_interval = max(0.1, poll_interval)
         self.max_poll_interval = max(self.poll_interval, max_poll_interval)
         self.poll_backoff_factor = max(1.0, poll_backoff_factor)
+        self.max_resolves_per_cycle = max(1, max_resolves_per_cycle)
         self._pid_map: dict[int, str] = {}
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._resolve_cursor = 0
 
     def start(self) -> None:
         """Start the monitoring thread."""
@@ -90,11 +94,32 @@ class PidMonitor:
         """Internal loop to poll PIDs."""
         current_interval = self.poll_interval
         while not self._stop_event.is_set():
-            new_map: dict[int, str] = {}
-            for package in self.packages:
+            packages = self.packages
+            total = len(packages)
+            cycle_limit = min(total, self.max_resolves_per_cycle)
+            polled_packages: list[str] = []
+            resolved_map: dict[int, str] = {}
+            for offset in range(cycle_limit):
+                package = packages[(self._resolve_cursor + offset) % total]
+                polled_packages.append(package)
                 pids = self._resolve_pids(package)
                 for pid in pids:
-                    new_map[pid] = package
+                    resolved_map[pid] = package
+
+            if cycle_limit == total:
+                new_map = resolved_map
+            else:
+                polled_package_set = set(polled_packages)
+                with self._lock:
+                    new_map = {
+                        pid: package
+                        for pid, package in self._pid_map.items()
+                        if package not in polled_package_set
+                    }
+                new_map.update(resolved_map)
+
+            if total:
+                self._resolve_cursor = (self._resolve_cursor + cycle_limit) % total
 
             changed = self._update_pid_map(new_map)
 
@@ -253,9 +278,11 @@ class LogStream:
         max_queue_size: int = 10000,
         read_timeout: float | None = None,
         queue_full_warning_interval: float = 5.0,
+        queue_overflow_policy: Literal["drop_newest", "drop_oldest"] = "drop_newest",
         pid_poll_interval: float = 2.0,
         pid_max_poll_interval: float = 30.0,
         pid_poll_backoff_factor: float = 2.0,
+        pid_max_resolves_per_cycle: int = 32,
     ) -> None:
         """Initialize the LogStream.
 
@@ -287,9 +314,12 @@ class LogStream:
             read_timeout: Timeout in seconds for reading from the stream.
             queue_full_warning_interval: Minimum interval in seconds between
                 repeated queue-full warnings. Defaults to 5.0.
+            queue_overflow_policy: Policy for callback queue overflow.
+                "drop_newest" drops incoming data, "drop_oldest" evicts oldest queued item.
             pid_poll_interval: Base interval in seconds for PID monitoring.
             pid_max_poll_interval: Maximum PID poll interval when idle.
             pid_poll_backoff_factor: Backoff factor for unchanged PID snapshots.
+            pid_max_resolves_per_cycle: Maximum packages to resolve per PID poll cycle.
         """
         self.adb_path = adb_path or resolve_adb()
         self.device_id = device_id
@@ -300,9 +330,11 @@ class LogStream:
         self.max_queue_size = max_queue_size
         self.read_timeout = read_timeout
         self._queue_full_warning_interval = max(0.0, queue_full_warning_interval)
+        self.queue_overflow_policy = queue_overflow_policy
         self.pid_poll_interval = pid_poll_interval
         self.pid_max_poll_interval = pid_max_poll_interval
         self.pid_poll_backoff_factor = pid_poll_backoff_factor
+        self.pid_max_resolves_per_cycle = pid_max_resolves_per_cycle
 
         # Handle grouper shortcut
         self.group_by = group_by
@@ -341,6 +373,7 @@ class LogStream:
                 poll_interval=self.pid_poll_interval,
                 max_poll_interval=self.pid_max_poll_interval,
                 poll_backoff_factor=self.pid_poll_backoff_factor,
+                max_resolves_per_cycle=self.pid_max_resolves_per_cycle,
             )
 
         self._process: subprocess.Popen[str] | None = None
@@ -474,7 +507,7 @@ class LogStream:
                 self.on_start()
 
             # Wait for process to exit
-            self._process.wait()
+            return_code = self._process.wait()
 
             # Wait for threads to finish reading
             if self._stdout_thread:
@@ -487,14 +520,23 @@ class LogStream:
                 self._watchdog_thread.join(timeout=1.0)
 
             # Signal callback thread to stop
-            self._callback_queue.put(None)
+            self._enqueue_callback_item(None, source=None, force=True)
             if self._callback_thread:
-                self._callback_thread.join()
+                self._callback_thread.join(timeout=0.5)
 
             if self._pid_monitor:
                 self._pid_monitor.stop()
 
             if self._stop_event.is_set():
+                break
+
+            if isinstance(return_code, int) and return_code != 0:
+                err = LogStreamInternalError(
+                    f"adb logcat exited with code {return_code}"
+                )
+                self._exceptions.put(err)
+                if self.on_error:
+                    self.on_error(err)
                 break
 
             if not self.auto_reconnect:
@@ -570,9 +612,21 @@ class LogStream:
         if not self._connection_thread:
             return
 
+        connection_was_alive = self._connection_thread.is_alive()
+
         self._connection_thread.join(timeout=timeout)
         if self._connection_thread.is_alive():
             raise LogStreamTimeoutError("Timeout waiting for connection thread")
+
+        if self._callback_thread and self._callback_thread.is_alive():
+            # Keep historical behavior: once join() has waited for the connection
+            # thread, it waits for callback completion when possible.
+            if timeout is None or connection_was_alive:
+                self._callback_thread.join()
+            else:
+                self._callback_thread.join(timeout=max(timeout, 0.0))
+                if self._callback_thread.is_alive():
+                    raise LogStreamTimeoutError("Timeout waiting for callback thread")
 
         if self.state == StreamState.KILLED:
             raise LogStreamKilledError("Stream was killed")
@@ -639,6 +693,9 @@ class LogStream:
 
         try:
             while not self._stop_event.is_set():
+                if self._process and self._process.poll() is not None:
+                    break
+
                 line = pipe.readline()
                 if not line:
                     # EOF
@@ -663,12 +720,7 @@ class LogStream:
             if source == "stdout" and self.group_by:
                 flushed = self.group_by.flush()
                 if flushed:
-                    try:
-                        self._callback_queue.put_nowait((flushed, source))
-                    except queue.Full:
-                        self._warn_queue_full_once(
-                            "LogStream callback queue is full. Dropping grouped log entries."
-                        )
+                    self._enqueue_callback_item((flushed, source), source=source)
 
     def _callback_loop(self) -> None:
         """Internal loop to process callbacks."""
@@ -694,6 +746,50 @@ class LogStream:
                 if self.on_error:
                     self.on_error(e)
 
+    def _enqueue_callback_item(
+        self,
+        item: tuple[list[LogEntry | list[LogEntry]], str] | None,
+        source: str | None,
+        force: bool = False,
+    ) -> None:
+        """Enqueue callback work honoring overflow policy."""
+        try:
+            self._callback_queue.put_nowait(item)
+            return
+        except queue.Full:
+            pass
+
+        if force:
+            try:
+                self._callback_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._callback_queue.put_nowait(item)
+            except queue.Full:
+                return
+            return
+
+        if self.queue_overflow_policy == "drop_oldest":
+            try:
+                self._callback_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._callback_queue.put_nowait(item)
+                return
+            except queue.Full:
+                pass
+
+        if source == "stdout" and self.group_by:
+            self._warn_queue_full_once(
+                "LogStream callback queue is full. Dropping grouped log entries."
+            )
+        else:
+            self._warn_queue_full_once(
+                "LogStream callback queue is full. Dropping log entry."
+            )
+
     def _process_line(self, line: str, source: str) -> None:
         """Process a single raw line."""
         # 1. Parse
@@ -702,10 +798,12 @@ class LogStream:
                 entry = self.parser.parse_stdout(line)
             else:
                 entry = self.parser.parse_stderr(line)
-        except Exception:
-            # If parsing fails, maybe fallback or ignore?
-            # For now, let's assume parser handles it or returns a basic entry
-            # If parser raises, we catch it here to not kill the thread
+        except Exception as e:
+            self._exceptions.put(e)
+            if self.on_error:
+                self.on_error(e)
+            if self._process:
+                self._process.terminate()
             return
 
         if self._pid_monitor:
@@ -726,12 +824,7 @@ class LogStream:
 
         # 4. Dispatch
         if items_to_emit:
-            try:
-                self._callback_queue.put_nowait((items_to_emit, source))
-            except queue.Full:
-                self._warn_queue_full_once(
-                    "LogStream callback queue is full. Dropping log entry."
-                )
+            self._enqueue_callback_item((items_to_emit, source), source=source)
 
     def __enter__(self) -> StreamHandle:
         """Start the stream and return the handle."""

@@ -1,13 +1,14 @@
 """Tests for log stream."""
 
 import logging
+import threading
 import time
 from datetime import datetime
 from unittest.mock import Mock
 
 import pytest
 
-from logpyt.exceptions import LogStreamInternalError
+from logpyt.exceptions import LogStreamInternalError, LogStreamTimeoutError
 from logpyt.filters import Filter
 from logpyt.models import LogEntry
 from logpyt.streams import LogStream, StreamState
@@ -119,6 +120,18 @@ def test_stream_error_callback(mocker) -> None:
     error_cb.assert_called_once()
 
 
+def test_stream_startup_failure_is_raised_from_join(mocker) -> None:
+    """Startup failures should be surfaced by join()."""
+    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("subprocess.Popen", side_effect=OSError("adb start failed"))
+
+    stream = LogStream()
+    stream.start()
+
+    with pytest.raises(LogStreamInternalError, match="adb start failed"):
+        stream.join(timeout=1.0)
+
+
 def test_stream_join_raises_exception(mock_popen, mocker) -> None:
     """Test that exceptions in threads are propagated to join()."""
     mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
@@ -135,6 +148,41 @@ def test_stream_join_raises_exception(mock_popen, mocker) -> None:
         stream.join(timeout=1.0)
 
     assert "Thread error" in str(excinfo.value)
+
+
+def test_stream_parse_error_propagates_to_join(mock_popen, mocker) -> None:
+    """Parser exceptions should be visible to join() callers."""
+    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+
+    process_mock = mock_popen.return_value
+    process_mock.stdout.readline.side_effect = ["bad line\n", ""]
+    process_mock.stderr.readline.return_value = ""
+
+    parser = Mock()
+    parser.parse_stdout.side_effect = ValueError("parse failed")
+
+    stream = LogStream(parser=parser)
+    stream.start()
+
+    with pytest.raises(LogStreamInternalError, match="parse failed"):
+        stream.join(timeout=1.0)
+
+
+def test_stream_non_zero_exit_is_raised_from_join(mock_popen, mocker) -> None:
+    """Non-zero ADB process exit should be surfaced by join()."""
+    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+
+    process_mock = mock_popen.return_value
+    process_mock.stdout.readline.return_value = ""
+    process_mock.stderr.readline.return_value = "adb: device offline\n"
+    process_mock.wait.return_value = 1
+    process_mock.poll.return_value = 1
+
+    stream = LogStream()
+    stream.start()
+
+    with pytest.raises(LogStreamInternalError):
+        stream.join(timeout=1.0)
 
 
 def test_stream_package_resolution(mock_popen, mocker) -> None:
@@ -310,3 +358,185 @@ def test_queue_full_warning_rate_limited(caplog, mocker) -> None:
         rec for rec in caplog.records if "callback queue is full" in rec.message
     ]
     assert len(queue_warnings) == 1
+
+
+def test_stop_does_not_hang_when_callback_queue_is_full(mock_popen, mocker) -> None:
+    """Stopping should complete even if callback queue is saturated."""
+    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+
+    process_mock = mock_popen.return_value
+    process_mock.stdout.readline.side_effect = [
+        "line-1\n",
+        "line-2\n",
+        "line-3\n",
+        "",
+    ]
+    process_mock.stderr.readline.return_value = ""
+    process_mock.wait.side_effect = lambda *args, **kwargs: time.sleep(0.1)
+
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+
+    def blocking_callback(entry, handle):
+        if entry.message == "line-1":
+            callback_entered.set()
+            release_callback.wait(timeout=2.0)
+
+    stream = LogStream(
+        stdout_callback=blocking_callback,
+        max_queue_size=1,
+    )
+
+    try:
+        stream.start()
+        assert callback_entered.wait(timeout=1.0)
+
+        deadline = time.time() + 1.0
+        while stream._callback_queue.qsize() < 1 and time.time() < deadline:
+            time.sleep(0.01)
+
+        assert stream._callback_queue.qsize() == 1
+
+        stream.stop()
+        stream.join(timeout=0.5)
+    finally:
+        release_callback.set()
+        stream.stop()
+        try:
+            stream.join(timeout=1.0)
+        except Exception:
+            pass
+
+
+def test_join_waits_for_callback_thread_completion(mock_popen, mocker) -> None:
+    """join() should not return while callback worker is still running."""
+    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+
+    process_mock = mock_popen.return_value
+    process_mock.stdout.readline.side_effect = ["line-1\n", ""]
+    process_mock.stderr.readline.return_value = ""
+    process_mock.wait.side_effect = lambda *args, **kwargs: time.sleep(0.1)
+
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+
+    def blocking_callback(entry, handle):
+        del entry, handle
+        callback_started.set()
+        release_callback.wait(timeout=3.0)
+
+    stream = LogStream(
+        stdout_callback=blocking_callback,
+        max_queue_size=1,
+    )
+
+    try:
+        stream.start()
+        assert callback_started.wait(timeout=1.0)
+
+        stream.stop()
+        stream.join(timeout=1.0)
+
+        assert stream._callback_thread is not None
+        assert not stream._callback_thread.is_alive()
+    finally:
+        release_callback.set()
+        stream.stop()
+        try:
+            stream.join(timeout=1.0)
+        except Exception:
+            pass
+
+
+def test_join_timeout_honored_when_callback_thread_blocked(
+    mock_popen, mocker
+) -> None:
+    """join(timeout=...) should time out even if callback thread is blocked."""
+    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+
+    process_mock = mock_popen.return_value
+    process_mock.stdout.readline.side_effect = ["line-1\n", ""]
+    process_mock.stderr.readline.return_value = ""
+    process_mock.wait.return_value = 0
+
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+
+    def blocking_callback(entry, handle):
+        del entry, handle
+        callback_started.set()
+        release_callback.wait(timeout=1.0)
+
+    stream = LogStream(
+        stdout_callback=blocking_callback,
+        max_queue_size=1,
+    )
+
+    try:
+        stream.start()
+        assert callback_started.wait(timeout=1.0)
+
+        stream.stop()
+
+        assert stream._connection_thread is not None
+        stream._connection_thread.join(timeout=1.0)
+        assert not stream._connection_thread.is_alive()
+
+        assert stream._callback_thread is not None
+        assert stream._callback_thread.is_alive()
+
+        start = time.monotonic()
+        with pytest.raises(LogStreamTimeoutError):
+            stream.join(timeout=0.05)
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 0.5
+    finally:
+        release_callback.set()
+        stream.stop()
+        try:
+            stream.join(timeout=1.0)
+        except Exception:
+            pass
+
+
+def test_sync_queue_overflow_policy_drop_oldest_is_configurable(mocker) -> None:
+    """Queue overflow policy should allow replacing stale queued items."""
+    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+
+    stream = LogStream(
+        max_queue_size=1,
+        queue_overflow_policy="drop_oldest",
+    )
+
+    old_entry = LogEntry(
+        timestamp=datetime.now(),
+        pid=1,
+        tid=1,
+        level="I",
+        tag="T",
+        message="old",
+        raw="old",
+    )
+    stream._callback_queue.put_nowait(([old_entry], "stdout"))
+
+    parser = Mock()
+    parser.parse_stdout.return_value = LogEntry(
+        timestamp=datetime.now(),
+        pid=1,
+        tid=1,
+        level="I",
+        tag="T",
+        message="new",
+        raw="new",
+    )
+    stream.parser = parser
+
+    stream._process_line("new\n", "stdout")
+
+    queued_items, source = stream._callback_queue.get_nowait()
+    assert source == "stdout"
+    assert len(queued_items) == 1
+    emitted = queued_items[0]
+    assert isinstance(emitted, LogEntry)
+    assert emitted.message == "new"

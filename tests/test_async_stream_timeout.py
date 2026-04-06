@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from logpyt.exceptions import LogStreamTimeoutError
 from logpyt.streams.async_stream import AsyncLogStream
 
 
@@ -57,3 +58,39 @@ async def test_read_timeout_raises_exception():
 
         # Verify process was terminated
         mock_process.terminate.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_read_timeout_is_raised_by_join() -> None:
+    """Read timeout should be surfaced to join() callers."""
+    mock_process = MagicMock()
+    mock_process.stdout = AsyncMock()
+    mock_process.stderr = AsyncMock()
+    mock_process.returncode = 0
+    mock_process.terminate = MagicMock()
+
+    async def hanging_readline():
+        await asyncio.sleep(1.0)
+        return b"line\n"
+
+    async def delayed_wait() -> int:
+        await asyncio.sleep(0.2)
+        return 0
+
+    mock_process.stdout.readline.side_effect = hanging_readline
+    mock_process.stderr.readline.return_value = b""
+    mock_process.wait = AsyncMock(side_effect=delayed_wait)
+
+    with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+        mock_exec.return_value = mock_process
+
+        stream = AsyncLogStream(
+            adb_path="adb",
+            read_timeout=0.05,
+            auto_reconnect=False,
+        )
+
+        await stream.start()
+
+        with pytest.raises(LogStreamTimeoutError):
+            await stream.join(timeout=1.0)

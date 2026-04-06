@@ -37,6 +37,7 @@ class AsyncPidMonitor:
         poll_interval: float = 5.0,
         max_poll_interval: float = 30.0,
         poll_backoff_factor: float = 2.0,
+        max_resolves_per_cycle: int = 32,
     ) -> None:
         """Initialize the PID monitor.
 
@@ -47,6 +48,7 @@ class AsyncPidMonitor:
             poll_interval: Interval in seconds between PID polls.
             max_poll_interval: Maximum poll interval in seconds when idle.
             poll_backoff_factor: Multiplier applied after unchanged polls.
+            max_resolves_per_cycle: Maximum packages to resolve per poll cycle.
         """
         self.adb_path = adb_path
         self.device_id = device_id
@@ -54,10 +56,12 @@ class AsyncPidMonitor:
         self.poll_interval = max(0.1, poll_interval)
         self.max_poll_interval = max(self.poll_interval, max_poll_interval)
         self.poll_backoff_factor = max(1.0, poll_backoff_factor)
+        self.max_resolves_per_cycle = max(1, max_resolves_per_cycle)
         self._pid_map: dict[int, str] = {}
         self._lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._resolve_cursor = 0
 
     async def start(self) -> None:
         """Start the monitoring task."""
@@ -98,10 +102,17 @@ class AsyncPidMonitor:
         current_interval = self.poll_interval
         while not self._stop_event.is_set():
             new_map: dict[int, str] = {}
-            for package in self.packages:
+            packages = self.packages
+            total = len(packages)
+            cycle_limit = min(total, self.max_resolves_per_cycle)
+            for offset in range(cycle_limit):
+                package = packages[(self._resolve_cursor + offset) % total]
                 pids = await self._resolve_pids(package)
                 for pid in pids:
                     new_map[pid] = package
+
+            if total:
+                self._resolve_cursor = (self._resolve_cursor + cycle_limit) % total
 
             changed = await self._update_pid_map(new_map)
 
@@ -260,6 +271,8 @@ class AsyncLogStream:
         pid_poll_backoff_factor: float = 2.0,
         read_timeout: float | None = None,
         callback_queue_size: int = 1024,
+        callback_queue_policy: Literal["drop_newest", "drop_oldest"] = "drop_newest",
+        pid_max_resolves_per_cycle: int = 32,
     ) -> None:
         """Initialize the AsyncLogStream.
 
@@ -287,6 +300,9 @@ class AsyncLogStream:
             read_timeout: Timeout in seconds for reading from the stream.
             callback_queue_size: Max buffered callback items per stream source.
                 Uses backpressure when full.
+            callback_queue_policy: Policy for callback queue overflow.
+                "drop_newest" drops incoming data, "drop_oldest" evicts oldest queued item.
+            pid_max_resolves_per_cycle: Maximum packages to resolve per PID poll cycle.
         """
         self.adb_path = adb_path or resolve_adb()
         self.device_id = device_id
@@ -299,6 +315,8 @@ class AsyncLogStream:
         self.pid_poll_backoff_factor = pid_poll_backoff_factor
         self.read_timeout = read_timeout
         self.callback_queue_size = callback_queue_size
+        self.callback_queue_policy = callback_queue_policy
+        self.pid_max_resolves_per_cycle = pid_max_resolves_per_cycle
 
         # Handle grouper shortcut
         self.group_by = group_by
@@ -334,6 +352,7 @@ class AsyncLogStream:
                 poll_interval=self.pid_poll_interval,
                 max_poll_interval=self.pid_max_poll_interval,
                 poll_backoff_factor=self.pid_poll_backoff_factor,
+                max_resolves_per_cycle=self.pid_max_resolves_per_cycle,
             )
 
         self._process: asyncio.subprocess.Process | None = None
@@ -371,6 +390,12 @@ class AsyncLogStream:
         if queue is None:
             await callback(item, self._handle)
             return
+        if self.callback_queue_policy == "drop_oldest" and queue.full():
+            try:
+                queue.get_nowait()
+                queue.task_done()
+            except asyncio.QueueEmpty:
+                pass
         await queue.put(item)
 
     async def _callback_dispatch_loop(
@@ -502,6 +527,7 @@ class AsyncLogStream:
                 stderr=asyncio.subprocess.PIPE,
             )
         except Exception as e:
+            self._exceptions.append(e)
             await self._set_state(StreamState.STOPPED)
             if self.on_error:
                 await self.on_error(e)
@@ -547,7 +573,7 @@ class AsyncLogStream:
 
         # Wait for process to exit
         try:
-            await self._process.wait()
+            return_code = await self._process.wait()
         except asyncio.CancelledError:
             # If connection manager is cancelled, we should stop everything
             return
@@ -570,6 +596,12 @@ class AsyncLogStream:
 
         if self._pid_monitor:
             await self._pid_monitor.stop()
+
+        if not self._stop_event.is_set() and return_code != 0:
+            error = LogStreamInternalError(f"adb logcat exited with code {return_code}")
+            self._exceptions.append(error)
+            if self.on_error:
+                await self.on_error(error)
 
     async def stop(self) -> None:
         """Stop the log stream gracefully."""
@@ -646,6 +678,8 @@ class AsyncLogStream:
 
         if self._exceptions:
             exc = self._exceptions[0]
+            if isinstance(exc, LogStreamTimeoutError) and self._stop_event.is_set():
+                return
             if isinstance(exc, LogStreamError):
                 raise exc
             raise LogStreamInternalError(
@@ -683,6 +717,7 @@ class AsyncLogStream:
 
                 await self._process_line(line, source)
         except asyncio.TimeoutError as e:
+            self._exceptions.append(LogStreamTimeoutError(str(e) or "Read timeout"))
             if self.on_error:
                 await self.on_error(e)
         except Exception as e:
@@ -717,7 +752,15 @@ class AsyncLogStream:
                 entry = self.parser.parse_stdout(line)
             else:
                 entry = self.parser.parse_stderr(line)
-        except Exception:
+        except Exception as e:
+            self._exceptions.append(e)
+            if self.on_error:
+                await self.on_error(e)
+            if self._process:
+                try:
+                    self._process.terminate()
+                except ProcessLookupError:
+                    pass
             return
 
         if self._pid_monitor:
@@ -756,7 +799,4 @@ class AsyncLogStream:
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Stop the stream on exit."""
         await self.stop()
-        try:
-            await self.join(timeout=1.0)
-        except (LogStreamTimeoutError, LogStreamKilledError):
-            pass
+        await self.join(timeout=1.0)

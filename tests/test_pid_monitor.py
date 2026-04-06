@@ -108,12 +108,10 @@ class TestPidMonitor:
             2222: "com.example.app",
         }
 
-        changed = monitor._update_pid_map(
-            {
-                2222: "com.example.app",  # unchanged
-                3333: "com.example.app",  # added
-            }
-        )
+        changed = monitor._update_pid_map({
+            2222: "com.example.app",  # unchanged
+            3333: "com.example.app",  # added
+        })
 
         assert changed is True
         assert monitor._pid_map == {
@@ -172,3 +170,69 @@ class TestPidMonitor:
         monitor._run()
 
         assert intervals == [2.0, 4.0, 1.0]
+
+    @patch("logpyt.streams.sync.PidMonitor._resolve_pids")
+    def test_run_loop_partial_resolve_preserves_unpolled_packages(self, mock_resolve):
+        """Partially polled package mappings should persist across cycles."""
+        monitor = PidMonitor(
+            adb_path="adb",
+            device_id=None,
+            packages=["pkg.a", "pkg.b", "pkg.c"],
+            poll_interval=0.1,
+            max_poll_interval=0.1,
+            max_resolves_per_cycle=1,
+        )
+
+        mock_resolve.side_effect = lambda package: {
+            "pkg.a": [1001],
+            "pkg.b": [1002],
+            "pkg.c": [1003],
+        }[package]
+
+        cycles = {"count": 0}
+
+        def stop_after_three_cycles(timeout: float) -> None:
+            del timeout
+            cycles["count"] += 1
+            if cycles["count"] >= 3:
+                monitor._stop_event.set()
+
+        monitor._stop_event.wait = Mock(side_effect=stop_after_three_cycles)
+
+        monitor._run()
+
+        assert monitor._pid_map == {
+            1001: "pkg.a",
+            1002: "pkg.b",
+            1003: "pkg.c",
+        }
+
+    def test_run_loop_large_package_set_limits_resolve_calls_per_cycle(self):
+        """Large package sets should avoid full pidof sweeps every poll cycle."""
+        packages = [f"pkg{i}" for i in range(120)]
+        monitor = PidMonitor(
+            adb_path="adb",
+            device_id=None,
+            packages=packages,
+            poll_interval=1.0,
+            max_poll_interval=1.0,
+        )
+
+        calls = {"n": 0}
+
+        def resolve_side_effect(package: str) -> list[int]:
+            del package
+            calls["n"] += 1
+            return []
+
+        monitor._resolve_pids = Mock(side_effect=resolve_side_effect)
+
+        def stop_after_one_cycle(timeout: float) -> None:
+            del timeout
+            monitor._stop_event.set()
+
+        monitor._stop_event.wait = Mock(side_effect=stop_after_one_cycle)
+
+        monitor._run()
+
+        assert calls["n"] < len(packages)

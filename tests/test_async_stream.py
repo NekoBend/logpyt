@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from logpyt.exceptions import LogStreamInternalError, LogStreamTimeoutError
 from logpyt.models import LogEntry
 from logpyt.streams.async_stream import AsyncLogStream, AsyncPidMonitor, StreamState
 
@@ -146,6 +147,73 @@ async def test_context_manager(mock_resolve_adb, mock_create_subprocess, mock_pr
 
 
 @pytest.mark.asyncio
+async def test_async_stream_startup_failure_propagates_to_join() -> None:
+    """Startup errors should be visible to join() callers."""
+    with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec:
+        mock_exec.side_effect = OSError("adb start failed")
+
+        stream = AsyncLogStream(adb_path="adb")
+        await stream.start()
+
+        with pytest.raises(LogStreamInternalError, match="adb start failed"):
+            await stream.join(timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_async_stream_parse_error_propagates_to_join(
+    mock_resolve_adb, mock_create_subprocess, mock_process
+):
+    """Parser exceptions should be surfaced by join()."""
+    mock_process.stdout.readline.side_effect = [b"bad line\n", b""]
+    mock_process.stderr.readline.return_value = b""
+
+    parser = MagicMock()
+    parser.parse_stdout.side_effect = ValueError("parse failed")
+
+    stream = AsyncLogStream(parser=parser)
+    await stream.start()
+
+    with pytest.raises(LogStreamInternalError, match="parse failed"):
+        await stream.join(timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_async_stream_non_zero_exit_is_raised_from_join(
+    mock_resolve_adb, mock_create_subprocess, mock_process
+):
+    """Non-zero ADB process exit should be surfaced by join()."""
+    mock_process.stdout.readline.return_value = b""
+    mock_process.stderr.readline.return_value = b""
+    mock_process.returncode = 1
+    mock_process.wait = AsyncMock(return_value=1)
+
+    stream = AsyncLogStream()
+    await stream.start()
+
+    with pytest.raises(LogStreamInternalError):
+        await stream.join(timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_async_context_manager_does_not_swallow_join_timeout() -> None:
+    """Context manager cleanup should not suppress join timeout failures."""
+    stream = AsyncLogStream(adb_path="adb")
+
+    with (
+        patch.object(stream, "start", new=AsyncMock()),
+        patch.object(stream, "stop", new=AsyncMock()),
+        patch.object(
+            stream,
+            "join",
+            new=AsyncMock(side_effect=LogStreamTimeoutError("cleanup timeout")),
+        ),
+    ):
+        with pytest.raises(LogStreamTimeoutError, match="cleanup timeout"):
+            async with stream:
+                pass
+
+
+@pytest.mark.asyncio
 async def test_pid_monitor(mock_resolve_adb):
     """Verify AsyncPidMonitor resolves PIDs correctly."""
 
@@ -205,12 +273,10 @@ async def test_async_pid_monitor_update_applies_add_remove_and_change():
         2222: "pkg",
     }
 
-    changed = await monitor._update_pid_map(
-        {
-            2222: "pkg",
-            3333: "pkg",
-        }
-    )
+    changed = await monitor._update_pid_map({
+        2222: "pkg",
+        3333: "pkg",
+    })
 
     assert changed is True
     assert monitor._pid_map == {
@@ -220,7 +286,9 @@ async def test_async_pid_monitor_update_applies_add_remove_and_change():
 
 
 @pytest.mark.asyncio
-@patch("logpyt.streams.async_stream.AsyncPidMonitor._resolve_pids", new_callable=AsyncMock)
+@patch(
+    "logpyt.streams.async_stream.AsyncPidMonitor._resolve_pids", new_callable=AsyncMock
+)
 async def test_async_pid_monitor_run_loop_adaptive_backoff_when_unchanged(mock_resolve):
     """Poll interval should back off up to max when snapshots do not change."""
     monitor = AsyncPidMonitor(
@@ -245,15 +313,22 @@ async def test_async_pid_monitor_run_loop_adaptive_backoff_when_unchanged(mock_r
             return True
         raise asyncio.TimeoutError
 
-    with patch("logpyt.streams.async_stream.asyncio.wait_for", side_effect=fake_wait_for):
+    with patch(
+        "logpyt.streams.async_stream.asyncio.wait_for", side_effect=fake_wait_for
+    ):
         await monitor._run()
 
     assert intervals == [2.0, 4.0, 4.0]
 
 
 @pytest.mark.asyncio
-@patch("logpyt.streams.async_stream.AsyncPidMonitor._resolve_pids", new_callable=AsyncMock)
-@patch("logpyt.streams.async_stream.AsyncPidMonitor._update_pid_map", new_callable=AsyncMock)
+@patch(
+    "logpyt.streams.async_stream.AsyncPidMonitor._resolve_pids", new_callable=AsyncMock
+)
+@patch(
+    "logpyt.streams.async_stream.AsyncPidMonitor._update_pid_map",
+    new_callable=AsyncMock,
+)
 async def test_async_pid_monitor_run_loop_resets_backoff_on_change(
     mock_update, mock_resolve
 ):
@@ -281,7 +356,9 @@ async def test_async_pid_monitor_run_loop_resets_backoff_on_change(
             return True
         raise asyncio.TimeoutError
 
-    with patch("logpyt.streams.async_stream.asyncio.wait_for", side_effect=fake_wait_for):
+    with patch(
+        "logpyt.streams.async_stream.asyncio.wait_for", side_effect=fake_wait_for
+    ):
         await monitor._run()
 
     assert intervals == [2.0, 4.0, 1.0]
@@ -478,3 +555,13 @@ async def test_ingestion_not_blocked_by_slow_callback(
 
     release_callback.set()
     await stream.join(timeout=1.0)
+
+
+def test_async_callback_backpressure_policy_drop_oldest_is_configurable() -> None:
+    """Async callback backpressure policy should be configurable via API."""
+    stream = AsyncLogStream(
+        adb_path="adb",
+        callback_queue_size=1,
+        callback_queue_policy="drop_oldest",
+    )
+    assert stream.callback_queue_size == 1
