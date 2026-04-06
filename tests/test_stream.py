@@ -3,12 +3,17 @@
 import logging
 import threading
 import time
-from datetime import datetime
+from contextlib import suppress
+from datetime import UTC, datetime
 from unittest.mock import Mock
 
 import pytest
 
-from logpyt.exceptions import LogStreamInternalError, LogStreamTimeoutError
+from logpyt.exceptions import (
+    LogStreamError,
+    LogStreamInternalError,
+    LogStreamTimeoutError,
+)
 from logpyt.filters import Filter
 from logpyt.models import LogEntry
 from logpyt.streams import LogStream, StreamState
@@ -208,7 +213,7 @@ def test_stream_package_resolution(mock_popen, mocker) -> None:
     # Mock parser to return an entry with a specific PID
     mock_parser = Mock()
     mock_entry = LogEntry(
-        timestamp=datetime.now(),
+        timestamp=datetime.now(UTC).replace(tzinfo=None),
         pid=1234,
         tid=1234,
         level="D",
@@ -339,7 +344,7 @@ def test_queue_full_warning_rate_limited(caplog, mocker) -> None:
 
     # Fill queue to force queue.Full for subsequent puts.
     dummy_entry = LogEntry(
-        timestamp=datetime.now(),
+        timestamp=datetime.now(UTC).replace(tzinfo=None),
         pid=1,
         tid=1,
         level="I",
@@ -402,10 +407,8 @@ def test_stop_does_not_hang_when_callback_queue_is_full(mock_popen, mocker) -> N
     finally:
         release_callback.set()
         stream.stop()
-        try:
+        with suppress(LogStreamError):
             stream.join(timeout=1.0)
-        except Exception:
-            pass
 
 
 def test_join_waits_for_callback_thread_completion(mock_popen, mocker) -> None:
@@ -442,15 +445,11 @@ def test_join_waits_for_callback_thread_completion(mock_popen, mocker) -> None:
     finally:
         release_callback.set()
         stream.stop()
-        try:
+        with suppress(LogStreamError):
             stream.join(timeout=1.0)
-        except Exception:
-            pass
 
 
-def test_join_timeout_honored_when_callback_thread_blocked(
-    mock_popen, mocker
-) -> None:
+def test_join_timeout_honored_when_callback_thread_blocked(mock_popen, mocker) -> None:
     """join(timeout=...) should time out even if callback thread is blocked."""
     mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
 
@@ -494,10 +493,8 @@ def test_join_timeout_honored_when_callback_thread_blocked(
     finally:
         release_callback.set()
         stream.stop()
-        try:
+        with suppress(LogStreamError):
             stream.join(timeout=1.0)
-        except Exception:
-            pass
 
 
 def test_sync_queue_overflow_policy_drop_oldest_is_configurable(mocker) -> None:
@@ -510,7 +507,7 @@ def test_sync_queue_overflow_policy_drop_oldest_is_configurable(mocker) -> None:
     )
 
     old_entry = LogEntry(
-        timestamp=datetime.now(),
+        timestamp=datetime.now(UTC).replace(tzinfo=None),
         pid=1,
         tid=1,
         level="I",
@@ -522,7 +519,7 @@ def test_sync_queue_overflow_policy_drop_oldest_is_configurable(mocker) -> None:
 
     parser = Mock()
     parser.parse_stdout.return_value = LogEntry(
-        timestamp=datetime.now(),
+        timestamp=datetime.now(UTC).replace(tzinfo=None),
         pid=1,
         tid=1,
         level="I",
@@ -534,7 +531,9 @@ def test_sync_queue_overflow_policy_drop_oldest_is_configurable(mocker) -> None:
 
     stream._process_line("new\n", "stdout")
 
-    queued_items, source = stream._callback_queue.get_nowait()
+    callback_item = stream._callback_queue.get_nowait()
+    assert callback_item is not None
+    queued_items, source = callback_item
     assert source == "stdout"
     assert len(queued_items) == 1
     emitted = queued_items[0]

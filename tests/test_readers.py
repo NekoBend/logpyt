@@ -1,7 +1,7 @@
 """Tests for LogFileReader and read_file."""
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -92,7 +92,7 @@ def test_log_file_reader_error_handling(tmp_path: Path) -> None:
             raise ValueError("Parsing failed")
         # Return a dummy entry for other lines
         return LogEntry(
-            timestamp=datetime.now(),
+            timestamp=datetime.now(UTC).replace(tzinfo=None),
             pid=0,
             tid=0,
             level="I",

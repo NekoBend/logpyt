@@ -2,7 +2,7 @@
 
 import csv
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -16,7 +16,7 @@ def sample_entries() -> list[LogEntry]:
     """Create a list of sample LogEntry objects."""
     return [
         LogEntry(
-            timestamp=datetime(2023, 1, 1, 12, 0, 0),
+            timestamp=datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC).replace(tzinfo=None),
             pid=1001,
             tid=2001,
             level="D",
@@ -26,7 +26,7 @@ def sample_entries() -> list[LogEntry]:
             meta={"source": "main"},
         ),
         LogEntry(
-            timestamp=datetime(2023, 1, 1, 12, 0, 1),
+            timestamp=datetime(2023, 1, 1, 12, 0, 1, tzinfo=UTC).replace(tzinfo=None),
             pid=1002,
             tid=2002,
             level="E",
@@ -66,7 +66,7 @@ def test_json_exporter_ensure_ascii(tmp_path: Path) -> None:
     output_file = tmp_path / "logs_ascii.json"
     entries = [
         LogEntry(
-            timestamp=datetime(2023, 1, 1, 12, 0, 0),
+            timestamp=datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC).replace(tzinfo=None),
             pid=1001,
             tid=2001,
             level="I",

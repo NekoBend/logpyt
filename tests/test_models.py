@@ -1,14 +1,14 @@
 """Tests for logpyt models."""
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 
 from logpyt.models import LogEntry
 
 
 def test_log_entry_initialization() -> None:
     """Test LogEntry initialization."""
-    now = datetime.now()
+    now = datetime.now(UTC).replace(tzinfo=None)
     entry = LogEntry(
         timestamp=now,
         pid=123,
@@ -32,7 +32,7 @@ def test_log_entry_initialization() -> None:
 
 def test_log_entry_to_dict() -> None:
     """Test LogEntry.to_dict()."""
-    now = datetime.now()
+    now = datetime.now(UTC).replace(tzinfo=None)
     entry = LogEntry(
         timestamp=now,
         pid=123,
@@ -56,7 +56,7 @@ def test_log_entry_to_dict() -> None:
 
 def test_log_entry_to_json() -> None:
     """Test LogEntry.to_json()."""
-    now = datetime.now()
+    now = datetime.now(UTC).replace(tzinfo=None)
     entry = LogEntry(
         timestamp=now,
         pid=123,
@@ -79,7 +79,7 @@ def test_log_entry_to_json() -> None:
 
 def test_log_entry_to_json_formatting() -> None:
     """Test LogEntry.to_json() with formatting options."""
-    now = datetime.now()
+    now = datetime.now(UTC).replace(tzinfo=None)
     entry = LogEntry(
         timestamp=now,
         pid=123,
@@ -97,7 +97,7 @@ def test_log_entry_to_json_formatting() -> None:
 
 def test_log_entry_json_payload() -> None:
     """Test LogEntry.json_payload property."""
-    now = datetime.now()
+    now = datetime.now(UTC).replace(tzinfo=None)
 
     # Case 1: Valid JSON in message
     entry1 = LogEntry(

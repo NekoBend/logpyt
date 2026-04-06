@@ -23,7 +23,7 @@ def test_sliding_window_correctness():
         by=["pid", "tid"], threshold_ms=threshold_ms, emit_mode="group"
     )
 
-    start_ts = datetime.datetime.now().replace(microsecond=0)
+    start_ts = datetime.datetime.now(datetime.UTC).replace(microsecond=0, tzinfo=None)
     pid, tid = 100, 200
 
     # 1. Start a group at T=0
@@ -80,7 +80,7 @@ def test_windowed_grouper_limits_heap_growth_for_hot_key_updates():
         max_groups=64,
     )
 
-    start_ts = datetime.datetime.now().replace(microsecond=0)
+    start_ts = datetime.datetime.now(datetime.UTC).replace(microsecond=0, tzinfo=None)
 
     for i in range(300):
         entry = create_log_entry(

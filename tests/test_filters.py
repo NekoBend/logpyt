@@ -1,6 +1,6 @@
 """Tests for log filters."""
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -21,7 +21,7 @@ from logpyt.models import LogEntry
 def sample_entry() -> LogEntry:
     """Provide a sample log entry."""
     return LogEntry(
-        timestamp=datetime.now(),
+        timestamp=datetime.now(UTC).replace(tzinfo=None),
         pid=123,
         tid=456,
         level="D",
@@ -117,7 +117,9 @@ def test_message_contains_is_case_sensitive(sample_entry: LogEntry) -> None:
     assert c.check(sample_entry) is False
 
 
-def test_message_contains_treats_regex_chars_as_literals(sample_entry: LogEntry) -> None:
+def test_message_contains_treats_regex_chars_as_literals(
+    sample_entry: LogEntry,
+) -> None:
     """Regex meta characters in pattern should be matched literally."""
     entry = sample_entry.model_copy(update={"message": "a.b[c](d){e}?"})
     c = MessageContains("a.b[c](d){e}?")
@@ -130,7 +132,9 @@ def test_message_contains_empty_pattern_still_matches(sample_entry: LogEntry) ->
     assert c.check(sample_entry) is True
 
 
-def test_filter_message_contains_empty_list_matches_nothing(sample_entry: LogEntry) -> None:
+def test_filter_message_contains_empty_list_matches_nothing(
+    sample_entry: LogEntry,
+) -> None:
     """An explicitly empty message_contains list should match no entries."""
     f = Filter(message_contains=[])
     assert f(sample_entry) is False

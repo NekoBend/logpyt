@@ -1,6 +1,6 @@
 """Tests for log parsers."""
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 from logpyt.parsers import LogParser, ThreadTimeLogParser
 
@@ -62,7 +62,7 @@ def test_thread_time_parser_success() -> None:
     assert entry.timestamp.minute == 34
     assert entry.timestamp.second == 56
     assert entry.timestamp.microsecond == 789000
-    assert entry.timestamp.year == datetime.now().year
+    assert entry.timestamp.year == datetime.now(UTC).astimezone().year
     assert entry.meta["parser"] == "ThreadTimeLogParser"
 
 

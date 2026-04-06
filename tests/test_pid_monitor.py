@@ -85,9 +85,8 @@ class TestPidMonitor:
         def side_effect_wait(timeout):
             monitor._stop_event.set()
 
-        monitor._stop_event.wait = Mock(side_effect=side_effect_wait)
-
-        monitor._run()
+        with patch.object(monitor._stop_event, "wait", side_effect=side_effect_wait):
+            monitor._run()
 
         assert monitor._pid_map == {1234: "com.example.app"}
         mock_resolve.assert_called_with("com.example.app")
@@ -138,9 +137,8 @@ class TestPidMonitor:
             if len(intervals) >= 3:
                 monitor._stop_event.set()
 
-        monitor._stop_event.wait = Mock(side_effect=side_effect_wait)
-
-        monitor._run()
+        with patch.object(monitor._stop_event, "wait", side_effect=side_effect_wait):
+            monitor._run()
 
         assert intervals == [2.0, 4.0, 4.0]
 
@@ -165,9 +163,8 @@ class TestPidMonitor:
             if len(intervals) >= 3:
                 monitor._stop_event.set()
 
-        monitor._stop_event.wait = Mock(side_effect=side_effect_wait)
-
-        monitor._run()
+        with patch.object(monitor._stop_event, "wait", side_effect=side_effect_wait):
+            monitor._run()
 
         assert intervals == [2.0, 4.0, 1.0]
 
@@ -197,9 +194,12 @@ class TestPidMonitor:
             if cycles["count"] >= 3:
                 monitor._stop_event.set()
 
-        monitor._stop_event.wait = Mock(side_effect=stop_after_three_cycles)
-
-        monitor._run()
+        with patch.object(
+            monitor._stop_event,
+            "wait",
+            side_effect=stop_after_three_cycles,
+        ):
+            monitor._run()
 
         assert monitor._pid_map == {
             1001: "pkg.a",
@@ -225,14 +225,18 @@ class TestPidMonitor:
             calls["n"] += 1
             return []
 
-        monitor._resolve_pids = Mock(side_effect=resolve_side_effect)
-
         def stop_after_one_cycle(timeout: float) -> None:
             del timeout
             monitor._stop_event.set()
 
-        monitor._stop_event.wait = Mock(side_effect=stop_after_one_cycle)
-
-        monitor._run()
+        with (
+            patch.object(monitor, "_resolve_pids", side_effect=resolve_side_effect),
+            patch.object(
+                monitor._stop_event,
+                "wait",
+                side_effect=stop_after_one_cycle,
+            ),
+        ):
+            monitor._run()
 
         assert calls["n"] < len(packages)

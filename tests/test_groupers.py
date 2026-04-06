@@ -1,6 +1,6 @@
 """Tests for log groupers."""
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import cast
 
 import pytest
@@ -12,7 +12,7 @@ from logpyt.models import LogEntry
 @pytest.fixture
 def base_time() -> datetime:
     """Provide a base time for tests."""
-    return datetime(2023, 1, 1, 12, 0, 0)
+    return datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC).replace(tzinfo=None)
 
 
 def create_entry(

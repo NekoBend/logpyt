@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from logpyt.groupers import WindowedLogGrouper
 from logpyt.models import LogEntry
@@ -8,7 +8,7 @@ from logpyt.models import LogEntry
 class TestWindowedLogGrouper(unittest.TestCase):
     def test_interleaved_groups(self):
         grouper = WindowedLogGrouper(by=["tag"], threshold_ms=100.0)
-        base_time = datetime(2023, 1, 1, 12, 0, 0)
+        base_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC).replace(tzinfo=None)
 
         # Create interleaved entries
         # Group A: Tag1

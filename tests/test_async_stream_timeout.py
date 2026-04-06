@@ -47,14 +47,14 @@ async def test_read_timeout_raises_exception():
 
         try:
             await asyncio.wait_for(error_caught.wait(), timeout=2.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
         await stream.stop()
         await stream.join()
 
         assert caught_exception is not None
-        assert isinstance(caught_exception, asyncio.TimeoutError)
+        assert isinstance(caught_exception, TimeoutError)
 
         # Verify process was terminated
         mock_process.terminate.assert_called()

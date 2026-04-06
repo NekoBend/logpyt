@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 
 from logpyt.filters import AnrCondition, CrashCondition
 from logpyt.models import LogEntry
@@ -6,7 +6,7 @@ from logpyt.models import LogEntry
 
 def test_crash_condition():
     condition = CrashCondition()
-    now = datetime.now()
+    now = datetime.now(UTC).replace(tzinfo=None)
 
     # Match
     entry1 = LogEntry(
@@ -59,7 +59,7 @@ def test_crash_condition():
 
 def test_anr_condition():
     condition = AnrCondition()
-    now = datetime.now()
+    now = datetime.now(UTC).replace(tzinfo=None)
 
     # Match
     entry1 = LogEntry(

@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -67,7 +67,7 @@ async def test_lifecycle(mock_resolve_adb, mock_create_subprocess, mock_process)
     # Wait for state to become RUNNING
     try:
         await asyncio.wait_for(wait_for_state(stream, StreamState.RUNNING), timeout=1.0)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         pass  # Assertion will fail below if state is wrong
 
     assert stream.state == StreamState.RUNNING
@@ -135,7 +135,7 @@ async def test_context_manager(mock_resolve_adb, mock_create_subprocess, mock_pr
             await asyncio.wait_for(
                 wait_for_state(stream, StreamState.RUNNING), timeout=1.0
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
         assert stream.state == StreamState.RUNNING
@@ -207,10 +207,10 @@ async def test_async_context_manager_does_not_swallow_join_timeout() -> None:
             "join",
             new=AsyncMock(side_effect=LogStreamTimeoutError("cleanup timeout")),
         ),
+        pytest.raises(LogStreamTimeoutError, match="cleanup timeout"),
     ):
-        with pytest.raises(LogStreamTimeoutError, match="cleanup timeout"):
-            async with stream:
-                pass
+        async with stream:
+            pass
 
 
 @pytest.mark.asyncio
@@ -311,7 +311,7 @@ async def test_async_pid_monitor_run_loop_adaptive_backoff_when_unchanged(mock_r
         if len(intervals) >= 3:
             monitor._stop_event.set()
             return True
-        raise asyncio.TimeoutError
+        raise TimeoutError
 
     with patch(
         "logpyt.streams.async_stream.asyncio.wait_for", side_effect=fake_wait_for
@@ -354,7 +354,7 @@ async def test_async_pid_monitor_run_loop_resets_backoff_on_change(
         if len(intervals) >= 3:
             monitor._stop_event.set()
             return True
-        raise asyncio.TimeoutError
+        raise TimeoutError
 
     with patch(
         "logpyt.streams.async_stream.asyncio.wait_for", side_effect=fake_wait_for
@@ -416,7 +416,7 @@ async def test_stream_with_pid_monitor(
     # Mock parser to return a LogEntry with PID 1234
     mock_parser = MagicMock()
     mock_parser.parse_stdout.return_value = LogEntry(
-        timestamp=datetime.now(),
+        timestamp=datetime.now(UTC).replace(tzinfo=None),
         pid=1234,
         tid=1,
         level="D",
@@ -519,7 +519,7 @@ async def test_ingestion_not_blocked_by_slow_callback(
     mock_parser = MagicMock()
     mock_parser.parse_stdout.side_effect = [
         LogEntry(
-            timestamp=datetime.now(),
+            timestamp=datetime.now(UTC).replace(tzinfo=None),
             pid=1,
             tid=1,
             level="D",
@@ -529,7 +529,7 @@ async def test_ingestion_not_blocked_by_slow_callback(
             meta={},
         ),
         LogEntry(
-            timestamp=datetime.now(),
+            timestamp=datetime.now(UTC).replace(tzinfo=None),
             pid=1,
             tid=1,
             level="D",
