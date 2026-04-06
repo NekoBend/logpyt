@@ -176,6 +176,21 @@ class WindowedLogGrouper(LogGrouper):
         self._expiries: dict[tuple[Any, ...], float] = {}
         self.max_groups = max_groups
 
+    def _maybe_compact_heap(self) -> None:
+        """Compact stale heap entries when lazy invalidation grows too much."""
+        if len(self._heap) <= self.max_groups:
+            return
+        if len(self._heap) <= (len(self._expiries) * 2):
+            return
+
+        compacted = [
+            (expiry, key)
+            for key, expiry in self._expiries.items()
+            if key in self._buffers
+        ]
+        heapq.heapify(compacted)
+        self._heap = compacted
+
     def process(self, entry: LogEntry) -> list[LogEntry | list[LogEntry]]:
         """Process a new log entry and update groups.
 
@@ -225,6 +240,7 @@ class WindowedLogGrouper(LogGrouper):
         new_expiry = current_ts + self.threshold_ms
         self._expiries[current_key] = new_expiry
         heapq.heappush(self._heap, (new_expiry, current_key))
+        self._maybe_compact_heap()
 
         return emitted
 

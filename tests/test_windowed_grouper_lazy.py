@@ -69,3 +69,27 @@ def test_sliding_window_correctness():
     assert group[0].message == "msg1"
     assert group[1].message == "msg2"
     assert group[2].message == "msg3"
+
+
+def test_windowed_grouper_limits_heap_growth_for_hot_key_updates():
+    """Repeated updates for one key should not grow heap without bound."""
+    grouper = WindowedLogGrouper(
+        by=["pid", "tid"],
+        threshold_ms=100.0,
+        emit_mode="group",
+        max_groups=64,
+    )
+
+    start_ts = datetime.datetime.now().replace(microsecond=0)
+
+    for i in range(300):
+        entry = create_log_entry(
+            start_ts + datetime.timedelta(milliseconds=i),
+            pid=100,
+            tid=200,
+            msg=f"hot-{i}",
+        )
+        grouper.process(entry)
+
+    assert len(grouper._buffers) == 1
+    assert len(grouper._heap) <= 64
