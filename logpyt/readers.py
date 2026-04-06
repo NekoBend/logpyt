@@ -107,7 +107,7 @@ class LogFileReader:
                     # Parse the line
                     # We use parse_stdout as the default for file lines
                     entry = self.parser.parse_stdout(line)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     # Log parse errors with throttling to avoid log storms
                     self._log_parse_error(line, e)
                     continue

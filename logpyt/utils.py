@@ -267,7 +267,7 @@ async def async_wait_for_device(
             await asyncio.wait_for(process.wait(), timeout=timeout)
         else:
             await process.wait()
-    except asyncio.TimeoutError as e:
+    except TimeoutError as e:
         try:
             process.kill()
             await process.wait()
@@ -347,7 +347,7 @@ async def async_adb_connect(address: str, timeout: float | None = None) -> None:
             await asyncio.wait_for(process.wait(), timeout=timeout)
         else:
             await process.wait()
-    except asyncio.TimeoutError as e:
+    except TimeoutError as e:
         try:
             process.kill()
             await process.wait()
@@ -413,6 +413,6 @@ def extract_json(text: str) -> Any | None:
             # to reduce repeated scans over known-invalid spans.
             attempts += 1
             next_idx = max(start + 1, exc.pos + 1)
-            idx = next_idx if next_idx < scan_limit else scan_limit
+            idx = min(next_idx, scan_limit)
 
     return None

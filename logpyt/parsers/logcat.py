@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 
 from ..models import LogEntry, LogLevel
+
+_LOCAL_TIMEZONE = datetime.now(UTC).astimezone().tzinfo or UTC
+
+
+def _naive_now() -> datetime:
+    """Return the current local wall-clock time as a naive datetime."""
+    return datetime.now(_LOCAL_TIMEZONE).replace(tzinfo=None)
 
 
 class LogParser:
@@ -42,11 +49,11 @@ class LogParser:
                 Users should provide this explicitly if known.
         """
         self.default_timestamp = default_timestamp
-        self.default_year = default_year or datetime.now().year
+        self.default_year = default_year or _naive_now().year
 
     def _get_default_timestamp(self) -> datetime:
         """Get the default timestamp to use when none is present in the log."""
-        return self.default_timestamp or datetime.now()
+        return self.default_timestamp or _naive_now()
 
     def parse_stdout(self, line: str) -> LogEntry:
         """Parse a line from stdout.
@@ -142,7 +149,8 @@ class ThreadTimeLogParser(LogParser):
             minute,
             second,
             microsecond,
-        )
+            tzinfo=_LOCAL_TIMEZONE,
+        ).replace(tzinfo=None)
 
     def parse_stdout(self, line: str) -> LogEntry:
         """Parse a line from stdout using threadtime format.
