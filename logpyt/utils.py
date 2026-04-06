@@ -73,7 +73,9 @@ def resolve_adb() -> str:
     # 1. Search in PATH
     for candidate in candidates:
         path = shutil.which(candidate)
-        if path:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+        if path and sys.platform == "win32" and path.startswith("/usr/bin/"):
             return path
 
     # 2. Search in Environment Variables

@@ -52,6 +52,18 @@ def test_resolve_adb_not_found(mocker) -> None:
         resolve_adb()
 
 
+def test_resolve_adb_path_candidate_must_be_executable_file(mocker) -> None:
+    """PATH candidate should be validated as an executable file."""
+    resolve_adb.cache_clear()
+    mocker.patch("shutil.which", return_value="/fake/bin/adb")
+    mocker.patch("os.path.isfile", return_value=False)
+    mocker.patch("os.access", return_value=False)
+    mocker.patch.dict(os.environ, {}, clear=True)
+
+    with pytest.raises(FileNotFoundError):
+        resolve_adb()
+
+
 def test_list_devices_success(mocker) -> None:
     """Test listing devices successfully."""
     mocker.patch("logpyt.utils.resolve_adb", return_value="adb")
@@ -405,10 +417,7 @@ def test_extract_json_scan_guard_limits_search_range() -> None:
     """Ensure JSON beyond scan limit is not searched to avoid worst-case scans."""
     from logpyt import utils
 
-    text = (
-        "x" * utils._EXTRACT_JSON_MAX_SCAN_CHARS
-        + '{"after_limit": true}'
-    )
+    text = "x" * utils._EXTRACT_JSON_MAX_SCAN_CHARS + '{"after_limit": true}'
 
     assert extract_json(text) is None
 
