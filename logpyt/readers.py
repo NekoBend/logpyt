@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from .models import LogEntry
 
 logger = logging.getLogger(__name__)
+_PARSE_ERROR_PREVIEW_LIMIT = 160
 
 
 class LogFileReader:
@@ -49,11 +50,25 @@ class LogFileReader:
         self._last_parse_error_log_ts = 0.0
         self._suppressed_parse_errors = 0
 
+    @staticmethod
+    def _sanitize_line_preview(
+        line: str, max_len: int = _PARSE_ERROR_PREVIEW_LIMIT
+    ) -> str:
+        """Sanitize untrusted log line content for diagnostics."""
+        stripped = line.rstrip("\r\n")
+        sanitized = "".join(
+            ch if (ch.isprintable() and ch not in "\x1b") else "?" for ch in stripped
+        )
+        if len(sanitized) > max_len:
+            return f"{sanitized[: max_len - 3]}..."
+        return sanitized
+
     def _log_parse_error(self, line: str, error: Exception) -> None:
         """Log parse errors with optional rate limiting."""
+        preview = self._sanitize_line_preview(line)
         interval = self._parse_error_log_interval
         if interval <= 0.0:
-            logger.error("Failed to parse line: %s - Error: %s", line.strip(), error)
+            logger.error("Failed to parse line: %s - Error: %s", preview, error)
             return
 
         now = time.monotonic()
@@ -66,7 +81,7 @@ class LogFileReader:
                 )
                 self._suppressed_parse_errors = 0
 
-            logger.error("Failed to parse line: %s - Error: %s", line.strip(), error)
+            logger.error("Failed to parse line: %s - Error: %s", preview, error)
             self._last_parse_error_log_ts = now
             return
 

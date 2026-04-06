@@ -168,3 +168,35 @@ def test_log_file_reader_parse_error_logging_throttled(
     assert len(error_logs) == 1
     assert len(summary_logs) == 1
     assert "4 parse errors" in summary_logs[0].message
+
+
+def test_log_file_reader_parse_error_logging_sanitizes_and_caps_preview(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    """Parse error log preview should sanitize control chars and cap length."""
+    log_file = tmp_path / "malformed.log"
+    long_line = "BAD\x00\x1b[31mCTRL" + ("X" * 1000) + "\n"
+    log_file.write_text(long_line, encoding="utf-8")
+
+    mock_parser = MagicMock()
+    mock_parser.parse_stdout.side_effect = ValueError("boom")
+
+    reader = LogFileReader(
+        log_file,
+        parser=mock_parser,
+        parse_error_log_interval=0.0,
+    )
+
+    with caplog.at_level(logging.ERROR):
+        entries = list(reader)
+
+    assert entries == []
+
+    error_logs = [r for r in caplog.records if "Failed to parse line:" in r.message]
+    assert len(error_logs) == 1
+
+    message = error_logs[0].message
+    assert "\x00" not in message
+    assert "\x1b" not in message
+    assert len(message) <= 240
