@@ -77,6 +77,18 @@ def test_thread_time_parser_fallback() -> None:
     assert "parser" not in entry.meta
 
 
+def test_thread_time_parser_invalid_level_falls_back() -> None:
+    """Threadtime parser should fallback when level is outside VDIWEF."""
+    parser = ThreadTimeLogParser()
+    line = "11-19 12:34:56.789  1234  5678 G MyTag   : Hello World"
+
+    entry = parser.parse_stdout(line)
+
+    assert entry.message == line
+    assert entry.level == "I"
+    assert "parser" not in entry.meta
+
+
 def test_thread_time_parser_tag_with_spaces() -> None:
     """Test parsing a log line where the tag contains spaces."""
     parser = ThreadTimeLogParser()

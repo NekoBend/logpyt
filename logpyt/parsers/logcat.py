@@ -183,6 +183,9 @@ class ThreadTimeLogParser(LogParser):
         pid = int(pid_str)
         tid = int(tid_str)
 
+        if level_str not in {"V", "D", "I", "W", "E", "F"}:
+            return super().parse_stdout(line)
+
         # Ensure level is treated as LogLevel
         # In practice, this will be one of V, D, I, W, E, F
         level: LogLevel = level_str  # type: ignore
