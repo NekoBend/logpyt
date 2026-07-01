@@ -7,11 +7,11 @@ from .common import StreamState
 from .sync import LogStream, PidMonitor, StreamHandle
 
 __all__ = [
+    "AsyncLogStream",
+    "AsyncPidMonitor",
+    "AsyncStreamHandle",
     "LogStream",
+    "PidMonitor",
     "StreamHandle",
     "StreamState",
-    "PidMonitor",
-    "AsyncLogStream",
-    "AsyncStreamHandle",
-    "AsyncPidMonitor",
 ]

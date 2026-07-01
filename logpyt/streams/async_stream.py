@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable, Sequence
 from typing import TYPE_CHECKING, Any, Literal
@@ -21,6 +22,8 @@ from logpyt.utils import resolve_adb
 from .common import StreamState, build_pidof_command
 
 if TYPE_CHECKING:
+    from types import TracebackType
+
     from logpyt.models import LogEntry
 
 # Configure module logger
@@ -80,13 +83,11 @@ class AsyncPidMonitor:
         if self._task:
             try:
                 await asyncio.wait_for(self._task, timeout=1.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 if self._task and not self._task.done():
                     self._task.cancel()
-                    try:
+                    with contextlib.suppress(asyncio.CancelledError):
                         await self._task
-                    except asyncio.CancelledError:
-                        pass
 
     async def get_package(self, pid: int) -> str | None:
         """Get the package name for a given PID.
@@ -131,7 +132,7 @@ class AsyncPidMonitor:
                 await asyncio.wait_for(
                     self._stop_event.wait(), timeout=current_interval
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
 
     async def _update_pid_map(self, new_map: dict[int, str]) -> bool:
@@ -177,10 +178,11 @@ class AsyncPidMonitor:
             if process.returncode == 0 and stdout:
                 output = stdout.decode("utf-8", errors="replace").strip()
                 if output:
-                    return [int(p) for p in output.split()]
-        except Exception:
-            # Ignore errors (e.g. device disconnected, command failed)
-            pass
+                    return [int(p) for p in output.split() if p.isdigit()]
+        except Exception as exc:  # noqa: BLE001
+            # A polling monitor must never crash: any failure (device disconnected,
+            # command failed, malformed output) degrades to returning no PIDs.
+            logger.debug("pidof resolution failed for %s: %s", package, exc)
         return []
 
 
@@ -267,7 +269,7 @@ class AsyncLogStream:
         group_keys: Sequence[str] | None = None,
         group_interval: float | None = None,
         group_mode: Literal["consecutive", "windowed"] = "consecutive",
-        auto_reconnect: bool = False,
+        auto_reconnect: bool = False,  # noqa: FBT001, FBT002  existing public signature
         reconnect_delay: float = 1.0,
         pid_poll_interval: float = 5.0,
         pid_max_poll_interval: float = 30.0,
@@ -304,7 +306,8 @@ class AsyncLogStream:
             callback_queue_size: Max buffered callback items per stream source.
                 Uses backpressure when full.
             callback_queue_policy: Policy for callback queue overflow.
-                "drop_newest" drops incoming data, "drop_oldest" evicts oldest queued item.
+                "drop_newest" drops incoming data, "drop_oldest" evicts the
+                oldest queued item.
             pid_max_resolves_per_cycle: Maximum packages to resolve per PID poll cycle.
         """
         self.adb_path = adb_path or resolve_adb()
@@ -413,7 +416,8 @@ class AsyncLogStream:
                 if item is _DISPATCH_STOP:
                     return
                 await callback(item, self._handle)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  user callback must not crash dispatcher
+                logger.debug("Error in dispatch callback: %s", e)
                 if self.on_error:
                     await self.on_error(e)
             finally:
@@ -461,18 +465,19 @@ class AsyncLogStream:
         if self.on_state:
             try:
                 await self.on_state(new_state)
-            except Exception as e:
-                logger.error(f"Error in on_state callback: {e}")
+            except Exception as e:  # noqa: BLE001  user callback must not crash stream
+                logger.error("Error in on_state callback: %s", e)
 
     async def start(self) -> None:
         """Start the log stream."""
         async with self._state_lock:
-            if self._state != StreamState.IDLE and self._state != StreamState.STOPPED:
+            if self._state not in {StreamState.IDLE, StreamState.STOPPED}:
                 raise LogStreamInternalError(
                     f"Cannot start stream from state {self._state}"
                 )
             self._state = StreamState.STARTING
-            # We manually trigger callback outside lock to avoid deadlocks if callback calls back
+            # We manually trigger the callback outside the lock to avoid
+            # deadlocks if the callback calls back into the stream.
 
         if self.on_state:
             await self.on_state(StreamState.STARTING)
@@ -498,7 +503,7 @@ class AsyncLogStream:
                 await asyncio.wait_for(
                     self._stop_event.wait(), timeout=self.reconnect_delay
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass  # Timeout, continue to reconnect
             except asyncio.CancelledError:
                 break
@@ -506,8 +511,8 @@ class AsyncLogStream:
         # Final cleanup
         async with self._state_lock:
             if self._state != StreamState.KILLED:
-                # Don't use _set_state here to avoid potential deadlock if we are cancelling?
-                # Actually _set_state is fine as long as we are not holding lock when calling callbacks
+                # _set_state is fine here as long as we are not holding the
+                # lock when calling callbacks.
                 pass
 
         if self.state != StreamState.KILLED:
@@ -515,7 +520,7 @@ class AsyncLogStream:
             if self.on_stop:
                 await self.on_stop()
 
-    async def _run_process_lifecycle(self) -> None:
+    async def _run_process_lifecycle(self) -> None:  # noqa: PLR0912  sequential process lifecycle setup/teardown
         """Run a single lifecycle of the ADB process."""
         cmd = [self.adb_path]
         if self.device_id:
@@ -529,7 +534,8 @@ class AsyncLogStream:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  subprocess spawn failure must not crash manager
+            logger.debug("Failed to start adb logcat subprocess: %s", e)
             self._exceptions.append(e)
             await self._set_state(StreamState.STOPPED)
             if self.on_error:
@@ -609,11 +615,11 @@ class AsyncLogStream:
     async def stop(self) -> None:
         """Stop the log stream gracefully."""
         async with self._state_lock:
-            if self._state in (
+            if self._state in {
                 StreamState.STOPPED,
                 StreamState.KILLED,
                 StreamState.IDLE,
-            ):
+            }:
                 return
             # Don't set state here, let _set_state handle it to trigger callbacks
 
@@ -624,11 +630,9 @@ class AsyncLogStream:
             await self._pid_monitor.stop()
 
         if self._process:
-            try:
+            # We don't await wait() here immediately, join() does that.
+            with contextlib.suppress(ProcessLookupError):
                 self._process.terminate()
-                # We don't await wait() here immediately, join() does that
-            except ProcessLookupError:
-                pass
 
     async def kill(self) -> None:
         """Kill the log stream immediately."""
@@ -639,10 +643,8 @@ class AsyncLogStream:
             await self._pid_monitor.stop()
 
         if self._process:
-            try:
+            with contextlib.suppress(ProcessLookupError):
                 self._process.kill()
-            except ProcessLookupError:
-                pass
 
     async def pause(self) -> None:
         """Pause dispatching of log entries."""
@@ -673,8 +675,8 @@ class AsyncLogStream:
 
         try:
             await asyncio.wait_for(self._connection_task, timeout=timeout)
-        except asyncio.TimeoutError:
-            raise LogStreamTimeoutError("Timeout waiting for connection task")
+        except TimeoutError as err:
+            raise LogStreamTimeoutError("Timeout waiting for connection task") from err
 
         if self.state == StreamState.KILLED:
             raise LogStreamKilledError("Stream was killed")
@@ -689,22 +691,20 @@ class AsyncLogStream:
                 f"Internal error in stream task: {exc}"
             ) from exc
 
-    async def _read_loop(self, stream: asyncio.StreamReader, source: str) -> None:
+    async def _read_loop(self, stream: asyncio.StreamReader, source: str) -> None:  # noqa: PLR0912  read/timeout/flush handling kept inline
         """Internal loop to read from a stream."""
-        try:
+        try:  # noqa: PLR1702  nested read/timeout handling kept inline
             while not self._stop_event.is_set():
                 if self.read_timeout:
                     try:
                         line_bytes = await asyncio.wait_for(
                             stream.readline(), timeout=self.read_timeout
                         )
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         # Terminate process to unblock connection manager
                         if self._process:
-                            try:
+                            with contextlib.suppress(ProcessLookupError):
                                 self._process.terminate()
-                            except ProcessLookupError:
-                                pass
                         raise
                 else:
                     line_bytes = await stream.readline()
@@ -719,30 +719,31 @@ class AsyncLogStream:
                     continue
 
                 await self._process_line(line, source)
-        except asyncio.TimeoutError as e:
+        except TimeoutError as e:
             self._exceptions.append(LogStreamTimeoutError(str(e) or "Read timeout"))
             if self.on_error:
                 await self.on_error(e)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  read/parse errors must not crash the loop
+            logger.debug("Error in read loop for %s: %s", source, e)
             self._exceptions.append(e)
             if self.on_error:
                 await self.on_error(e)
         finally:
-            if source == "stdout":
+            if source == "stdout" and self.group_by:
                 # Flush grouper
-                if self.group_by:
-                    flushed = self.group_by.flush()
-                    if flushed and self.stdout_callback:
-                        for item in flushed:
-                            try:
-                                await self._dispatch_item(
-                                    item,
-                                    source="stdout",
-                                    callback=self.stdout_callback,
-                                )
-                            except Exception as e:
-                                if self.on_error:
-                                    await self.on_error(e)
+                flushed = self.group_by.flush()
+                if flushed and self.stdout_callback:
+                    for item in flushed:
+                        try:
+                            await self._dispatch_item(
+                                item,
+                                source="stdout",
+                                callback=self.stdout_callback,
+                            )
+                        except Exception as e:  # noqa: BLE001  callback must not crash flush
+                            logger.debug("Error dispatching flushed item: %s", e)
+                            if self.on_error:
+                                await self.on_error(e)
 
     async def _process_line(self, line: str, source: str) -> None:
         """Process a single raw line."""
@@ -755,15 +756,14 @@ class AsyncLogStream:
                 entry = self.parser.parse_stdout(line)
             else:
                 entry = self.parser.parse_stderr(line)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  parser errors must not crash the stream
+            logger.debug("Error parsing %s line: %s", source, e)
             self._exceptions.append(e)
             if self.on_error:
                 await self.on_error(e)
             if self._process:
-                try:
+                with contextlib.suppress(ProcessLookupError):
                     self._process.terminate()
-                except ProcessLookupError:
-                    pass
             return
 
         if self._pid_monitor:
@@ -777,12 +777,10 @@ class AsyncLogStream:
 
         # 3. Group
         # Note: Grouping is also CPU-bound but stateful.
-        items_to_emit: list[LogEntry | list[LogEntry]] = []
-        if self.group_by:
-            # LogGrouper is synchronous, which is fine as it's CPU bound and fast
-            items_to_emit = self.group_by.process(entry)
-        else:
-            items_to_emit = [entry]
+        # LogGrouper is synchronous, which is fine as it's CPU bound and fast.
+        items_to_emit: list[LogEntry | list[LogEntry]] = (
+            self.group_by.process(entry) if self.group_by else [entry]
+        )
 
         # 4. Dispatch
         callback = self.stdout_callback if source == "stdout" else self.stderr_callback
@@ -790,7 +788,8 @@ class AsyncLogStream:
             for item in items_to_emit:
                 try:
                     await self._dispatch_item(item, source=source, callback=callback)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001  dispatch must not crash the stream
+                    logger.debug("Error dispatching %s item: %s", source, e)
                     if self.on_error:
                         await self.on_error(e)
 
@@ -799,7 +798,12 @@ class AsyncLogStream:
         await self.start()
         return self._handle
 
-    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         """Stop the stream on exit."""
         await self.stop()
         await self.join(timeout=1.0)

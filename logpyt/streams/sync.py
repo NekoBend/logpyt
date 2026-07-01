@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import queue
 import subprocess
@@ -24,6 +25,8 @@ from logpyt.utils import resolve_adb
 from .common import StreamState, build_pidof_command
 
 if TYPE_CHECKING:
+    from types import TracebackType
+
     from logpyt.models import LogEntry
 
 
@@ -172,10 +175,13 @@ class PidMonitor:
             # Use a timeout to prevent hanging
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=5.0)
             if result.returncode == 0 and result.stdout.strip():
-                return [int(p) for p in result.stdout.split()]
-        except Exception:
-            # Ignore errors (e.g. device disconnected, command failed)
-            pass
+                return [int(p) for p in result.stdout.split() if p.isdigit()]
+        except Exception as exc:  # noqa: BLE001
+            # A polling monitor must never crash: any failure (device disconnected,
+            # command failed, malformed output) degrades to returning no PIDs.
+            logging.getLogger("logpyt").debug(
+                "pidof resolution failed for %s: %s", package, exc
+            )
         return []
 
 
@@ -276,7 +282,7 @@ class LogStream:
         group_keys: Sequence[str] | None = None,
         group_interval: float | None = None,
         group_mode: Literal["consecutive", "windowed"] = "consecutive",
-        auto_reconnect: bool = False,
+        auto_reconnect: bool = False,  # noqa: FBT001, FBT002 (existing public signature)
         reconnect_delay: float = 1.0,
         max_queue_size: int = 10000,
         read_timeout: float | None = None,
@@ -318,7 +324,8 @@ class LogStream:
             queue_full_warning_interval: Minimum interval in seconds between
                 repeated queue-full warnings. Defaults to 5.0.
             queue_overflow_policy: Policy for callback queue overflow.
-                "drop_newest" drops incoming data, "drop_oldest" evicts oldest queued item.
+                "drop_newest" drops incoming data, "drop_oldest" evicts the
+                oldest queued item.
             pid_poll_interval: Base interval in seconds for PID monitoring.
             pid_max_poll_interval: Maximum PID poll interval when idle.
             pid_poll_backoff_factor: Backoff factor for unchanged PID snapshots.
@@ -412,14 +419,13 @@ class LogStream:
             try:
                 self.on_state(new_state)
             except Exception:
-                # Don't let callback errors crash the stream, but maybe log it?
-                # For now, just ignore or print to stderr if debug
-                pass
+                # Don't let a user on_state callback error crash the stream.
+                logging.getLogger("logpyt").exception("on_state callback failed")
 
     def start(self) -> None:
         """Start the log stream."""
         with self._state_lock:
-            if self._state != StreamState.IDLE and self._state != StreamState.STOPPED:
+            if self._state not in {StreamState.IDLE, StreamState.STOPPED}:
                 raise LogStreamInternalError(
                     f"Cannot start stream from state {self._state}"
                 )
@@ -433,7 +439,7 @@ class LogStream:
         )
         self._connection_thread.start()
 
-    def _connection_manager(self) -> None:
+    def _connection_manager(self) -> None:  # noqa: PLR0912, PLR0915 (lifecycle state machine; refactor deferred)
         """Manage the ADB process lifecycle and reconnection."""
         while not self._stop_event.is_set():
             cmd = [self.adb_path]
@@ -452,15 +458,16 @@ class LogStream:
                     encoding="utf-8",
                     errors="replace",
                 )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 (process spawn may fail arbitrarily; must not crash manager)
+                logging.getLogger("logpyt").debug("Failed to start adb process: %s", e)
                 self._set_state(StreamState.STOPPED)
                 self._exceptions.put(e)
                 if self.on_error:
                     self.on_error(e)
-                # If we can't even start the process, we probably shouldn't loop infinitely fast
-                # unless it's a transient error.
-                # For now, let's treat start failure as fatal or subject to reconnect delay?
-                # If auto_reconnect is True, we should probably wait and retry.
+                # If we can't even start the process, we probably shouldn't loop
+                # infinitely fast unless it's a transient error.
+                # For now, let's treat start failure as fatal or subject to the
+                # reconnect delay when auto_reconnect is True.
                 if self.auto_reconnect and not self._stop_event.is_set():
                     self._set_state(StreamState.RECONNECTING)
                     if self._stop_event.wait(self.reconnect_delay):
@@ -559,11 +566,11 @@ class LogStream:
     def stop(self) -> None:
         """Stop the log stream gracefully."""
         with self._state_lock:
-            if self._state in (
+            if self._state in {
                 StreamState.STOPPED,
                 StreamState.KILLED,
                 StreamState.IDLE,
-            ):
+            }:
                 return
             self._set_state(StreamState.STOPPING)
 
@@ -660,13 +667,12 @@ class LogStream:
 
             if time.time() - last > self.read_timeout:
                 logging.getLogger("logpyt").warning(
-                    f"LogStream read timeout ({self.read_timeout}s). Killing ADB process."
+                    "LogStream read timeout (%ss). Killing ADB process.",
+                    self.read_timeout,
                 )
                 if self._process:
-                    try:
+                    with contextlib.suppress(ProcessLookupError, OSError):
                         self._process.kill()
-                    except Exception:
-                        pass
                 break
 
             time.sleep(1.0)
@@ -712,7 +718,8 @@ class LogStream:
                     continue
 
                 self._process_line(line, source)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 (read/parse errors must not crash the reader thread)
+            logging.getLogger("logpyt").debug("Read loop error on %s: %s", source, e)
             self._exceptions.put(e)
             if self.on_error:
                 self.on_error(e)
@@ -727,7 +734,7 @@ class LogStream:
 
     def _callback_loop(self) -> None:
         """Internal loop to process callbacks."""
-        while True:
+        while True:  # noqa: PLR1702 (dispatch loop nesting is intentional; refactor deferred)
             try:
                 item = self._callback_queue.get()
                 if item is None:
@@ -741,11 +748,15 @@ class LogStream:
                     for entry in items:
                         try:
                             callback(entry, self._handle)
-                        except Exception as e:
+                        except Exception as e:  # noqa: BLE001 (user callback must not crash the dispatch loop)
+                            logging.getLogger("logpyt").debug(
+                                "User callback raised: %s", e
+                            )
                             if self.on_error:
                                 self.on_error(e)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 (dispatch loop must not crash on unexpected errors)
                 # Should not happen, but if it does, log it
+                logging.getLogger("logpyt").debug("Callback loop error: %s", e)
                 if self.on_error:
                     self.on_error(e)
 
@@ -753,7 +764,7 @@ class LogStream:
         self,
         item: tuple[list[LogEntry | list[LogEntry]], str] | None,
         source: str | None,
-        force: bool = False,
+        force: bool = False,  # noqa: FBT001, FBT002 (existing public signature)
     ) -> None:
         """Enqueue callback work honoring overflow policy."""
         try:
@@ -801,7 +812,8 @@ class LogStream:
                 entry = self.parser.parse_stdout(line)
             else:
                 entry = self.parser.parse_stderr(line)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 (parser errors must not crash the reader thread)
+            logging.getLogger("logpyt").debug("Parser error on %s line: %s", source, e)
             self._exceptions.put(e)
             if self.on_error:
                 self.on_error(e)
@@ -819,11 +831,9 @@ class LogStream:
             return
 
         # 3. Group
-        items_to_emit: list[LogEntry | list[LogEntry]] = []
-        if self.group_by:
-            items_to_emit = self.group_by.process(entry)
-        else:
-            items_to_emit = [entry]
+        items_to_emit: list[LogEntry | list[LogEntry]] = (
+            self.group_by.process(entry) if self.group_by else [entry]
+        )
 
         # 4. Dispatch
         if items_to_emit:
@@ -834,14 +844,17 @@ class LogStream:
         self.start()
         return self._handle
 
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         """Stop the stream on exit."""
         self.stop()
-        # We don't necessarily join here, as stop() is async, but usually context managers
-        # clean up resources. stop() terminates the process.
+        # We don't necessarily join here, as stop() is async, but usually
+        # context managers clean up resources. stop() terminates the process.
         # We might want to wait for it to actually close?
-        # Let's do a quick join with timeout to ensure cleanup
-        try:
+        # Let's do a quick join with timeout to ensure cleanup.
+        with contextlib.suppress(LogStreamTimeoutError, LogStreamKilledError):
             self.join(timeout=1.0)
-        except (LogStreamTimeoutError, LogStreamKilledError):
-            pass

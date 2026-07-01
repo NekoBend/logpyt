@@ -74,9 +74,7 @@ def resolve_adb() -> str:
     # 1. Search in PATH
     for candidate in candidates:
         path = shutil.which(candidate)
-        if path and os.path.isfile(path) and os.access(path, os.X_OK):
-            return path
-        if path and sys.platform == "win32" and path.startswith("/usr/bin/"):
+        if path and Path(path).is_file() and os.access(path, os.X_OK):
             return path
 
     # 2. Search in Environment Variables
@@ -85,15 +83,15 @@ def resolve_adb() -> str:
         root = os.environ.get(var)
         if root:
             for candidate in candidates:
-                path = os.path.join(root, "platform-tools", candidate)
-                if os.path.isfile(path) and os.access(path, os.X_OK):
-                    return path
+                candidate_path = Path(root) / "platform-tools" / candidate
+                if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
+                    return str(candidate_path)
 
     msg = "Could not find 'adb' or 'adb.exe' in PATH or Android SDK directories."
     raise FileNotFoundError(msg)
 
 
-def list_devices(
+def list_devices(  # noqa: PLR0912
     device_type: DeviceType | None = None,
     timeout: float = 10.0,
 ) -> list[DeviceInfo]:
@@ -291,7 +289,8 @@ async def async_wait_for_device(
 
     if process.returncode != 0:
         stderr_data = await process.stderr.read() if process.stderr else b""
-        msg = f"Failed to wait for device: {stderr_data.decode().strip()}"
+        detail = stderr_data.decode(errors="replace").strip()
+        msg = f"Failed to wait for device: {detail}"
         raise RuntimeError(msg)
 
 
@@ -378,8 +377,8 @@ async def async_adb_connect(address: str, timeout: float | None = None) -> None:
         raise TimeoutError(msg) from e
 
     stdout_data, stderr_data = await process.communicate()
-    output = stdout_data.decode().strip()
-    error = stderr_data.decode().strip()
+    output = stdout_data.decode(errors="replace").strip()
+    error = stderr_data.decode(errors="replace").strip()
 
     if (
         process.returncode != 0
@@ -391,7 +390,7 @@ async def async_adb_connect(address: str, timeout: float | None = None) -> None:
         raise RuntimeError(msg)
 
 
-def extract_json(text: str) -> Any | None:
+def extract_json(text: str) -> Any | None:  # noqa: ANN401
     """Extract and parse the first valid JSON object or array found in the text.
 
     Args:
