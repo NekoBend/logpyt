@@ -15,6 +15,7 @@ from logpyt.exceptions import (
     LogStreamTimeoutError,
 )
 from logpyt.filters import Filter
+from logpyt.groupers import LogGrouper
 from logpyt.models import LogEntry
 from logpyt.streams import LogStream, StreamState
 
@@ -59,7 +60,7 @@ def test_stream_lifecycle(mock_popen, mocker) -> None:
 
     stream.stop()
     # State might be STOPPING or STOPPED depending on thread timing
-    assert stream.state in (StreamState.STOPPING, StreamState.STOPPED)
+    assert stream.state in {StreamState.STOPPING, StreamState.STOPPED}
 
     stream.join(timeout=1.0)
     # After join, threads should be dead
@@ -102,7 +103,7 @@ def test_stream_context_manager(mock_popen, mocker) -> None:
 
         assert handle.state == StreamState.RUNNING
         handle.stop()
-        assert handle.state in (StreamState.STOPPING, StreamState.STOPPED)
+        assert handle.state in {StreamState.STOPPING, StreamState.STOPPED}
 
 
 def test_stream_error_callback(mocker) -> None:
@@ -238,6 +239,115 @@ def test_stream_package_resolution(mock_popen, mocker) -> None:
     assert entries[0].meta["package"] == "com.example"
 
 
+def test_stream_package_filter_drops_non_matching_entries(mock_popen, mocker) -> None:
+    """A package Filter must DROP entries whose package does not match.
+
+    Extends test_stream_package_resolution (happy path only) by proving that
+    entries resolving to a different package never reach the callback, while
+    matching ones do.
+    """
+    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+
+    # PidMonitor resolves PID 1234 -> matching package, PID 9999 -> other package.
+    mock_pid_monitor_cls = mocker.patch("logpyt.streams.sync.PidMonitor")
+    mock_pid_monitor = mock_pid_monitor_cls.return_value
+    mock_pid_monitor.get_package.side_effect = lambda pid: {
+        1234: "com.example",
+        9999: "com.other",
+    }.get(pid)
+
+    pkg_filter = Filter(package=["com.example"])
+
+    entries: list[LogEntry] = []
+
+    def callback(entry, handle):
+        del handle
+        entries.append(entry)
+
+    stream = LogStream(filter_by=pkg_filter, stdout_callback=callback)
+
+    # Two raw lines; parser maps them to a matching and a non-matching PID.
+    process_mock = mock_popen.return_value
+    process_mock.stdout.readline.side_effect = ["match\n", "drop\n", ""]
+    process_mock.stderr.readline.return_value = ""
+
+    def parse_stdout(line: str) -> LogEntry:
+        pid = 1234 if line.strip() == "match" else 9999
+        return LogEntry(
+            timestamp=datetime.now(UTC).replace(tzinfo=None),
+            pid=pid,
+            tid=pid,
+            level="D",
+            tag="Tag",
+            message=line.strip(),
+            raw=line.strip(),
+        )
+
+    mock_parser = Mock()
+    mock_parser.parse_stdout.side_effect = parse_stdout
+    stream.parser = mock_parser
+
+    stream.start()
+    stream.join(timeout=1.0)
+
+    # Only the matching-package entry reaches the callback; the other is dropped.
+    assert [e.message for e in entries] == ["match"]
+    assert all(e.meta.get("package") == "com.example" for e in entries)
+
+
+def test_stream_grouper_flushes_buffered_entries_on_stdout_eof(
+    mock_popen, mocker
+) -> None:
+    """Buffered grouped entries must be flushed to the callback on stdout EOF.
+
+    Covers commit 2d8c57d: a group_by grouper buffers consecutive same-key
+    entries without emitting; when stdout reaches EOF the read loop's finally
+    block flushes the buffer so the grouped entries are still delivered.
+    """
+    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+
+    # Large threshold + same key => both entries buffer, nothing emitted early.
+    grouper = LogGrouper(by=["tag"], threshold_ms=10_000.0, emit_mode="group")
+
+    received: list[list[LogEntry]] = []
+
+    def callback(item: list[LogEntry], handle) -> None:
+        del handle
+        received.append(item)
+
+    stream = LogStream(group_by=grouper, stdout_callback=callback)
+
+    process_mock = mock_popen.return_value
+    process_mock.stdout.readline.side_effect = ["line-1\n", "line-2\n", ""]
+    process_mock.stderr.readline.return_value = ""
+
+    base_ts = datetime.now(UTC).replace(tzinfo=None)
+
+    def parse_stdout(line: str) -> LogEntry:
+        return LogEntry(
+            timestamp=base_ts,
+            pid=1,
+            tid=1,
+            level="D",
+            tag="SameTag",
+            message=line.strip(),
+            raw=line.strip(),
+        )
+
+    mock_parser = Mock()
+    mock_parser.parse_stdout.side_effect = parse_stdout
+    stream.parser = mock_parser
+
+    stream.start()
+    stream.join(timeout=1.0)
+
+    # emit_mode="group" delivers the buffered group as a single list argument.
+    assert len(received) == 1
+    group = received[0]
+    assert isinstance(group, list)
+    assert [entry.message for entry in group] == ["line-1", "line-2"]
+
+
 def test_auto_reconnect(mocker) -> None:
     """Test that the stream automatically reconnects when the process exits."""
     mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
@@ -284,7 +394,8 @@ def test_auto_reconnect(mocker) -> None:
     assert mock_popen.call_count >= 2
 
     # Verify state transitions
-    # Should see STARTING -> RUNNING -> RECONNECTING -> RUNNING ... -> STOPPING -> STOPPED
+    # Should see STARTING -> RUNNING -> RECONNECTING -> RUNNING ...
+    # -> STOPPING -> STOPPED
     assert StreamState.STARTING in state_changes
     assert StreamState.RUNNING in state_changes
     assert StreamState.RECONNECTING in state_changes
@@ -293,7 +404,7 @@ def test_auto_reconnect(mocker) -> None:
     # Verify that RECONNECTING appears between RUNNING states
     # Filter to just RUNNING and RECONNECTING to check the sequence
     run_reconnect_seq = [
-        s for s in state_changes if s in (StreamState.RUNNING, StreamState.RECONNECTING)
+        s for s in state_changes if s in {StreamState.RUNNING, StreamState.RECONNECTING}
     ]
     # Should look like [RUNNING, RECONNECTING, RUNNING, RECONNECTING, ...]
     # Just check that we have at least one transition from RECONNECTING to RUNNING

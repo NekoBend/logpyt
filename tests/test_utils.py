@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -22,6 +23,8 @@ def test_resolve_adb_in_path(mocker) -> None:
     """Test resolving adb when it's in PATH."""
     resolve_adb.cache_clear()
     mocker.patch("shutil.which", return_value="/usr/bin/adb")
+    mocker.patch("pathlib.Path.is_file", return_value=True)
+    mocker.patch("os.access", return_value=True)
 
     path = resolve_adb()
     assert path == "/usr/bin/adb"
@@ -33,12 +36,12 @@ def test_resolve_adb_in_android_home(mocker) -> None:
     mocker.patch("shutil.which", return_value=None)
     mocker.patch.dict(os.environ, {"ANDROID_HOME": "/opt/android-sdk"})
 
-    # Mock os.path.isfile and os.access
-    mocker.patch("os.path.isfile", return_value=True)
+    # Mock the executable-file check and access permission.
+    mocker.patch("pathlib.Path.is_file", return_value=True)
     mocker.patch("os.access", return_value=True)
 
     path = resolve_adb()
-    expected_path = os.path.join("/opt/android-sdk", "platform-tools", "adb")
+    expected_path = str(Path("/opt/android-sdk") / "platform-tools" / "adb")
     assert path == expected_path
 
 
@@ -70,7 +73,7 @@ def test_list_devices_success(mocker) -> None:
 
     mock_run = mocker.patch("subprocess.run")
     mock_run.return_value.stdout = """List of devices attached
-emulator-5554 device product:sdk_gphone_x86_64 model:sdk_gphone_x86_64 device:generic_x86_64 transport_id:1
+emulator-5554 device product:sdk_gphone model:sdk_gphone device:generic transport_id:1
 1234567890abc device product:myphone model:Pixel_5 device:pixel5 transport_id:2
 """
 
@@ -331,6 +334,39 @@ async def test_async_adb_connect_timeout(mocker) -> None:
         await async_adb_connect("192.168.1.5:5555", timeout=0.1)
 
     mock_process.kill.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_async_wait_for_device_error_decodes_invalid_utf8(mocker) -> None:
+    """Non-UTF-8 stderr must surface as RuntimeError, not UnicodeDecodeError."""
+    mocker.patch("logpyt.utils.resolve_adb", return_value="adb")
+
+    mock_process = mocker.AsyncMock()
+    mock_process.wait.return_value = None
+    mock_process.returncode = 1
+    mock_process.stderr = mocker.Mock()
+    mock_process.stderr.read = mocker.AsyncMock(return_value=b"\xff\xfe bad bytes")
+
+    mocker.patch("asyncio.create_subprocess_exec", return_value=mock_process)
+
+    with pytest.raises(RuntimeError, match="Failed to wait for device"):
+        await async_wait_for_device()
+
+
+@pytest.mark.asyncio
+async def test_async_adb_connect_decodes_invalid_utf8(mocker) -> None:
+    """Non-UTF-8 connect output must surface as RuntimeError, not UnicodeDecodeError."""
+    mocker.patch("logpyt.utils.resolve_adb", return_value="adb")
+
+    mock_process = mocker.AsyncMock()
+    mock_process.wait.return_value = None
+    mock_process.communicate.return_value = (b"\xff\xfe", b"failed \xff")
+    mock_process.returncode = 1
+
+    mocker.patch("asyncio.create_subprocess_exec", return_value=mock_process)
+
+    with pytest.raises(RuntimeError, match="Failed to connect"):
+        await async_adb_connect("192.168.1.5:5555")
 
 
 def test_extract_json_simple_object() -> None:

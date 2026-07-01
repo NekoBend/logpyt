@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -65,10 +66,9 @@ async def test_lifecycle(mock_resolve_adb, mock_create_subprocess, mock_process)
     await stream.start()
 
     # Wait for state to become RUNNING
-    try:
+    with contextlib.suppress(TimeoutError):
+        # Assertion will fail below if state is wrong
         await asyncio.wait_for(wait_for_state(stream, StreamState.RUNNING), timeout=1.0)
-    except TimeoutError:
-        pass  # Assertion will fail below if state is wrong
 
     assert stream.state == StreamState.RUNNING
     mock_create_subprocess.assert_called_once()
@@ -79,7 +79,7 @@ async def test_lifecycle(mock_resolve_adb, mock_create_subprocess, mock_process)
     # Test Stop
     await stream.stop()
     # State might be STOPPING or STOPPED depending on race, but eventually STOPPED
-    assert stream.state in (StreamState.STOPPING, StreamState.STOPPED)
+    assert stream.state in {StreamState.STOPPING, StreamState.STOPPED}
     mock_process.terminate.assert_called_once()
 
     # Test Join
@@ -131,12 +131,10 @@ async def test_context_manager(mock_resolve_adb, mock_create_subprocess, mock_pr
         mock_process.wait.side_effect = delayed_wait
 
         # Wait for state to become RUNNING
-        try:
+        with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(
                 wait_for_state(stream, StreamState.RUNNING), timeout=1.0
             )
-        except TimeoutError:
-            pass
 
         assert stream.state == StreamState.RUNNING
         mock_create_subprocess.assert_called_once()
@@ -273,10 +271,12 @@ async def test_async_pid_monitor_update_applies_add_remove_and_change():
         2222: "pkg",
     }
 
-    changed = await monitor._update_pid_map({
-        2222: "pkg",
-        3333: "pkg",
-    })
+    changed = await monitor._update_pid_map(
+        {
+            2222: "pkg",
+            3333: "pkg",
+        }
+    )
 
     assert changed is True
     assert monitor._pid_map == {
@@ -368,7 +368,7 @@ async def test_async_pid_monitor_run_loop_resets_backoff_on_change(
 async def test_stream_with_pid_monitor(
     mock_resolve_adb, mock_create_subprocess, mock_process
 ):
-    """Verify AsyncLogStream integrates with AsyncPidMonitor when filters are present."""
+    """Verify AsyncLogStream integrates with AsyncPidMonitor when filters exist."""
     from logpyt.filters import Filter
 
     # Setup mocks
@@ -396,7 +396,8 @@ async def test_stream_with_pid_monitor(
     logcat_process.stdout.readline.side_effect = delayed_readline
 
     def side_effect(*args, **kwargs):
-        # args[0] is the program, but here it's passed as *cmd so args will be the command parts
+        # args[0] is the program, but here it's passed as *cmd so args will be
+        # the command parts
         # create_subprocess_exec(program, *args, ...)
         # But the code calls it as: create_subprocess_exec(*cmd, ...)
         # So the first arg is the adb path
@@ -494,7 +495,7 @@ async def test_auto_reconnect(mock_resolve_adb, mock_create_subprocess):
 
     # Verify sequence
     run_reconnect_seq = [
-        s for s in state_changes if s in (StreamState.RUNNING, StreamState.RECONNECTING)
+        s for s in state_changes if s in {StreamState.RUNNING, StreamState.RECONNECTING}
     ]
     # Should look like [RUNNING, RECONNECTING, RUNNING, ...]
     assert len(run_reconnect_seq) >= 3
@@ -565,3 +566,92 @@ def test_async_callback_backpressure_policy_drop_oldest_is_configurable() -> Non
         callback_queue_policy="drop_oldest",
     )
     assert stream.callback_queue_size == 1
+
+
+def _make_entry(message: str) -> LogEntry:
+    """Build a minimal LogEntry for dispatch assertions."""
+    return LogEntry(
+        timestamp=datetime.now(UTC).replace(tzinfo=None),
+        pid=1,
+        tid=1,
+        level="D",
+        tag="T",
+        message=message,
+        raw=message,
+        meta={},
+    )
+
+
+@pytest.mark.asyncio
+async def test_pause_stops_dispatch_and_resume_continues(
+    mock_resolve_adb, mock_create_subprocess, mock_process
+):
+    """Lines read while PAUSED are dropped; RESUME restores dispatch.
+
+    Covers the pause-state race fixed in commit 748be6e: after pause() the
+    read loop must skip processing (no callback), and after resume() dispatch
+    must continue for subsequent lines.
+    """
+    # Gate each readline so the test can pause/resume between lines
+    line_gates = [asyncio.Event() for _ in range(3)]
+    read_reached = [asyncio.Event() for _ in range(3)]
+    lines = [b"before-pause\n", b"during-pause\n", b"after-resume\n"]
+
+    call_index = 0
+
+    async def gated_readline(*args, **kwargs):
+        nonlocal call_index
+        idx = call_index
+        call_index += 1
+        if idx >= len(lines):
+            return b""
+        read_reached[idx].set()
+        await line_gates[idx].wait()
+        return lines[idx]
+
+    mock_process.stdout.readline.side_effect = gated_readline
+    mock_process.stderr.readline.return_value = b""
+
+    # Keep the process alive so the read loop is not torn down mid-test
+    async def delayed_wait():
+        await asyncio.sleep(1.0)
+        return 0
+
+    mock_process.wait.side_effect = delayed_wait
+
+    mock_parser = MagicMock()
+    mock_parser.parse_stdout.side_effect = lambda line: _make_entry(line.strip())
+
+    dispatched: list[str] = []
+
+    async def callback(entry, handle):
+        del handle
+        dispatched.append(entry.message)
+
+    stream = AsyncLogStream(parser=mock_parser, stdout_callback=callback)
+
+    await stream.start()
+    await asyncio.wait_for(wait_for_state(stream, StreamState.RUNNING), timeout=1.0)
+
+    # Line 1: dispatched normally while RUNNING
+    line_gates[0].set()
+    await asyncio.wait_for(read_reached[1].wait(), timeout=1.0)
+
+    # Pause, then release line 2: it must be read but NOT dispatched
+    await stream.pause()
+    assert stream.state == StreamState.PAUSED
+    line_gates[1].set()
+    await asyncio.wait_for(read_reached[2].wait(), timeout=1.0)
+
+    # Resume, then release line 3: dispatch continues
+    await stream.resume()
+    assert stream.state == StreamState.RUNNING
+    line_gates[2].set()
+
+    await stream.stop()
+    await stream.join(timeout=1.0)
+
+    assert "before-pause" in dispatched
+    assert "after-resume" in dispatched
+    # The line read while paused must never reach the callback
+    assert "during-pause" not in dispatched

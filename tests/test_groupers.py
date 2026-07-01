@@ -55,7 +55,7 @@ def test_grouper_basic_grouping(base_time: datetime) -> None:
     # Flush
     final = grouper.flush()
     assert len(final) == 1
-    group = cast(list[LogEntry], final[0])
+    group = cast("list[LogEntry]", final[0])
     assert isinstance(group, list)
     assert len(group) == 3
     assert group[0].message == "1"
@@ -77,14 +77,14 @@ def test_grouper_threshold_exceeded(base_time: datetime) -> None:
 
     # Should emit the first group (e1) and buffer e2
     assert len(res) == 1
-    group1 = cast(list[LogEntry], res[0])
+    group1 = cast("list[LogEntry]", res[0])
     assert len(group1) == 1
     assert group1[0].message == "1"
 
     # Flush remaining
     final = grouper.flush()
     assert len(final) == 1
-    group2 = cast(list[LogEntry], final[0])
+    group2 = cast("list[LogEntry]", final[0])
     assert group2[0].message == "2"
 
 
@@ -100,11 +100,11 @@ def test_grouper_key_change(base_time: datetime) -> None:
 
     # Should emit e1 because PID changed
     assert len(res) == 1
-    group1 = cast(list[LogEntry], res[0])
+    group1 = cast("list[LogEntry]", res[0])
     assert group1[0].pid == 100
 
     final = grouper.flush()
-    group2 = cast(list[LogEntry], final[0])
+    group2 = cast("list[LogEntry]", final[0])
     assert group2[0].pid == 101
 
 
@@ -120,6 +120,6 @@ def test_grouper_emit_mode_entry(base_time: datetime) -> None:
 
     # Should emit e1 as a single item, not a list
     assert len(res) == 1
-    entry = cast(LogEntry, res[0])
+    entry = cast("LogEntry", res[0])
     assert isinstance(entry, LogEntry)
     assert entry.message == "1"

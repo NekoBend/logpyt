@@ -107,10 +107,12 @@ class TestPidMonitor:
             2222: "com.example.app",
         }
 
-        changed = monitor._update_pid_map({
-            2222: "com.example.app",  # unchanged
-            3333: "com.example.app",  # added
-        })
+        changed = monitor._update_pid_map(
+            {
+                2222: "com.example.app",  # unchanged
+                3333: "com.example.app",  # added
+            }
+        )
 
         assert changed is True
         assert monitor._pid_map == {

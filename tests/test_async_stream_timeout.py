@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -45,10 +46,8 @@ async def test_read_timeout_raises_exception():
 
         await stream.start()
 
-        try:
+        with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(error_caught.wait(), timeout=2.0)
-        except TimeoutError:
-            pass
 
         await stream.stop()
         await stream.join()

@@ -246,7 +246,7 @@ def test_brief_log_parser_non_brief_prefix_fallback() -> None:
 
 
 def test_thread_time_parser_missing_colon_separator_fallback() -> None:
-    """Threadtime parser should fallback for date-like lines without tag/message separator."""
+    """Fallback for date-like lines without a tag/message separator."""
     parser = ThreadTimeLogParser()
     line = "11-19 12:34:56.789  1234  5678 D MyTag Hello World"
     entry = parser.parse_stdout(line)
