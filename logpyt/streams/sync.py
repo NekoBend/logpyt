@@ -622,19 +622,20 @@ class LogStream:
         if not self._connection_thread:
             return
 
-        connection_was_alive = self._connection_thread.is_alive()
+        deadline = None if timeout is None else time.monotonic() + timeout
 
         self._connection_thread.join(timeout=timeout)
         if self._connection_thread.is_alive():
             raise LogStreamTimeoutError("Timeout waiting for connection thread")
 
         if self._callback_thread and self._callback_thread.is_alive():
-            # Keep historical behavior: once join() has waited for the connection
-            # thread, it waits for callback completion when possible.
-            if timeout is None or connection_was_alive:
+            if deadline is None:
                 self._callback_thread.join()
             else:
-                self._callback_thread.join(timeout=max(timeout, 0.0))
+                # Honor the remaining timeout budget for the callback phase too, so
+                # a blocked user callback cannot make join(timeout=...) hang.
+                remaining = max(deadline - time.monotonic(), 0.0)
+                self._callback_thread.join(timeout=remaining)
                 if self._callback_thread.is_alive():
                     raise LogStreamTimeoutError("Timeout waiting for callback thread")
 

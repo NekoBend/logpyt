@@ -105,15 +105,31 @@ class AsyncPidMonitor:
         """Internal loop to poll PIDs."""
         current_interval = self.poll_interval
         while not self._stop_event.is_set():
-            new_map: dict[int, str] = {}
             packages = self.packages
             total = len(packages)
             cycle_limit = min(total, self.max_resolves_per_cycle)
+            polled_packages: list[str] = []
+            resolved_map: dict[int, str] = {}
             for offset in range(cycle_limit):
                 package = packages[(self._resolve_cursor + offset) % total]
+                polled_packages.append(package)
                 pids = await self._resolve_pids(package)
                 for pid in pids:
-                    new_map[pid] = package
+                    resolved_map[pid] = package
+
+            if cycle_limit == total:
+                new_map = resolved_map
+            else:
+                # Only reconcile PIDs for packages polled this cycle; keep mappings
+                # for unpolled packages so throttled polling stays correct.
+                polled_package_set = set(polled_packages)
+                async with self._lock:
+                    new_map = {
+                        pid: package
+                        for pid, package in self._pid_map.items()
+                        if package not in polled_package_set
+                    }
+                new_map.update(resolved_map)
 
             if total:
                 self._resolve_cursor = (self._resolve_cursor + cycle_limit) % total
@@ -437,7 +453,17 @@ class AsyncLogStream:
         )
         if queue is None or task is None:
             return
-        await queue.put(_DISPATCH_STOP)
+        # Enqueue the stop sentinel without blocking: if the queue is full (slow or
+        # stuck callback under backpressure), evict one item to make room so shutdown
+        # cannot deadlock on put().
+        try:
+            queue.put_nowait(_DISPATCH_STOP)
+        except asyncio.QueueFull:
+            with contextlib.suppress(asyncio.QueueEmpty):
+                queue.get_nowait()
+                queue.task_done()
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait(_DISPATCH_STOP)
         await queue.join()
         await asyncio.gather(task, return_exceptions=True)
         if source == "stdout":

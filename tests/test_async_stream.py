@@ -365,6 +365,95 @@ async def test_async_pid_monitor_run_loop_resets_backoff_on_change(
 
 
 @pytest.mark.asyncio
+@patch(
+    "logpyt.streams.async_stream.AsyncPidMonitor._resolve_pids", new_callable=AsyncMock
+)
+async def test_async_pid_monitor_partial_resolve_preserves_unpolled_packages(
+    mock_resolve,
+):
+    """Throttled polling must keep PID mappings for packages not polled this cycle."""
+    monitor = AsyncPidMonitor(
+        adb_path="adb",
+        device_id=None,
+        packages=["pkg.a", "pkg.b", "pkg.c"],
+        poll_interval=0.1,
+        max_poll_interval=0.1,
+        max_resolves_per_cycle=1,
+    )
+    mock_resolve.side_effect = lambda package: {
+        "pkg.a": [1001],
+        "pkg.b": [1002],
+        "pkg.c": [1003],
+    }[package]
+
+    cycles = {"count": 0}
+
+    async def fake_wait_for(awaitable, timeout):
+        del timeout
+        close = getattr(awaitable, "close", None)
+        if callable(close):
+            close()
+        cycles["count"] += 1
+        if cycles["count"] >= 3:
+            monitor._stop_event.set()
+            return True
+        raise TimeoutError
+
+    with patch(
+        "logpyt.streams.async_stream.asyncio.wait_for", side_effect=fake_wait_for
+    ):
+        await monitor._run()
+
+    assert monitor._pid_map == {1001: "pkg.a", 1002: "pkg.b", 1003: "pkg.c"}
+
+
+@pytest.mark.asyncio
+async def test_stop_dispatcher_evicts_to_enqueue_sentinel_when_queue_full():
+    """Stopping a dispatcher must not block when its bounded queue is full.
+
+    Covers the fix that enqueues the stop sentinel non-blockingly (evicting one
+    queued item if needed) instead of ``await queue.put(_DISPATCH_STOP)``, which
+    deadlocks shutdown on a full queue while a callback is stuck.
+    """
+    stream = AsyncLogStream(adb_path="adb", callback_queue_size=1)
+
+    stuck_entered = asyncio.Event()
+    release = asyncio.Event()
+    processed: list[str] = []
+
+    async def callback(item, handle):
+        del handle
+        processed.append(item.message)
+        if item.message == "A":
+            stuck_entered.set()
+            await release.wait()
+
+    queue = stream._build_dispatch_queue()
+    stream._stdout_dispatch_queue = queue
+    stream._stdout_dispatch_task = asyncio.create_task(
+        stream._callback_dispatch_loop(queue, callback)
+    )
+
+    # "A" is consumed (callback blocks); "B" then fills the queue (maxsize=1).
+    await queue.put(_make_entry("A"))
+    await asyncio.wait_for(stuck_entered.wait(), timeout=1.0)
+    await queue.put(_make_entry("B"))
+    assert queue.full()
+
+    stop = asyncio.create_task(stream._stop_dispatcher("stdout"))
+    # Let _stop_dispatcher run: it must evict "B" to enqueue the stop sentinel and then
+    # park on queue.join(). Without the fix it would block here on put() forever.
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.wait_for(stop, timeout=1.0)
+
+    # "B" was evicted to make room for the sentinel, so it is never dispatched.
+    assert processed == ["A"]
+    assert stream._stdout_dispatch_queue is None
+    assert stream._stdout_dispatch_task is None
+
+
+@pytest.mark.asyncio
 async def test_stream_with_pid_monitor(
     mock_resolve_adb, mock_create_subprocess, mock_process
 ):

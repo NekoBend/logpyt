@@ -44,5 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Deterministic fallback on invalid threadtime log levels.
 - Hardened sync/async stream lifecycle, the async pause-state race, and
   grouper flush-on-shutdown.
+- Honor `join(timeout=...)` during the callback-drain phase, preserve PID
+  mappings under throttled async polling, and make async dispatcher shutdown
+  non-blocking on a full queue.
 
 [2.0.0]: https://github.com/NekoBend/logpyt/compare/v1.0.0...v2.0.0

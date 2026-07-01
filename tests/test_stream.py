@@ -514,7 +514,10 @@ def test_stop_does_not_hang_when_callback_queue_is_full(mock_popen, mocker) -> N
         assert stream._callback_queue.qsize() == 1
 
         stream.stop()
-        stream.join(timeout=0.5)
+        # The user callback is still blocked, so join must honor its timeout
+        # (not hang indefinitely) while stop() itself completes promptly.
+        with pytest.raises(LogStreamTimeoutError):
+            stream.join(timeout=0.5)
     finally:
         release_callback.set()
         stream.stop()
@@ -523,7 +526,7 @@ def test_stop_does_not_hang_when_callback_queue_is_full(mock_popen, mocker) -> N
 
 
 def test_join_waits_for_callback_thread_completion(mock_popen, mocker) -> None:
-    """join() should not return while callback worker is still running."""
+    """join() (no timeout) should not return until the callback worker finishes."""
     mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
 
     process_mock = mock_popen.return_value
@@ -532,15 +535,16 @@ def test_join_waits_for_callback_thread_completion(mock_popen, mocker) -> None:
     process_mock.wait.side_effect = lambda *args, **kwargs: time.sleep(0.1)
 
     callback_started = threading.Event()
-    release_callback = threading.Event()
+    callback_finished = threading.Event()
 
-    def blocking_callback(entry, handle):
+    def slow_callback(entry, handle):
         del entry, handle
         callback_started.set()
-        release_callback.wait(timeout=3.0)
+        time.sleep(0.3)
+        callback_finished.set()
 
     stream = LogStream(
-        stdout_callback=blocking_callback,
+        stdout_callback=slow_callback,
         max_queue_size=1,
     )
 
@@ -549,12 +553,13 @@ def test_join_waits_for_callback_thread_completion(mock_popen, mocker) -> None:
         assert callback_started.wait(timeout=1.0)
 
         stream.stop()
-        stream.join(timeout=1.0)
+        # No timeout: join must wait for the callback worker to drain and exit.
+        stream.join()
 
+        assert callback_finished.is_set()
         assert stream._callback_thread is not None
         assert not stream._callback_thread.is_alive()
     finally:
-        release_callback.set()
         stream.stop()
         with suppress(LogStreamError):
             stream.join(timeout=1.0)
