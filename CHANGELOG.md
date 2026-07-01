@@ -22,11 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configurable stream callback-queue overflow policy and PID-resolution controls.
 - A `hatchling` build backend so the project is installable and publishable.
 - GitHub Actions CI: `ruff` lint + format check, `ty` type check, and `pytest`
-  across Ubuntu/Windows and Python 3.11–3.14.
+  across Ubuntu/Windows and Python 3.12-3.14.
 
 ### Changed
 
-- Broadened supported Python to `>=3.11` (previously `>=3.13`).
+- Set supported Python to `>=3.12` (previously `>=3.13`).
 - Adopted a strict `ruff` lint configuration and upgraded the `ruff`/`ty`
   toolchain.
 - Performance optimizations across parsers (hot-path parsing, early-reject),
