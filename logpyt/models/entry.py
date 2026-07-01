@@ -61,7 +61,11 @@ class LogEntry(BaseModel):
         """
         return self.model_dump()
 
-    def to_json(self, ensure_ascii: bool = False, indent: int | None = None) -> str:
+    def to_json(
+        self,
+        ensure_ascii: bool = False,  # noqa: FBT001, FBT002  (existing public signature)
+        indent: int | None = None,
+    ) -> str:
         """Convert the log entry to a JSON string.
 
         Args:
@@ -79,7 +83,7 @@ class LogEntry(BaseModel):
         return self.model_dump_json(indent=indent)
 
     @cached_property
-    def json_payload(self) -> Any | None:
+    def json_payload(self) -> Any | None:  # noqa: ANN401  (arbitrary parsed JSON)
         """Extract JSON payload from the log message.
 
         Returns:

@@ -154,21 +154,27 @@ class _FieldMatchCondition(Condition):
 class Package(_FieldMatchCondition):
     """Matches the package name (requires metadata)."""
 
-    def _get_value(self, entry: LogEntry) -> str | None:
+    def _get_value(self, entry: LogEntry) -> str | None:  # noqa: PLR6301
+        # Polymorphic override of _FieldMatchCondition._get_value; called via
+        # self._get_value() in the base check(). Must stay an instance method.
         return entry.meta.get("package")
 
 
 class Tag(_FieldMatchCondition):
     """Matches the log tag."""
 
-    def _get_value(self, entry: LogEntry) -> str:
+    def _get_value(self, entry: LogEntry) -> str:  # noqa: PLR6301
+        # Polymorphic override of _FieldMatchCondition._get_value; called via
+        # self._get_value() in the base check(). Must stay an instance method.
         return entry.tag
 
 
 class Level(_FieldMatchCondition):
     """Matches the log level."""
 
-    def _get_value(self, entry: LogEntry) -> str:
+    def _get_value(self, entry: LogEntry) -> str:  # noqa: PLR6301
+        # Polymorphic override of _FieldMatchCondition._get_value; called via
+        # self._get_value() in the base check(). Must stay an instance method.
         return entry.level
 
 

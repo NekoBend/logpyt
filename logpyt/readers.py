@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .parsers import LogParser
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from .filters import Filter
     from .models import LogEntry
 
@@ -57,7 +58,7 @@ class LogFileReader:
         """Sanitize untrusted log line content for diagnostics."""
         stripped = line.rstrip("\r\n")
         sanitized = "".join(
-            ch if (ch.isprintable() and ch not in "\x1b") else "?" for ch in stripped
+            ch if (ch.isprintable() and ch != "\x1b") else "?" for ch in stripped
         )
         if len(sanitized) > max_len:
             return f"{sanitized[: max_len - 3]}..."
@@ -144,5 +145,4 @@ def read_file(
     Returns:
         Iterator of LogEntry objects.
     """
-    reader = LogFileReader(file_path, parser, filter_by)
-    yield from reader
+    yield from LogFileReader(file_path, parser, filter_by)

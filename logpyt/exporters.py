@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import csv
 import json
-from collections.abc import Iterable
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from logpyt.models.entry import LogEntry
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 
 class LogExporter(Protocol):
@@ -27,7 +29,11 @@ class LogExporter(Protocol):
 class JsonLogExporter:
     """Exports log entries to a JSON file."""
 
-    def __init__(self, indent: int | None = None, ensure_ascii: bool = False) -> None:
+    def __init__(
+        self,
+        indent: int | None = None,
+        ensure_ascii: bool = False,  # noqa: FBT001, FBT002  (existing public signature)
+    ) -> None:
         """Initialize the JSON exporter.
 
         Args:
@@ -79,7 +85,8 @@ class CsvLogExporter:
 
         Args:
             delimiter: A one-character string used to separate fields. Defaults to ",".
-            quotechar: A one-character string used to quote fields containing special characters. Defaults to '"'.
+            quotechar: A one-character string used to quote fields containing
+                special characters. Defaults to '"'.
         """
         self.delimiter = delimiter
         self.quotechar = quotechar
@@ -119,7 +126,7 @@ class CsvLogExporter:
 def export_logs(
     entries: Iterable[LogEntry],
     destination: str | Path,
-    format: Literal["json", "csv"] = "json",
+    format: Literal["json", "csv"] = "json",  # noqa: A002  (public param)
 ) -> None:
     """Export logs to a file in the specified format.
 

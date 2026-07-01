@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import heapq
 from collections import OrderedDict
-from collections.abc import Sequence
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-from ..models import LogEntry
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from ..models import LogEntry
 
 # Type definitions
 EmitMode = Literal["entry", "group"]
@@ -106,7 +108,8 @@ class LogGrouper:
         time_diff = (entry.timestamp - last_entry.timestamp).total_seconds() * 1000
         # We assume logs are mostly ordered, but take abs just in case of slight jitter,
         # though strictly speaking "consecutive" usually implies forward flow.
-        # If the new entry is OLDER than the last one by more than threshold, it definitely breaks.
+        # If the new entry is OLDER than the last one by more than threshold,
+        # it definitely breaks.
         # If it is NEWER by more than threshold, it breaks.
         within_threshold = abs(time_diff) <= self.threshold_ms
 
