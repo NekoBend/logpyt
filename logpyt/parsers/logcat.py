@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
+from typing import cast
 
 from ..models import LogEntry, LogLevel
 
@@ -163,8 +164,9 @@ class ThreadTimeLogParser(LogParser):
         """
         # Strip whitespace from ends to ensure clean matching
         clean_line = line.strip()
+        # perf: early-reject fast path; boolean-expr count is intentional
         if (
-            len(clean_line) < 24
+            len(clean_line) < 24  # noqa: PLR0916
             or clean_line[2] != "-"
             or clean_line[5] != " "
             or not clean_line[0:2].isdigit()
@@ -194,9 +196,8 @@ class ThreadTimeLogParser(LogParser):
         if level_str not in {"V", "D", "I", "W", "E", "F"}:
             return super().parse_stdout(line)
 
-        # Ensure level is treated as LogLevel
-        # In practice, this will be one of V, D, I, W, E, F
-        level: LogLevel = level_str  # type: ignore
+        # level_str was validated against the allowed set above.
+        level = cast("LogLevel", level_str)
 
         return LogEntry(
             timestamp=timestamp,
@@ -234,8 +235,9 @@ class BriefLogParser(LogParser):
             A LogEntry object.
         """
         clean_line = line.strip()
+        # perf: early-reject fast path; boolean-expr count is intentional
         if (
-            len(clean_line) < 8
+            len(clean_line) < 8  # noqa: PLR0916
             or clean_line[0] not in "VDIWEF"
             or clean_line[1] != "/"
             or "(" not in clean_line
@@ -254,7 +256,7 @@ class BriefLogParser(LogParser):
             timestamp=self._get_default_timestamp(),
             pid=int(pid_str),
             tid=0,
-            level=level_str,  # type: ignore
+            level=cast("LogLevel", level_str),
             tag=tag.strip(),
             message=message,
             raw=line,
@@ -303,7 +305,7 @@ class ProcessLogParser(LogParser):
             timestamp=self._get_default_timestamp(),
             pid=int(pid_str),
             tid=0,
-            level=level_str,  # type: ignore
+            level=cast("LogLevel", level_str),
             tag="",
             message=message,
             raw=line,
@@ -352,7 +354,7 @@ class TagLogParser(LogParser):
             timestamp=self._get_default_timestamp(),
             pid=0,
             tid=0,
-            level=level_str,  # type: ignore
+            level=cast("LogLevel", level_str),
             tag=tag.strip(),
             message=message,
             raw=line,
