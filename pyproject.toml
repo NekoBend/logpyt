@@ -3,14 +3,88 @@ name = "logpyt"
 version = "1.0.0"
 description = "Structured logging toolkit around Android logcat streams"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = ["pydantic>=2.12.4"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
     "pytest>=9.0.1",
     "pytest-asyncio>=1.3.0",
     "pytest-mock>=3.15.1",
-    "ruff>=0.14.5",
-    "ty>=0.0.12",
+    "ruff>=0.15.20",
+    "ty>=0.0.55",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+
+[tool.ruff.lint]
+preview = true
+select = [
+    "A",
+    "ANN",
+    "B",
+    "BLE",
+    "C4",
+    "DTZ",
+    "E",
+    "F",
+    "FAST",
+    "FBT",
+    "FURB",
+    "G",
+    "I",
+    "ICN",
+    "N",
+    "PERF",
+    "PIE",
+    "PLR",
+    "PT",
+    "PTH",
+    "RSE",
+    "RUF",
+    "S",
+    "SIM",
+    "SLF",
+    "TC",
+    "UP",
+    "W",
+]
+ignore = [
+    "ANN204",  # missing return type on special (dunder) methods
+    "CPY",     # flake8-copyright: no per-file license header required
+    "INP",     # implicit-namespace-package: intentional package layout
+    "PLR0913", # too-many-arguments: stream/exporter APIs are wide by design
+    "PLR0917", # too-many-positional-arguments: same rationale as PLR0913
+    "PLR2004", # magic-value-comparison: noisy for log-level/threshold literals
+    "T",        # flake8-print: print() is allowed (CLI-facing output later)
+    # ADB is fundamentally a subprocess wrapper. All spawns use list-form args
+    # with a validated adb path (see resolve_adb) and never shell=True, so the
+    # flake8-bandit subprocess heuristics are false positives here.
+    "S404",    # suspicious subprocess import
+    "S603",    # subprocess call without shell=True literal check
+]
+# ANN101/ANN102 were removed from ruff; keeping them in `ignore` only warns.
+
+[tool.ruff.lint.per-file-ignores]
+# Tests legitimately use asserts, touch private members, and skip annotations.
+"tests/**" = [
+    "S101",    # assert used
+    "SLF001",  # private-member-access (tests reach into internals)
+    "ANN001",  # missing type annotation for function argument
+    "ANN201",  # missing return type on public function
+    "ANN202",  # missing return type on private function
+    "ANN002",  # missing type annotation for *args (mock/callback signatures)
+    "ANN003",  # missing type annotation for **kwargs (mock/callback signatures)
+    "PLR6301", # no-self-use
+    "RUF029",  # async test callbacks must match the async callback signature
+]
+
+[tool.ruff.lint.flake8-type-checking]
+# Pydantic models evaluate annotations at runtime, so imported field types
+# must stay importable outside TYPE_CHECKING blocks.
+runtime-evaluated-base-classes = ["pydantic.BaseModel"]
