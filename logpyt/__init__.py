@@ -1,8 +1,9 @@
 """logpyt package.
 
-This package provides tools for parsing, filtering, grouping, and handling structured log entries
-from ADB logcat output. It allows you to treat log streams as observable events, making it
-easier to build tools that react to specific log patterns.
+This package provides tools for parsing, filtering, grouping, and handling
+structured log entries from ADB logcat output. It allows you to treat log streams
+as observable events, making it easier to build tools that react to specific log
+patterns.
 
 Quick Start:
     ```python
@@ -32,7 +33,6 @@ from .exceptions import (
     LogStreamInternalError,
     LogStreamKilledError,
     LogStreamPidResolveError,
-    LogStreamStdErrError,
     LogStreamStderrError,
     LogStreamTimeoutError,
 )
@@ -59,7 +59,6 @@ __all__ = [
     "LogStreamInternalError",
     "LogStreamKilledError",
     "LogStreamPidResolveError",
-    "LogStreamStdErrError",
     "LogStreamStderrError",
     "LogStreamTimeoutError",
     "StreamHandle",

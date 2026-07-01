@@ -21,10 +21,6 @@ class LogStreamStderrError(LogStreamError):
     """
 
 
-# Alias for backward compatibility or alternative naming preference
-LogStreamStdErrError = LogStreamStderrError
-
-
 class LogStreamPidResolveError(LogStreamError):
     """Raised when the PID for a package cannot be resolved.
 
