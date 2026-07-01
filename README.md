@@ -2,7 +2,23 @@
 
 Structured logging toolkit around Android logcat streams.
 
+[![CI](https://github.com/NekoBend/logpyt/actions/workflows/ci.yml/badge.svg)](https://github.com/NekoBend/logpyt/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
+## Features
+
+- Live `adb logcat` streaming — synchronous (`LogStream`) and asyncio (`AsyncLogStream`).
+- Multiple logcat format parsers: threadtime (default), brief, process, tag, raw.
+- Composable filtering: a simple `Filter` plus an `AdvancedFilter` DSL (`&`, `|`, `~`).
+- Built-in crash / ANR detection and time-window grouping.
+- Offline log-file analysis and JSON / CSV export.
+
 ## Installation
+
+Requires **Python 3.11+** and the Android `adb` executable (auto-discovered by
+`resolve_adb()`, or pass `adb_path=` explicitly).
 
 ```bash
 uv pip install git+https://github.com/NekoBend/logpyt.git
@@ -190,3 +206,7 @@ if __name__ == "__main__":
   - `list_devices()`: Lists connected devices.
   - `read_file()` / `LogFileReader`: Tools for offline log analysis.
   - `export_logs()`: Exports logs to JSON/CSV.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
