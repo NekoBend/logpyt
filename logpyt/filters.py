@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
 from functools import lru_cache
-from typing import Any
+from typing import TYPE_CHECKING
 
-from .models import LogEntry
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from .models import LogEntry
 
 
 @lru_cache(maxsize=256)
@@ -20,6 +22,7 @@ def _compile_contains_regex(patterns: tuple[str, ...]) -> re.Pattern[str] | None
 
     Returns:
         Compiled regex pattern, or None when no patterns are provided.
+
     """
     if not patterns:
         return None
@@ -39,16 +42,35 @@ class Condition(ABC):
 
         Returns:
             True if the condition is met, False otherwise.
+
         """
         ...
 
     def __and__(self, other: Condition) -> Condition:
+        """Return the AND combination of this and another condition.
+
+        Returns:
+            The combined condition.
+
+        """
         return And(self, other)
 
     def __or__(self, other: Condition) -> Condition:
+        """Return the OR combination of this and another condition.
+
+        Returns:
+            The combined condition.
+
+        """
         return Or(self, other)
 
     def __invert__(self) -> Condition:
+        """Return the negation of this condition.
+
+        Returns:
+            The combined condition.
+
+        """
         return Not(self)
 
 
@@ -56,9 +78,16 @@ class And(Condition):
     """Logical AND combination of conditions."""
 
     def __init__(self, *conditions: Condition) -> None:
+        """Initialize with one or more conditions."""
         self.conditions = conditions
 
     def check(self, entry: LogEntry) -> bool:
+        """Return True if all conditions are met.
+
+        Returns:
+            Whether all conditions are satisfied.
+
+        """
         return all(c.check(entry) for c in self.conditions)
 
 
@@ -66,9 +95,16 @@ class Or(Condition):
     """Logical OR combination of conditions."""
 
     def __init__(self, *conditions: Condition) -> None:
+        """Initialize with one or more conditions."""
         self.conditions = conditions
 
     def check(self, entry: LogEntry) -> bool:
+        """Return True if any condition is met.
+
+        Returns:
+            Whether any condition is satisfied.
+
+        """
         return any(c.check(entry) for c in self.conditions)
 
 
@@ -76,9 +112,16 @@ class Not(Condition):
     """Logical NOT of a condition."""
 
     def __init__(self, condition: Condition) -> None:
+        """Initialize with the condition to negate."""
         self.condition = condition
 
     def check(self, entry: LogEntry) -> bool:
+        """Return True if the condition is not met.
+
+        Returns:
+            Whether the condition is not satisfied.
+
+        """
         return not self.condition.check(entry)
 
 
@@ -86,15 +129,22 @@ class _FieldMatchCondition(Condition):
     """Base class for conditions that match against a set of values."""
 
     def __init__(self, values: str | Iterable[str]) -> None:
+        """Initialize with value(s) to match against."""
         if isinstance(values, str):
             self.values = {values}
         else:
             self.values = set(values)
 
     @abstractmethod
-    def _get_value(self, entry: LogEntry) -> Any: ...
+    def _get_value(self, entry: LogEntry) -> str | None: ...
 
     def check(self, entry: LogEntry) -> bool:
+        """Return True if the entry's field matches any of the values.
+
+        Returns:
+            Whether the field value matches.
+
+        """
         val = self._get_value(entry)
         if val is None:
             return False
@@ -126,6 +176,7 @@ class MessageContains(Condition):
     """Checks if the message contains any of the specified strings."""
 
     def __init__(self, patterns: str | Iterable[str]) -> None:
+        """Initialize with pattern(s) to search for."""
         if isinstance(patterns, str):
             self.patterns = [patterns]
         else:
@@ -133,6 +184,12 @@ class MessageContains(Condition):
         self._compiled_pattern = _compile_contains_regex(tuple(self.patterns))
 
     def check(self, entry: LogEntry) -> bool:
+        """Return True if the message contains any pattern.
+
+        Returns:
+            Whether a pattern was found.
+
+        """
         if self._compiled_pattern is None:
             return False
         return self._compiled_pattern.search(entry.message) is not None
@@ -147,11 +204,18 @@ class CrashCondition(Condition):
         level: str = "E",
         message_pattern: str = "FATAL EXCEPTION",
     ) -> None:
+        """Initialize crash detection parameters."""
         self.tag = tag
         self.level = level
         self.message_pattern = message_pattern
 
     def check(self, entry: LogEntry) -> bool:
+        """Return True if the entry matches a crash pattern.
+
+        Returns:
+            Whether a crash was detected.
+
+        """
         return (
             entry.tag == self.tag
             and entry.level == self.level
@@ -168,11 +232,18 @@ class AnrCondition(Condition):
         level: str = "E",
         message_prefix: str = "ANR in",
     ) -> None:
+        """Initialize ANR detection parameters."""
         self.tag = tag
         self.level = level
         self.message_prefix = message_prefix
 
     def check(self, entry: LogEntry) -> bool:
+        """Return True if the entry matches an ANR pattern.
+
+        Returns:
+            Whether an ANR was detected.
+
+        """
         return (
             entry.tag == self.tag
             and entry.level == self.level
@@ -188,6 +259,7 @@ class AdvancedFilter:
 
         Args:
             condition: The root condition object.
+
         """
         self.condition = condition
 
@@ -199,6 +271,7 @@ class AdvancedFilter:
 
         Returns:
             True if it matches, False otherwise.
+
         """
         return self.condition.check(entry)
 
@@ -206,8 +279,10 @@ class AdvancedFilter:
 class Filter:
     """A simple filter combining criteria with AND logic.
 
-    This filter allows you to specify multiple criteria (package, tag, level, message content).
-    A log entry must match ALL specified criteria to pass the filter. If a criterion accepts
+    This filter allows you to specify multiple criteria
+    (package, tag, level, message content).
+    A log entry must match ALL specified criteria to pass
+    the filter. If a criterion accepts
     a list of values (e.g., `tag=["TagA", "TagB"]`), the entry matches if it matches ANY
     value in that list (OR logic within the field).
 
@@ -220,6 +295,7 @@ class Filter:
 
         Filter by tag "MyApp" OR "MyService", AND message contains "Error":
         >>> f = Filter(tag=["MyApp", "MyService"], message_contains="Error")
+
     """
 
     def __init__(
@@ -236,6 +312,7 @@ class Filter:
             tag: Tag(s) to match.
             level: Log level(s) to match (e.g., "E", "W").
             message_contains: Substring(s) to look for in the message.
+
         """
         self.packages = self._to_set(package)
         self.tags = self._to_set(tag)
@@ -247,14 +324,16 @@ class Filter:
             else None
         )
 
-    def _to_set(self, value: str | list[str] | None) -> set[str] | None:
+    @staticmethod
+    def _to_set(value: str | list[str] | None) -> set[str] | None:
         if value is None:
             return None
         if isinstance(value, str):
             return {value}
         return set(value)
 
-    def _to_list(self, value: str | list[str] | None) -> list[str] | None:
+    @staticmethod
+    def _to_list(value: str | list[str] | None) -> list[str] | None:
         if value is None:
             return None
         if isinstance(value, str):
@@ -269,6 +348,7 @@ class Filter:
 
         Returns:
             True if it matches, False otherwise.
+
         """
         if self.packages is not None:
             pkg = entry.meta.get("package")

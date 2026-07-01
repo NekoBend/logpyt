@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any, Literal, TypedDict
 
 
@@ -53,6 +54,7 @@ def resolve_adb() -> str:
 
     Raises:
         FileNotFoundError: If ADB executable cannot be found.
+
     """
     # Candidates to search for
     candidates = ["adb"]
@@ -60,9 +62,8 @@ def resolve_adb() -> str:
     is_wsl = False
     if sys.platform == "linux":
         try:
-            with open("/proc/version", "r") as f:
-                if "microsoft" in f.read().lower():
-                    is_wsl = True
+            if "microsoft" in Path("/proc/version").read_text(encoding="utf-8").lower():
+                is_wsl = True
         except OSError:
             pass
 
@@ -88,13 +89,13 @@ def resolve_adb() -> str:
                 if os.path.isfile(path) and os.access(path, os.X_OK):
                     return path
 
-    raise FileNotFoundError(
-        "Could not find 'adb' or 'adb.exe' in PATH or Android SDK directories."
-    )
+    msg = "Could not find 'adb' or 'adb.exe' in PATH or Android SDK directories."
+    raise FileNotFoundError(msg)
 
 
 def list_devices(
-    device_type: DeviceType | None = None, timeout: float = 10.0
+    device_type: DeviceType | None = None,
+    timeout: float = 10.0,
 ) -> list[DeviceInfo]:
     """List connected ADB devices.
 
@@ -111,7 +112,7 @@ def list_devices(
     Raises:
         RuntimeError: If ADB command fails.
         TimeoutError: If ADB command times out.
-        FileNotFoundError: If ADB is not found.
+
     """
     adb_path = resolve_adb()
 
@@ -125,14 +126,16 @@ def list_devices(
             timeout=timeout,
         )
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Failed to run adb devices: {e.stderr}") from e
+        msg = f"Failed to run adb devices: {e.stderr}"
+        raise RuntimeError(msg) from e
     except subprocess.TimeoutExpired as e:
-        raise TimeoutError(f"Timed out running adb devices after {timeout}s") from e
+        msg = f"Timed out running adb devices after {timeout}s"
+        raise TimeoutError(msg) from e
 
     devices: list[DeviceInfo] = []
 
     # Parse output
-    # Example: "emulator-5554 device product:sdk_gphone_x86_64 model:sdk_gphone_x86_64 device:generic_x86_64 transport_id:1"
+    # Example: "emulator-5554 device product:sdk_gphone_x86_64 ..."
     lines = result.stdout.strip().splitlines()
 
     # Skip the first line "List of devices attached"
@@ -168,7 +171,7 @@ def list_devices(
         # Parse key:value pairs if present
         if props_str:
             for key, value in prop_pattern.findall(props_str):
-                if key in ["product", "model", "device", "transport_id"]:
+                if key in {"product", "model", "device", "transport_id"}:
                     info[key] = value.strip()
 
         # Apply filter
@@ -195,6 +198,7 @@ def enable_debug(level: str | int = "INFO") -> None:
 
     Args:
         level: Logging level (e.g., "DEBUG", "INFO", logging.DEBUG).
+
     """
     logger = logging.getLogger("logpyt")
     logger.setLevel(level)
@@ -203,7 +207,7 @@ def enable_debug(level: str | int = "INFO") -> None:
     if not logger.handlers:
         handler = logging.StreamHandler()
         formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         )
         handler.setFormatter(formatter)
         logger.addHandler(handler)
@@ -219,7 +223,7 @@ def wait_for_device(serial: str | None = None, timeout: float | None = None) -> 
     Raises:
         TimeoutError: If timeout expires.
         RuntimeError: If ADB command fails.
-        FileNotFoundError: If ADB is not found.
+
     """
     adb_path = resolve_adb()
     cmd = [adb_path]
@@ -228,15 +232,24 @@ def wait_for_device(serial: str | None = None, timeout: float | None = None) -> 
     cmd.append("wait-for-device")
 
     try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=timeout)
+        subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=timeout,
+        )
     except subprocess.TimeoutExpired as e:
-        raise TimeoutError(f"Timed out waiting for device after {timeout}s") from e
+        msg = f"Timed out waiting for device after {timeout}s"
+        raise TimeoutError(msg) from e
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Failed to wait for device: {e.stderr}") from e
+        msg = f"Failed to wait for device: {e.stderr}"
+        raise RuntimeError(msg) from e
 
 
 async def async_wait_for_device(
-    serial: str | None = None, timeout: float | None = None
+    serial: str | None = None,
+    timeout: float | None = None,
 ) -> None:
     """Wait for device to be ready (async).
 
@@ -247,7 +260,7 @@ async def async_wait_for_device(
     Raises:
         TimeoutError: If timeout expires.
         RuntimeError: If ADB command fails.
-        FileNotFoundError: If ADB is not found.
+
     """
     adb_path = resolve_adb()
     args = []
@@ -273,11 +286,13 @@ async def async_wait_for_device(
             await process.wait()
         except ProcessLookupError:
             pass
-        raise TimeoutError(f"Timed out waiting for device after {timeout}s") from e
+        msg = f"Timed out waiting for device after {timeout}s"
+        raise TimeoutError(msg) from e
 
     if process.returncode != 0:
         stderr_data = await process.stderr.read() if process.stderr else b""
-        raise RuntimeError(f"Failed to wait for device: {stderr_data.decode().strip()}")
+        msg = f"Failed to wait for device: {stderr_data.decode().strip()}"
+        raise RuntimeError(msg)
 
 
 def adb_connect(address: str, timeout: float | None = None) -> None:
@@ -290,17 +305,22 @@ def adb_connect(address: str, timeout: float | None = None) -> None:
     Raises:
         RuntimeError: If connection fails.
         TimeoutError: If operation times out.
-        FileNotFoundError: If ADB is not found.
+
     """
     adb_path = resolve_adb()
     cmd = [adb_path, "connect", address]
 
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, check=False
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
         )
     except subprocess.TimeoutExpired as e:
-        raise TimeoutError(f"Timed out connecting to {address} after {timeout}s") from e
+        msg = f"Timed out connecting to {address} after {timeout}s"
+        raise TimeoutError(msg) from e
 
     output = result.stdout.strip()
     error = result.stderr.strip()
@@ -313,8 +333,9 @@ def adb_connect(address: str, timeout: float | None = None) -> None:
         or "unable" in output.lower()
         or "failed" in output.lower()
     ):
-        msg = error if error else output
-        raise RuntimeError(f"Failed to connect to {address}: {msg}")
+        detail = error or output
+        msg = f"Failed to connect to {address}: {detail}"
+        raise RuntimeError(msg)
 
     # "already connected to 192.168.1.5:5555" -> Success
     # "connected to 192.168.1.5:5555" -> Success
@@ -330,7 +351,7 @@ async def async_adb_connect(address: str, timeout: float | None = None) -> None:
     Raises:
         RuntimeError: If connection fails.
         TimeoutError: If operation times out.
-        FileNotFoundError: If ADB is not found.
+
     """
     adb_path = resolve_adb()
 
@@ -353,7 +374,8 @@ async def async_adb_connect(address: str, timeout: float | None = None) -> None:
             await process.wait()
         except ProcessLookupError:
             pass
-        raise TimeoutError(f"Timed out connecting to {address} after {timeout}s") from e
+        msg = f"Timed out connecting to {address} after {timeout}s"
+        raise TimeoutError(msg) from e
 
     stdout_data, stderr_data = await process.communicate()
     output = stdout_data.decode().strip()
@@ -364,8 +386,9 @@ async def async_adb_connect(address: str, timeout: float | None = None) -> None:
         or "unable" in output.lower()
         or "failed" in output.lower()
     ):
-        msg = error if error else output
-        raise RuntimeError(f"Failed to connect to {address}: {msg}")
+        detail = error or output
+        msg = f"Failed to connect to {address}: {detail}"
+        raise RuntimeError(msg)
 
 
 def extract_json(text: str) -> Any | None:
@@ -380,6 +403,7 @@ def extract_json(text: str) -> Any | None:
     Notes:
         Scanning is bounded to protect against worst-case inputs with huge numbers
         of JSON-like delimiters that repeatedly fail to parse.
+
     """
     if not text:
         return None

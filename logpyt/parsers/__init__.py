@@ -1,3 +1,5 @@
+"""Log format parsers."""
+
 from .logcat import (
     BriefLogParser,
     LogParser,

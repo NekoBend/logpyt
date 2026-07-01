@@ -8,20 +8,23 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Sequence
-from typing import Any, Literal, TextIO
+from typing import TYPE_CHECKING, Any, Literal, TextIO
 
-from ..exceptions import (
+from logpyt.exceptions import (
     LogStreamError,
     LogStreamInternalError,
     LogStreamKilledError,
     LogStreamTimeoutError,
 )
-from ..filters import Filter
-from ..groupers import LogGrouper, WindowedLogGrouper
-from ..models import LogEntry
-from ..parsers import LogParser
-from ..utils import resolve_adb
+from logpyt.filters import Filter
+from logpyt.groupers import LogGrouper, WindowedLogGrouper
+from logpyt.parsers import LogParser
+from logpyt.utils import resolve_adb
+
 from .common import StreamState, build_pidof_command
+
+if TYPE_CHECKING:
+    from logpyt.models import LogEntry
 
 
 class PidMonitor:

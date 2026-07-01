@@ -30,6 +30,7 @@ def build_pidof_command(
 
     Returns:
         List of command arguments.
+
     """
     cmd = [adb_path]
     if device_id:

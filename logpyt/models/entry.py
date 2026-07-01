@@ -17,8 +17,9 @@ LogLevel = Literal["V", "D", "I", "W", "E", "F"]
 class LogEntry(BaseModel):
     """A structured log entry representing a single line of log output.
 
-    This class encapsulates all standard fields found in common log formats (like Android's logcat),
-    along with the raw log line and any additional metadata.
+    This class encapsulates all standard fields found in common log
+    formats (like Android's logcat), along with the raw log line and
+    any additional metadata.
 
     Attributes:
         timestamp: The datetime object representing when the log entry was created.
@@ -31,11 +32,13 @@ class LogEntry(BaseModel):
             - "W": Warning
             - "E": Error
             - "F": Fatal
-        tag: A short string tag identifying the component or category (e.g., "ActivityManager").
+        tag: A short string tag identifying the component or
+            category (e.g., "ActivityManager").
         message: The main content of the log message.
         raw: The original, unmodified raw string of the log line.
         meta: A dictionary for additional metadata (e.g., source stream, package name).
             Defaults to an empty dict.
+
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -54,6 +57,7 @@ class LogEntry(BaseModel):
 
         Returns:
             A dictionary representation of the log entry.
+
         """
         return self.model_dump()
 
@@ -63,12 +67,13 @@ class LogEntry(BaseModel):
         Args:
             ensure_ascii: If True, non-ASCII characters are escaped.
                 Note: When using model_dump_json, ensure_ascii is not directly supported
-                in the same way as json.dumps in all Pydantic versions, but we prioritize
-                performance.
+                in the same way as json.dumps in all Pydantic
+                versions, but we prioritize performance.
             indent: If specified, formats the JSON with the given indentation.
 
         Returns:
             A JSON string representation of the log entry.
+
         """
         # Use model_dump_json for better performance (avoids double serialization)
         return self.model_dump_json(indent=indent)
@@ -78,6 +83,8 @@ class LogEntry(BaseModel):
         """Extract JSON payload from the log message.
 
         Returns:
-            The parsed JSON object/array if found in the message, otherwise None.
+            The parsed JSON object/array if found in the message,
+            otherwise None.
+
         """
         return extract_json(self.message)
