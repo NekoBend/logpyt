@@ -71,6 +71,68 @@ def test_sliding_window_correctness():
     assert group[2].message == "msg3"
 
 
+def test_windowed_grouper_lru_eviction_on_max_groups():
+    """A 3rd distinct key over max_groups=2 evicts (flushes) the LRU key."""
+    threshold_ms = 1000.0
+    grouper = WindowedLogGrouper(
+        by=["tid"], threshold_ms=threshold_ms, emit_mode="group", max_groups=2
+    )
+
+    start_ts = datetime.datetime.now(datetime.UTC).replace(microsecond=0, tzinfo=None)
+
+    # Three DISTINCT keys, all within threshold of each other so the heap-based
+    # timeout never fires; any flush must come from LRU eviction alone.
+    e_a = create_log_entry(start_ts, pid=1, tid=10, msg="A")
+    e_b = create_log_entry(
+        start_ts + datetime.timedelta(milliseconds=10), pid=1, tid=20, msg="B"
+    )
+    e_c = create_log_entry(
+        start_ts + datetime.timedelta(milliseconds=20), pid=1, tid=30, msg="C"
+    )
+
+    assert grouper.process(e_a) == []
+    assert grouper.process(e_b) == []
+
+    # Inserting the 3rd distinct key exceeds max_groups=2 and must evict the LRU
+    # key (tid=10, "A"), emitting its group.
+    emitted = grouper.process(e_c)
+
+    assert len(emitted) == 1
+    group = emitted[0]
+    assert isinstance(group, list)
+    assert len(group) == 1
+    assert group[0].message == "A"
+    assert group[0].tid == 10
+
+    # The two most-recent keys remain open.
+    assert set(grouper._buffers.keys()) == {(20,), (30,)}
+
+
+def test_windowed_grouper_emit_mode_entry_flattens_on_flush():
+    """emit_mode='entry' yields flat LogEntry items, not list-of-list, on flush."""
+    grouper = WindowedLogGrouper(by=["tid"], threshold_ms=100.0, emit_mode="entry")
+
+    start_ts = datetime.datetime.now(datetime.UTC).replace(microsecond=0, tzinfo=None)
+
+    e1 = create_log_entry(start_ts, pid=1, tid=10, msg="m1")
+    e2 = create_log_entry(
+        start_ts + datetime.timedelta(milliseconds=10), pid=1, tid=10, msg="m2"
+    )
+
+    assert grouper.process(e1) == []
+    assert grouper.process(e2) == []
+
+    emitted = grouper.flush()
+
+    # Two flat LogEntry items, not a single list containing a list.
+    assert len(emitted) == 2
+    messages = []
+    for item in emitted:
+        assert isinstance(item, LogEntry)
+        messages.append(item.message)
+    assert messages == ["m1", "m2"]
+
+
 def test_windowed_grouper_limits_heap_growth_for_hot_key_updates():
     """Repeated updates for one key should not grow heap without bound."""
     grouper = WindowedLogGrouper(

@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    from .models import LogEntry
+    from .models import LogEntry, LogLevel
 
 
 @lru_cache(maxsize=256)
@@ -172,6 +172,14 @@ class Tag(_FieldMatchCondition):
 class Level(_FieldMatchCondition):
     """Matches the log level."""
 
+    def __init__(self, values: LogLevel | Iterable[LogLevel]) -> None:
+        """Initialize with log level(s) to match against.
+
+        Typing the parameter as ``LogLevel`` lets a type checker catch an
+        invalid literal such as ``Level("ERROR")`` at check time.
+        """
+        super().__init__(values)
+
     def _get_value(self, entry: LogEntry) -> str:  # noqa: PLR6301
         # Polymorphic override of _FieldMatchCondition._get_value; called via
         # self._get_value() in the base check(). Must stay an instance method.
@@ -308,10 +316,15 @@ class Filter:
         self,
         package: str | list[str] | None = None,
         tag: str | list[str] | None = None,
-        level: str | list[str] | None = None,
+        level: LogLevel | list[LogLevel] | None = None,
         message_contains: str | list[str] | None = None,
     ) -> None:
         """Initialize the filter.
+
+        An empty collection (e.g. ``tag=[]``) is treated the same as ``None``:
+        it imposes no constraint on that field, rather than rejecting every
+        entry. A filter whose criteria are all ``None`` or empty passes every
+        entry.
 
         Args:
             package: Package name(s) to match. Requires 'package' in LogEntry.meta.
@@ -331,20 +344,24 @@ class Filter:
         )
 
     @staticmethod
-    def _to_set(value: str | list[str] | None) -> set[str] | None:
+    def _to_set(value: str | Iterable[str] | None) -> set[str] | None:
+        # An empty collection means "no constraint", identical to None.
         if value is None:
             return None
         if isinstance(value, str):
             return {value}
-        return set(value)
+        result = set(value)
+        return result or None
 
     @staticmethod
-    def _to_list(value: str | list[str] | None) -> list[str] | None:
+    def _to_list(value: str | Iterable[str] | None) -> list[str] | None:
+        # An empty collection means "no constraint", identical to None.
         if value is None:
             return None
         if isinstance(value, str):
             return [value]
-        return list(value)
+        result = list(value)
+        return result or None
 
     def __call__(self, entry: LogEntry) -> bool:
         """Check if the entry matches all criteria.

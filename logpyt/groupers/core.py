@@ -21,6 +21,17 @@ class LogGrouper:
     This class is useful for reconstructing fragmented logs or grouping related logs
     that occur close together in time.
 
+    Boundary semantics:
+        ``threshold_ms`` bounds only the gap between an entry and the immediately
+        preceding entry in the same group; it is applied inclusively
+        (``abs(time_diff) <= threshold_ms``), so an entry arriving exactly
+        ``threshold_ms`` after the previous one stays in the same group. It does
+        NOT bound the total time span of a group: a long run of entries each
+        within ``threshold_ms`` of its predecessor forms one group whose overall
+        span may greatly exceed ``threshold_ms`` (i.e. the window "drifts"
+        forward with each entry). This is intentional; groups are defined by
+        inter-entry gaps, not by an absolute maximum duration.
+
     Attributes:
         by: Fields to group by (e.g., ("pid", "tid")).
         threshold_ms: Maximum time difference in milliseconds between
@@ -156,6 +167,26 @@ class WindowedLogGrouper(LogGrouper):
 
     This is useful for interleaved logs where multiple processes/threads are
     logging simultaneously.
+
+    Boundary semantics (differs subtly from ``LogGrouper``):
+        A window for a key is closed lazily via an expiry heap. Each entry sets
+        that key's expiry to ``entry_ts + threshold_ms``. A window is flushed
+        only when a later entry arrives with ``current_ts > expiry`` (a STRICT
+        comparison). Consequently a same-key entry arriving *exactly*
+        ``threshold_ms`` after the previous one (``current_ts == expiry``) does
+        NOT close the window; it extends the same group. This matches
+        ``LogGrouper``'s inclusive ``abs(diff) <= threshold_ms`` rule at the
+        exact boundary, and both close the group once the gap strictly exceeds
+        ``threshold_ms``. As with ``LogGrouper``, ``threshold_ms`` bounds only
+        the inter-entry gap, not a group's total span, so a busy window drifts
+        forward as long as entries keep arriving within threshold.
+
+    Eviction:
+        At most ``max_groups`` windows are kept open concurrently. When a new,
+        distinct key would exceed ``max_groups``, the least-recently-updated
+        (LRU) window is flushed and emitted to make room, regardless of whether
+        its threshold has elapsed. Recency is tracked by insertion/update order
+        in the underlying ``OrderedDict`` of buffers.
     """
 
     def __init__(

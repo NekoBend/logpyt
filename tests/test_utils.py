@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 from pathlib import Path
@@ -12,6 +13,7 @@ from logpyt.utils import (
     adb_connect,
     async_adb_connect,
     async_wait_for_device,
+    enable_debug,
     extract_json,
     list_devices,
     resolve_adb,
@@ -56,15 +58,51 @@ def test_resolve_adb_not_found(mocker) -> None:
 
 
 def test_resolve_adb_path_candidate_must_be_executable_file(mocker) -> None:
-    """PATH candidate should be validated as an executable file."""
+    """PATH candidate that is a file but not executable must be rejected.
+
+    The implementation validates candidates with ``Path(path).is_file()`` and
+    ``os.access(path, os.X_OK)``. Here the file exists (is_file -> True) but is
+    not executable (os.access -> False), so the FileNotFoundError must be driven
+    specifically by the X_OK check, not by a missing file.
+    """
     resolve_adb.cache_clear()
     mocker.patch("shutil.which", return_value="/fake/bin/adb")
-    mocker.patch("os.path.isfile", return_value=False)
-    mocker.patch("os.access", return_value=False)
+    # File exists...
+    mocker.patch("pathlib.Path.is_file", return_value=True)
+    # ...but is not executable. This is the check that must reject it.
+    mock_access = mocker.patch("os.access", return_value=False)
     mocker.patch.dict(os.environ, {}, clear=True)
 
     with pytest.raises(FileNotFoundError):
         resolve_adb()
+
+    # Confirm the executable check was actually exercised (X_OK on the candidate).
+    mock_access.assert_any_call("/fake/bin/adb", os.X_OK)
+
+
+def test_enable_debug_configures_logger_without_duplicate_handlers() -> None:
+    """enable_debug sets the level and attaches exactly one handler (idempotent)."""
+    logger = logging.getLogger("logpyt")
+    # Snapshot and clear any pre-existing state so this test is deterministic.
+    saved_handlers = logger.handlers[:]
+    saved_level = logger.level
+    logger.handlers.clear()
+
+    try:
+        enable_debug("DEBUG")
+        assert logger.level == logging.DEBUG
+        assert len(logger.handlers) == 1
+
+        # Calling again must NOT add a duplicate handler (the `if not
+        # logger.handlers` guard) and must still apply the requested level.
+        enable_debug("INFO")
+        assert logger.level == logging.INFO
+        assert len(logger.handlers) == 1
+    finally:
+        # Restore original logger state so this does not leak into other tests.
+        logger.handlers.clear()
+        logger.handlers.extend(saved_handlers)
+        logger.setLevel(saved_level)
 
 
 def test_list_devices_success(mocker) -> None:
@@ -83,9 +121,46 @@ emulator-5554 device product:sdk_gphone model:sdk_gphone device:generic transpor
     assert devices[0].get("id") == "emulator-5554"
     assert devices[0].get("type") == "emulator"
     assert devices[0].get("state") == "device"
+    # Parsed key:value properties must be surfaced, not just id/state/type.
+    assert devices[0].get("product") == "sdk_gphone"
+    assert devices[0].get("model") == "sdk_gphone"
+    assert devices[0].get("device") == "generic"
+    assert devices[0].get("transport_id") == "1"
 
     assert devices[1].get("id") == "1234567890abc"
     assert devices[1].get("type") == "usb"
+    assert devices[1].get("product") == "myphone"
+    assert devices[1].get("model") == "Pixel_5"
+    assert devices[1].get("device") == "pixel5"
+    assert devices[1].get("transport_id") == "2"
+
+
+def test_list_devices_property_value_with_space(mocker) -> None:
+    """A property value containing a space must be captured wholly.
+
+    The prop regex ``(\\w+):((?:(?!\\s\\w+:).)*)`` uses a negative lookahead so a
+    value only terminates when the next `` key:`` pair begins. This locks that
+    behavior: ``model`` here is ``Pixel 5`` (with an embedded space) and does not
+    swallow the following ``device:`` pair.
+    """
+    mocker.patch("logpyt.utils.resolve_adb", return_value="adb")
+
+    mock_run = mocker.patch("subprocess.run")
+    mock_run.return_value.stdout = (
+        "List of devices attached\n"
+        "1234567890abc device product:my_phone model:Pixel 5 "
+        "device:pixel5 transport_id:3\n"
+    )
+
+    devices = list_devices()
+    assert len(devices) == 1
+
+    assert devices[0].get("product") == "my_phone"
+    # The space-containing value is captured whole, not truncated at the space.
+    assert devices[0].get("model") == "Pixel 5"
+    # And the lookahead correctly stops before the next key, so `device` is clean.
+    assert devices[0].get("device") == "pixel5"
+    assert devices[0].get("transport_id") == "3"
 
 
 def test_list_devices_filter(mocker) -> None:

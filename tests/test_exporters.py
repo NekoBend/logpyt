@@ -142,6 +142,38 @@ def test_csv_exporter(tmp_path: Path, sample_entries: list[LogEntry]) -> None:
     assert row1["timestamp"] == "2023-01-01T12:00:00"
 
 
+def test_csv_exporter_sanitizes_formula_injection(tmp_path: Path) -> None:
+    """CSV export prefixes a quote to values that start with a formula char."""
+    output_file = tmp_path / "logs_injection.csv"
+    entries = [
+        LogEntry(
+            timestamp=datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC).replace(tzinfo=None),
+            pid=1001,
+            tid=2001,
+            level="W",
+            tag="@evil",
+            message="=cmd|calc!A1",
+            raw="raw log line",
+            meta={"k": "=danger"},
+        )
+    ]
+
+    exporter = CsvLogExporter()
+    exporter.export(entries, output_file)
+
+    with output_file.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["message"] == "'=cmd|calc!A1"
+    assert row["tag"] == "'@evil"
+    # The serialized meta JSON string also starts with a risky char ('{' is
+    # safe, but the round-trip remains valid JSON after any prefixing).
+    assert json.loads(row["meta"]) == {"k": "=danger"}
+
+
 def test_export_logs_json(tmp_path: Path, sample_entries: list[LogEntry]) -> None:
     """Test the export_logs helper function with JSON format."""
     output_file = tmp_path / "helper_logs.json"

@@ -453,6 +453,97 @@ async def test_stop_dispatcher_evicts_to_enqueue_sentinel_when_queue_full():
     assert stream._stdout_dispatch_task is None
 
 
+async def _noop_async_callback(item, handle) -> None:
+    del item, handle
+
+
+@pytest.mark.asyncio
+async def test_dispatch_drop_newest_drops_when_queue_full():
+    """drop_newest must drop the incoming item on a full queue, not block ingestion."""
+    stream = AsyncLogStream(
+        adb_path="adb", callback_queue_size=1, callback_queue_policy="drop_newest"
+    )
+    queue = stream._build_dispatch_queue()
+    stream._stdout_dispatch_queue = queue
+    await queue.put(_make_entry("A"))
+    assert queue.full()
+
+    # Must return immediately (drop), not block on the full queue.
+    await asyncio.wait_for(
+        stream._dispatch_item(_make_entry("B"), "stdout", _noop_async_callback),
+        timeout=1.0,
+    )
+
+    assert queue.qsize() == 1
+    kept = queue.get_nowait()
+    assert isinstance(kept, LogEntry)
+    assert kept.message == "A"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_drop_oldest_evicts_when_queue_full():
+    """drop_oldest evicts the oldest queued item to make room for the newest."""
+    stream = AsyncLogStream(
+        adb_path="adb", callback_queue_size=1, callback_queue_policy="drop_oldest"
+    )
+    queue = stream._build_dispatch_queue()
+    stream._stdout_dispatch_queue = queue
+    await queue.put(_make_entry("A"))
+    assert queue.full()
+
+    await asyncio.wait_for(
+        stream._dispatch_item(_make_entry("B"), "stdout", _noop_async_callback),
+        timeout=1.0,
+    )
+
+    assert queue.qsize() == 1
+    kept = queue.get_nowait()
+    assert isinstance(kept, LogEntry)
+    assert kept.message == "B"
+
+
+@pytest.mark.asyncio
+async def test_stop_dispatcher_bounded_drain_when_callback_stuck(mocker):
+    """A permanently-stuck callback must not hang shutdown; the drain is bounded."""
+    mocker.patch("logpyt.streams.async_stream._DISPATCH_DRAIN_TIMEOUT", 0.1)
+    stream = AsyncLogStream(adb_path="adb", callback_queue_size=4)
+
+    entered = asyncio.Event()
+
+    async def stuck_callback(item, handle):
+        del item, handle
+        entered.set()
+        await asyncio.Event().wait()  # never returns
+
+    queue = stream._build_dispatch_queue()
+    stream._stdout_dispatch_queue = queue
+    stream._stdout_dispatch_task = asyncio.create_task(
+        stream._callback_dispatch_loop(queue, stuck_callback)
+    )
+    await queue.put(_make_entry("A"))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+    # Bounded drain -> cancel; must complete rather than hang on queue.join().
+    await asyncio.wait_for(stream._stop_dispatcher("stdout"), timeout=2.0)
+
+    assert stream._stdout_dispatch_queue is None
+    assert stream._stdout_dispatch_task is None
+
+
+@pytest.mark.asyncio
+async def test_read_loop_skips_oversized_line_and_continues(mocker):
+    """An oversized line (readline ValueError) is dropped; the reader keeps going."""
+    stream = AsyncLogStream(adb_path="adb")
+    fake = mocker.Mock()
+    fake.readline = mocker.AsyncMock(side_effect=[ValueError("limit"), b""])
+    fake.read = mocker.AsyncMock(return_value=b"")
+
+    await asyncio.wait_for(stream._read_loop(fake, "stdout"), timeout=1.0)
+
+    # The overrun was handled (drain + continue), not recorded as a stream error.
+    assert stream._exceptions == []
+
+
 @pytest.mark.asyncio
 async def test_stream_with_pid_monitor(
     mock_resolve_adb, mock_create_subprocess, mock_process

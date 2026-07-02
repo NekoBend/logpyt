@@ -131,19 +131,37 @@ class ThreadTimeLogParser(LogParser):
     # Group 6: Tag
     # Group 7: Message
     _PATTERN = re.compile(
-        r"^(\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d{3})\s+(\d+)\s+(\d+)\s+([A-Z])\s+(.*?):\s+(.*)$"
+        r"^(\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d{3})\s+(\d{1,7})\s+(\d{1,7})\s+([A-Z])\s+(.*?):(?:\s+(.*))?$"
     )
 
+    def __init__(
+        self,
+        default_timestamp: datetime | None = None,
+        default_year: int | None = None,
+    ) -> None:
+        """Initialize the threadtime parser (tracks month for year rollover)."""
+        super().__init__(default_timestamp, default_year)
+        self._last_month: int | None = None
+        self._year_offset = 0
+
     def _parse_timestamp(self, date_str: str, time_str: str) -> datetime:
-        """Parse threadtime timestamp without strptime for hot-path performance."""
+        """Parse threadtime timestamp without strptime for hot-path performance.
+
+        The threadtime format carries no year; the year is rolled forward when the
+        month decreases relative to the previous line, so a Dec -> Jan boundary
+        stays chronologically ordered.
+        """
         month = int(date_str[0:2])
         day = int(date_str[3:5])
         hour = int(time_str[0:2])
         minute = int(time_str[3:5])
         second = int(time_str[6:8])
         microsecond = int(time_str[9:12]) * 1000
-        return datetime(
-            self.default_year,
+        offset = self._year_offset
+        if self._last_month is not None and month < self._last_month:
+            offset += 1
+        timestamp = datetime(
+            self.default_year + offset,
             month,
             day,
             hour,
@@ -152,6 +170,10 @@ class ThreadTimeLogParser(LogParser):
             microsecond,
             tzinfo=_LOCAL_TIMEZONE,
         ).replace(tzinfo=None)
+        # Commit rollover state only after a valid date was constructed.
+        self._year_offset = offset
+        self._last_month = month
+        return timestamp
 
     def parse_stdout(self, line: str) -> LogEntry:
         """Parse a line from stdout using threadtime format.
@@ -181,20 +203,21 @@ class ThreadTimeLogParser(LogParser):
 
         date_str, time_str, pid_str, tid_str, level_str, tag, message = match.groups()
 
-        # Parse timestamp
-        # Use configured default year
+        # A malformed calendar value (e.g. month 13) means this is not a real
+        # threadtime line: fall back to raw rather than inventing a timestamp.
         try:
             timestamp = self._parse_timestamp(date_str, time_str)
         except ValueError:
-            # Fallback if timestamp parsing fails, though regex ensures format
-            timestamp = self._get_default_timestamp()
-
-        # Cast fields
-        pid = int(pid_str)
-        tid = int(tid_str)
+            return super().parse_stdout(line)
 
         if level_str not in {"V", "D", "I", "W", "E", "F"}:
             return super().parse_stdout(line)
+
+        # pid/tid are bounded to <= 7 digits by the regex, so int() cannot blow up.
+        pid = int(pid_str)
+        tid = int(tid_str)
+        # The message group is optional (empty-message lines), so it may be None.
+        message = message or ""
 
         # level_str was validated against the allowed set above.
         level = cast("LogLevel", level_str)
@@ -223,7 +246,7 @@ class BriefLogParser(LogParser):
     # Group 2: Tag
     # Group 3: PID
     # Group 4: Message
-    _PATTERN = re.compile(r"^([VDIWEF])/([^(]+)\(\s*(\d+)\):\s+(.*)$")
+    _PATTERN = re.compile(r"^([VDIWEF])/(.+)\(\s*(\d{1,7})\):\s+(.*)$")
 
     def parse_stdout(self, line: str) -> LogEntry:
         """Parse a line from stdout using brief format.
@@ -275,7 +298,7 @@ class ProcessLogParser(LogParser):
     # Group 1: Level
     # Group 2: PID
     # Group 3: Message
-    _PATTERN = re.compile(r"^([VDIWEF])\(\s*(\d+)\)\s+(.*)$")
+    _PATTERN = re.compile(r"^([VDIWEF])\(\s*(\d{1,7})\)\s+(.*)$")
 
     def parse_stdout(self, line: str) -> LogEntry:
         """Parse a line from stdout using process format.

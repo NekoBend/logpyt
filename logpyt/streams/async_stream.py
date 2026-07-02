@@ -16,7 +16,7 @@ from logpyt.exceptions import (
 )
 from logpyt.filters import Filter
 from logpyt.groupers import LogGrouper, WindowedLogGrouper
-from logpyt.parsers import LogParser
+from logpyt.parsers import LogParser, ThreadTimeLogParser
 from logpyt.utils import resolve_adb
 
 from .common import StreamState, build_pidof_command
@@ -30,6 +30,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DISPATCH_STOP = object()
+
+# Max bytes buffered while reading a single logcat line. The asyncio default is
+# 64 KiB, which a single crafted/huge line can exceed and permanently stall the
+# reader; a generous limit plus drain-and-continue avoids that DoS.
+_READ_LIMIT = 8 * 1024 * 1024
+# Upper bound on the graceful callback drain during dispatcher shutdown, so a stuck
+# user callback cannot hang teardown.
+_DISPATCH_DRAIN_TIMEOUT = 2.0
 
 
 class AsyncPidMonitor:
@@ -194,7 +202,9 @@ class AsyncPidMonitor:
             if process.returncode == 0 and stdout:
                 output = stdout.decode("utf-8", errors="replace").strip()
                 if output:
-                    return [int(p) for p in output.split() if p.isdigit()]
+                    return [
+                        int(p) for p in output.split() if p.isdigit() and len(p) <= 7
+                    ]
         except Exception as exc:  # noqa: BLE001
             # A polling monitor must never crash: any failure (device disconnected,
             # command failed, malformed output) degrades to returning no PIDs.
@@ -328,7 +338,7 @@ class AsyncLogStream:
         """
         self.adb_path = adb_path or resolve_adb()
         self.device_id = device_id
-        self.parser = parser or LogParser()
+        self.parser = parser or ThreadTimeLogParser()
         self.filter_by = filter_by
         self.auto_reconnect = auto_reconnect
         self.reconnect_delay = reconnect_delay
@@ -412,13 +422,18 @@ class AsyncLogStream:
         if queue is None:
             await callback(item, self._handle)
             return
-        if self.callback_queue_policy == "drop_oldest" and queue.full():
-            try:
-                queue.get_nowait()
-                queue.task_done()
-            except asyncio.QueueEmpty:
-                pass
-        await queue.put(item)
+        # Never block ingestion on a full queue: apply the overflow policy instead.
+        if queue.full():
+            if self.callback_queue_policy == "drop_oldest":
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    queue.get_nowait()
+                    queue.task_done()
+            else:
+                # drop_newest: drop the incoming item rather than blocking the reader.
+                logger.debug("Dispatch queue full; dropping newest %s item", source)
+                return
+        with contextlib.suppress(asyncio.QueueFull):
+            queue.put_nowait(item)
 
     async def _callback_dispatch_loop(
         self,
@@ -464,7 +479,12 @@ class AsyncLogStream:
                 queue.task_done()
             with contextlib.suppress(asyncio.QueueFull):
                 queue.put_nowait(_DISPATCH_STOP)
-        await queue.join()
+        # Bound the graceful drain so a stuck user callback cannot hang shutdown.
+        try:
+            await asyncio.wait_for(queue.join(), timeout=_DISPATCH_DRAIN_TIMEOUT)
+        except TimeoutError:
+            logger.debug("Dispatcher drain timed out for %s; cancelling", source)
+            task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         if source == "stdout":
             self._stdout_dispatch_queue = None
@@ -559,6 +579,7 @@ class AsyncLogStream:
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=_READ_LIMIT,
             )
         except Exception as e:  # noqa: BLE001  subprocess spawn failure must not crash manager
             logger.debug("Failed to start adb logcat subprocess: %s", e)
@@ -721,19 +742,30 @@ class AsyncLogStream:
         """Internal loop to read from a stream."""
         try:  # noqa: PLR1702  nested read/timeout handling kept inline
             while not self._stop_event.is_set():
-                if self.read_timeout:
-                    try:
-                        line_bytes = await asyncio.wait_for(
-                            stream.readline(), timeout=self.read_timeout
-                        )
-                    except TimeoutError:
-                        # Terminate process to unblock connection manager
-                        if self._process:
-                            with contextlib.suppress(ProcessLookupError):
-                                self._process.terminate()
-                        raise
-                else:
-                    line_bytes = await stream.readline()
+                try:
+                    if self.read_timeout:
+                        try:
+                            line_bytes = await asyncio.wait_for(
+                                stream.readline(), timeout=self.read_timeout
+                            )
+                        except TimeoutError:
+                            # Terminate process to unblock connection manager
+                            if self._process:
+                                with contextlib.suppress(ProcessLookupError):
+                                    self._process.terminate()
+                            raise
+                    else:
+                        line_bytes = await stream.readline()
+                except ValueError:
+                    # Oversized line (no newline within the read buffer limit): drop
+                    # the buffered chunk and keep reading rather than aborting the loop.
+                    logger.warning(
+                        "Dropping oversized %s data exceeding the read buffer limit",
+                        source,
+                    )
+                    with contextlib.suppress(Exception):
+                        await stream.read(_READ_LIMIT)
+                    continue
 
                 if not line_bytes:
                     # EOF

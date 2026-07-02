@@ -2,7 +2,7 @@
 
 from datetime import UTC, datetime
 
-from logpyt.parsers import LogParser, ThreadTimeLogParser
+from logpyt.parsers import BriefLogParser, LogParser, ThreadTimeLogParser
 
 
 def test_log_parser_parse_stdout() -> None:
@@ -64,6 +64,65 @@ def test_thread_time_parser_success() -> None:
     assert entry.timestamp.microsecond == 789000
     assert entry.timestamp.year == datetime.now(UTC).astimezone().year
     assert entry.meta["parser"] == "ThreadTimeLogParser"
+
+
+def test_thread_time_parser_empty_message() -> None:
+    """An empty-message threadtime line keeps its structured fields (not raw)."""
+    parser = ThreadTimeLogParser()
+    entry = parser.parse_stdout("11-19 12:34:56.789  1234  5678 D MyTag   : ")
+
+    assert entry.pid == 1234
+    assert entry.tid == 5678
+    assert entry.level == "D"
+    assert entry.tag == "MyTag"
+    assert entry.message == ""
+    assert entry.meta["parser"] == "ThreadTimeLogParser"
+
+
+def test_thread_time_parser_oversized_pid_falls_back() -> None:
+    """A pathologically long PID must not crash int(); the line falls back to raw."""
+    line = "11-19 12:34:56.789  " + "9" * 5000 + "  5678 D Tag: msg"
+
+    entry = ThreadTimeLogParser().parse_stdout(line)
+
+    # The bounded regex (\d{1,7}) rejects the huge PID -> raw fallback, no ValueError.
+    assert entry.pid == 0
+    assert entry.tag == ""
+    assert entry.message == line
+    assert entry.meta.get("parser") is None
+
+
+def test_thread_time_parser_year_rollover() -> None:
+    """The year rolls forward when the month decreases (Dec -> Jan)."""
+    parser = ThreadTimeLogParser(default_year=2024)
+    dec = parser.parse_stdout("12-31 23:59:59.000  1  1 D T: end of year")
+    jan = parser.parse_stdout("01-01 00:00:01.000  1  1 D T: new year")
+
+    assert dec.timestamp.year == 2024
+    assert jan.timestamp.year == 2025
+    assert jan.timestamp > dec.timestamp
+
+
+def test_thread_time_parser_invalid_date_falls_back() -> None:
+    """An impossible calendar date (month 13) falls back to raw, not a fake 'now'."""
+    line = "13-01 12:00:00.000  1  1 D T: m"
+
+    entry = ThreadTimeLogParser().parse_stdout(line)
+
+    assert entry.pid == 0
+    assert entry.tag == ""
+    assert entry.message == line
+    assert entry.meta.get("parser") is None
+
+
+def test_brief_parser_tag_with_parens() -> None:
+    """Brief parser handles a tag that itself contains parentheses."""
+    entry = BriefLogParser().parse_stdout("D/Foo(Bar)( 2034): routeCall()")
+
+    assert entry.level == "D"
+    assert entry.tag == "Foo(Bar)"
+    assert entry.pid == 2034
+    assert entry.message == "routeCall()"
 
 
 def test_thread_time_parser_fallback() -> None:

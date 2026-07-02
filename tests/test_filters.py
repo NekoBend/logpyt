@@ -132,12 +132,57 @@ def test_message_contains_empty_pattern_still_matches(sample_entry: LogEntry) ->
     assert c.check(sample_entry) is True
 
 
-def test_filter_message_contains_empty_list_matches_nothing(
+def test_filter_empty_tag_is_no_constraint(sample_entry: LogEntry) -> None:
+    """An empty tag collection imposes no constraint (same as None)."""
+    f = Filter(tag=[])
+    assert f(sample_entry) is True
+
+
+def test_filter_empty_level_is_no_constraint(sample_entry: LogEntry) -> None:
+    """An empty level collection imposes no constraint (same as None)."""
+    f = Filter(level=[])
+    assert f(sample_entry) is True
+
+
+def test_filter_empty_package_is_no_constraint(sample_entry: LogEntry) -> None:
+    """An empty package collection imposes no constraint (same as None)."""
+    f = Filter(package=[])
+    assert f(sample_entry) is True
+
+
+def test_filter_empty_message_contains_is_no_constraint(
     sample_entry: LogEntry,
 ) -> None:
-    """An explicitly empty message_contains list should match no entries."""
+    """An empty message_contains collection imposes no constraint (same as None)."""
     f = Filter(message_contains=[])
-    assert f(sample_entry) is False
+    assert f(sample_entry) is True
+
+
+def test_filter_all_empty_criteria_passes_every_entry(
+    sample_entry: LogEntry,
+) -> None:
+    """A filter whose criteria are all empty/None passes every entry."""
+    f = Filter(package=[], tag=[], level=[], message_contains=[])
+    assert f(sample_entry) is True
+
+
+def test_filter_non_empty_criterion_still_filters(sample_entry: LogEntry) -> None:
+    """A non-empty criterion still filters even when others are empty."""
+    # Empty tag is no-constraint, but the non-matching level still rejects.
+    f_reject = Filter(tag=[], level=["E"])
+    assert f_reject(sample_entry) is False
+    # Matching level passes.
+    f_pass = Filter(tag=[], level=["D"])
+    assert f_pass(sample_entry) is True
+
+
+def test_filter_empty_criterion_does_not_match_missing_field(
+    sample_entry: LogEntry,
+) -> None:
+    """Empty package criterion is no-constraint even when meta lacks a package."""
+    entry = sample_entry.model_copy(update={"meta": {}})
+    f = Filter(package=[])
+    assert f(entry) is True
 
 
 def test_crash_condition(sample_entry: LogEntry) -> None:

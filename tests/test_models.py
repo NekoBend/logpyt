@@ -95,6 +95,31 @@ def test_log_entry_to_json_formatting() -> None:
     assert '  "pid": 123' in json_str
 
 
+def test_log_entry_to_json_ensure_ascii() -> None:
+    """Test LogEntry.to_json() honors the ensure_ascii parameter."""
+    now = datetime.now(UTC).replace(tzinfo=None)
+    entry = LogEntry(
+        timestamp=now,
+        pid=123,
+        tid=456,
+        level="I",
+        tag="Tag",
+        message="日本語",
+        raw="raw log line",
+    )
+
+    # ensure_ascii=True escapes non-ASCII characters.
+    escaped = entry.to_json(ensure_ascii=True)
+    assert "日" not in escaped
+    assert "\\u65e5" in escaped
+    assert json.loads(escaped)["message"] == "日本語"
+
+    # ensure_ascii=False keeps non-ASCII characters literal.
+    literal = entry.to_json(ensure_ascii=False)
+    assert "日" in literal
+    assert json.loads(literal)["message"] == "日本語"
+
+
 def test_log_entry_json_payload() -> None:
     """Test LogEntry.json_payload property."""
     now = datetime.now(UTC).replace(tzinfo=None)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from functools import cached_property
 from typing import Any, Literal
@@ -69,18 +70,19 @@ class LogEntry(BaseModel):
         """Convert the log entry to a JSON string.
 
         Args:
-            ensure_ascii: If True, non-ASCII characters are escaped.
-                Note: When using model_dump_json, ensure_ascii is not directly supported
-                in the same way as json.dumps in all Pydantic
-                versions, but we prioritize performance.
+            ensure_ascii: If True, non-ASCII characters are escaped as ``\\uXXXX``
+                sequences. If False (default), they are kept literally.
             indent: If specified, formats the JSON with the given indentation.
 
         Returns:
             A JSON string representation of the log entry.
 
         """
-        # Use model_dump_json for better performance (avoids double serialization)
-        return self.model_dump_json(indent=indent)
+        return json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=ensure_ascii,
+            indent=indent,
+        )
 
     @cached_property
     def json_payload(self) -> Any | None:  # noqa: ANN401  (arbitrary parsed JSON)

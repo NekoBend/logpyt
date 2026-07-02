@@ -12,6 +12,26 @@ from logpyt.models.entry import LogEntry
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
+# Characters that trigger formula evaluation in Excel/Sheets when they lead a
+# cell value. Log content is attacker-controllable, so such values are
+# neutralized by prefixing a single quote before writing the CSV row.
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
+
+
+def _sanitize_csv_value(value: str) -> str:
+    """Neutralize CSV formula injection by prefixing risky leading characters.
+
+    Args:
+        value: The string cell value to sanitize.
+
+    Returns:
+        The value unchanged, or prefixed with a single quote if it starts with
+        a character that spreadsheet applications interpret as a formula.
+    """
+    if value.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
 
 class LogExporter(Protocol):
     """Interface for log exporters."""
@@ -119,6 +139,12 @@ class CsvLogExporter:
                     row["meta"] = dumps(
                         row["meta"], ensure_ascii=False, separators=(",", ":")
                     )
+
+                # Neutralize CSV formula injection in all string cell values
+                # (message, tag, the serialized meta, etc.).
+                for key, cell in row.items():
+                    if isinstance(cell, str):
+                        row[key] = _sanitize_csv_value(cell)
 
                 writer.writerow(row)
 
