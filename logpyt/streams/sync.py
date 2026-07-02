@@ -19,7 +19,7 @@ from logpyt.exceptions import (
 )
 from logpyt.filters import Filter
 from logpyt.groupers import LogGrouper, WindowedLogGrouper
-from logpyt.parsers import LogParser
+from logpyt.parsers import LogParser, ThreadTimeLogParser
 from logpyt.utils import resolve_adb
 
 from .common import StreamState, build_pidof_command
@@ -175,7 +175,9 @@ class PidMonitor:
             # Use a timeout to prevent hanging
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=5.0)
             if result.returncode == 0 and result.stdout.strip():
-                return [int(p) for p in result.stdout.split() if p.isdigit()]
+                return [
+                    int(p) for p in result.stdout.split() if p.isdigit() and len(p) <= 7
+                ]
         except Exception as exc:  # noqa: BLE001
             # A polling monitor must never crash: any failure (device disconnected,
             # command failed, malformed output) degrades to returning no PIDs.
@@ -333,7 +335,7 @@ class LogStream:
         """
         self.adb_path = adb_path or resolve_adb()
         self.device_id = device_id
-        self.parser = parser or LogParser()
+        self.parser = parser or ThreadTimeLogParser()
         self.filter_by = filter_by
         self.auto_reconnect = auto_reconnect
         self.reconnect_delay = reconnect_delay
@@ -371,6 +373,8 @@ class LogStream:
         self.logcat_args = list(logcat_args) if logcat_args else []
 
         self._exceptions: queue.Queue[Exception] = queue.Queue()
+        # Serializes grouper access: stdout and stderr reader threads share one grouper.
+        self._grouper_lock = threading.Lock()
         self._callback_queue: queue.Queue[
             tuple[list[LogEntry | list[LogEntry]], str] | None
         ] = queue.Queue(maxsize=self.max_queue_size)
@@ -462,8 +466,7 @@ class LogStream:
                 logging.getLogger("logpyt").debug("Failed to start adb process: %s", e)
                 self._set_state(StreamState.STOPPED)
                 self._exceptions.put(e)
-                if self.on_error:
-                    self.on_error(e)
+                self._invoke_callback(self.on_error, e)
                 # If we can't even start the process, we probably shouldn't loop
                 # infinitely fast unless it's a transient error.
                 # For now, let's treat start failure as fatal or subject to the
@@ -513,8 +516,7 @@ class LogStream:
                 self._watchdog_thread.start()
 
             self._set_state(StreamState.RUNNING)
-            if self.on_start:
-                self.on_start()
+            self._invoke_callback(self.on_start)
 
             # Wait for process to exit
             return_code = self._process.wait()
@@ -545,8 +547,7 @@ class LogStream:
                     f"adb logcat exited with code {return_code}"
                 )
                 self._exceptions.put(err)
-                if self.on_error:
-                    self.on_error(err)
+                self._invoke_callback(self.on_error, err)
                 break
 
             if not self.auto_reconnect:
@@ -560,8 +561,7 @@ class LogStream:
         with self._state_lock:
             if self._state != StreamState.KILLED:
                 self._set_state(StreamState.STOPPED)
-                if self.on_stop:
-                    self.on_stop()
+                self._invoke_callback(self.on_stop)
 
     def stop(self) -> None:
         """Stop the log stream gracefully."""
@@ -608,6 +608,16 @@ class LogStream:
             if self._state == StreamState.PAUSED:
                 self._set_state(StreamState.RUNNING)
 
+    @staticmethod
+    def _invoke_callback(callback: Callable[..., None] | None, *args: object) -> None:
+        """Invoke a user lifecycle/error callback without letting it break teardown."""
+        if callback is None:
+            return
+        try:
+            callback(*args)
+        except Exception:
+            logging.getLogger("logpyt").exception("LogStream lifecycle callback raised")
+
     def join(self, timeout: float | None = None) -> None:
         """Wait for the stream to finish.
 
@@ -646,7 +656,9 @@ class LogStream:
         if not self._exceptions.empty():
             # Raise the first exception found
             # We wrap it in LogStreamInternalError if it's not already a LogStreamError
-            exc = self._exceptions.get()
+            # Peek (non-destructive) so re-invoking join() surfaces the same terminal
+            # error, matching AsyncLogStream.join().
+            exc = self._exceptions.queue[0]
             if isinstance(exc, LogStreamError):
                 raise exc
             raise LogStreamInternalError(
@@ -722,20 +734,20 @@ class LogStream:
         except Exception as e:  # noqa: BLE001 (read/parse errors must not crash the reader thread)
             logging.getLogger("logpyt").debug("Read loop error on %s: %s", source, e)
             self._exceptions.put(e)
-            if self.on_error:
-                self.on_error(e)
+            self._invoke_callback(self.on_error, e)
             # Ensure process is terminated so connection manager doesn't hang
             if self._process:
                 self._process.terminate()
         finally:
             if source == "stdout" and self.group_by:
-                flushed = self.group_by.flush()
+                with self._grouper_lock:
+                    flushed = self.group_by.flush()
                 if flushed:
                     self._enqueue_callback_item((flushed, source), source=source)
 
     def _callback_loop(self) -> None:
         """Internal loop to process callbacks."""
-        while True:  # noqa: PLR1702 (dispatch loop nesting is intentional; refactor deferred)
+        while True:
             try:
                 item = self._callback_queue.get()
                 if item is None:
@@ -753,13 +765,11 @@ class LogStream:
                             logging.getLogger("logpyt").debug(
                                 "User callback raised: %s", e
                             )
-                            if self.on_error:
-                                self.on_error(e)
+                            self._invoke_callback(self.on_error, e)
             except Exception as e:  # noqa: BLE001 (dispatch loop must not crash on unexpected errors)
                 # Should not happen, but if it does, log it
                 logging.getLogger("logpyt").debug("Callback loop error: %s", e)
-                if self.on_error:
-                    self.on_error(e)
+                self._invoke_callback(self.on_error, e)
 
     def _enqueue_callback_item(
         self,
@@ -816,8 +826,7 @@ class LogStream:
         except Exception as e:  # noqa: BLE001 (parser errors must not crash the reader thread)
             logging.getLogger("logpyt").debug("Parser error on %s line: %s", source, e)
             self._exceptions.put(e)
-            if self.on_error:
-                self.on_error(e)
+            self._invoke_callback(self.on_error, e)
             if self._process:
                 self._process.terminate()
             return
@@ -832,9 +841,12 @@ class LogStream:
             return
 
         # 3. Group
-        items_to_emit: list[LogEntry | list[LogEntry]] = (
-            self.group_by.process(entry) if self.group_by else [entry]
-        )
+        items_to_emit: list[LogEntry | list[LogEntry]]
+        if self.group_by:
+            with self._grouper_lock:
+                items_to_emit = self.group_by.process(entry)
+        else:
+            items_to_emit = [entry]
 
         # 4. Dispatch
         if items_to_emit:
@@ -850,7 +862,7 @@ class LogStream:
         exc_type: type[BaseException] | None,
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
-    ) -> None:
+    ) -> bool | None:
         """Stop the stream on exit."""
         self.stop()
         # We don't necessarily join here, as stop() is async, but usually

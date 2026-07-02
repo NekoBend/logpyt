@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .parsers import LogParser
+from .parsers import LogParser, ThreadTimeLogParser
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -45,7 +45,7 @@ class LogFileReader:
                 repeated parse error logs. Defaults to 5.0.
         """
         self.file_path = Path(file_path)
-        self.parser = parser or LogParser()
+        self.parser = parser or ThreadTimeLogParser()
         self.filter_by = filter_by
         self._parse_error_log_interval = max(0.0, parse_error_log_interval)
         self._last_parse_error_log_ts = 0.0

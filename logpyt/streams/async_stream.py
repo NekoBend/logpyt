@@ -449,8 +449,7 @@ class AsyncLogStream:
                 await callback(item, self._handle)
             except Exception as e:  # noqa: BLE001  user callback must not crash dispatcher
                 logger.debug("Error in dispatch callback: %s", e)
-                if self.on_error:
-                    await self.on_error(e)
+                await self._invoke_callback(self.on_error, e)
             finally:
                 queue.task_done()
 
@@ -563,8 +562,7 @@ class AsyncLogStream:
 
         if self.state != StreamState.KILLED:
             await self._set_state(StreamState.STOPPED)
-            if self.on_stop:
-                await self.on_stop()
+            await self._invoke_callback(self.on_stop)
 
     async def _run_process_lifecycle(self) -> None:  # noqa: PLR0912  sequential process lifecycle setup/teardown
         """Run a single lifecycle of the ADB process."""
@@ -585,8 +583,7 @@ class AsyncLogStream:
             logger.debug("Failed to start adb logcat subprocess: %s", e)
             self._exceptions.append(e)
             await self._set_state(StreamState.STOPPED)
-            if self.on_error:
-                await self.on_error(e)
+            await self._invoke_callback(self.on_error, e)
             return
 
         if self._process.stdout:
@@ -624,8 +621,7 @@ class AsyncLogStream:
             await self._pid_monitor.start()
 
         await self._set_state(StreamState.RUNNING)
-        if self.on_start:
-            await self.on_start()
+        await self._invoke_callback(self.on_start)
 
         # Wait for process to exit
         try:
@@ -656,8 +652,7 @@ class AsyncLogStream:
         if not self._stop_event.is_set() and return_code != 0:
             error = LogStreamInternalError(f"adb logcat exited with code {return_code}")
             self._exceptions.append(error)
-            if self.on_error:
-                await self.on_error(error)
+            await self._invoke_callback(self.on_error, error)
 
     async def stop(self) -> None:
         """Stop the log stream gracefully."""
@@ -705,6 +700,18 @@ class AsyncLogStream:
         """Resume dispatching of log entries."""
         if self.state == StreamState.PAUSED:
             await self._set_state(StreamState.RUNNING)
+
+    @staticmethod
+    async def _invoke_callback(
+        callback: Callable[..., Awaitable[None]] | None, *args: object
+    ) -> None:
+        """Invoke a user lifecycle/error callback without letting it break teardown."""
+        if callback is None:
+            return
+        try:
+            await callback(*args)
+        except Exception:
+            logger.exception("AsyncLogStream lifecycle callback raised")
 
     async def join(self, timeout: float | None = None) -> None:
         """Wait for the stream to finish.
@@ -779,13 +786,11 @@ class AsyncLogStream:
                 await self._process_line(line, source)
         except TimeoutError as e:
             self._exceptions.append(LogStreamTimeoutError(str(e) or "Read timeout"))
-            if self.on_error:
-                await self.on_error(e)
+            await self._invoke_callback(self.on_error, e)
         except Exception as e:  # noqa: BLE001  read/parse errors must not crash the loop
             logger.debug("Error in read loop for %s: %s", source, e)
             self._exceptions.append(e)
-            if self.on_error:
-                await self.on_error(e)
+            await self._invoke_callback(self.on_error, e)
         finally:
             if source == "stdout" and self.group_by:
                 # Flush grouper
@@ -800,8 +805,7 @@ class AsyncLogStream:
                             )
                         except Exception as e:  # noqa: BLE001  callback must not crash flush
                             logger.debug("Error dispatching flushed item: %s", e)
-                            if self.on_error:
-                                await self.on_error(e)
+                            await self._invoke_callback(self.on_error, e)
 
     async def _process_line(self, line: str, source: str) -> None:
         """Process a single raw line."""
@@ -817,8 +821,7 @@ class AsyncLogStream:
         except Exception as e:  # noqa: BLE001  parser errors must not crash the stream
             logger.debug("Error parsing %s line: %s", source, e)
             self._exceptions.append(e)
-            if self.on_error:
-                await self.on_error(e)
+            await self._invoke_callback(self.on_error, e)
             if self._process:
                 with contextlib.suppress(ProcessLookupError):
                     self._process.terminate()
@@ -848,8 +851,7 @@ class AsyncLogStream:
                     await self._dispatch_item(item, source=source, callback=callback)
                 except Exception as e:  # noqa: BLE001  dispatch must not crash the stream
                     logger.debug("Error dispatching %s item: %s", source, e)
-                    if self.on_error:
-                        await self.on_error(e)
+                    await self._invoke_callback(self.on_error, e)
 
     async def __aenter__(self) -> AsyncStreamHandle:
         """Start the stream and return the handle."""
@@ -861,7 +863,7 @@ class AsyncLogStream:
         exc_type: type[BaseException] | None,
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
-    ) -> None:
+    ) -> bool | None:
         """Stop the stream on exit."""
         await self.stop()
         await self.join(timeout=1.0)
