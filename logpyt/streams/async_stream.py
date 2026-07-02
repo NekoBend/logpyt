@@ -839,9 +839,13 @@ class AsyncLogStream:
         # 3. Group
         # Note: Grouping is also CPU-bound but stateful.
         # LogGrouper is synchronous, which is fine as it's CPU bound and fast.
-        items_to_emit: list[LogEntry | list[LogEntry]] = (
-            self.group_by.process(entry) if self.group_by else [entry]
-        )
+        # Grouping applies to stdout only (the grouper is flushed on stdout EOF);
+        # feeding stderr through the shared grouper would flush/misroute stdout groups.
+        items_to_emit: list[LogEntry | list[LogEntry]]
+        if self.group_by and source == "stdout":
+            items_to_emit = self.group_by.process(entry)
+        else:
+            items_to_emit = [entry]
 
         # 4. Dispatch
         callback = self.stdout_callback if source == "stdout" else self.stderr_callback

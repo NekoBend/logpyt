@@ -17,7 +17,7 @@ from logpyt.exceptions import (
 )
 from logpyt.filters import Filter
 from logpyt.groupers import LogGrouper
-from logpyt.models import LogEntry
+from logpyt.models import LogEntry, LogLevel
 from logpyt.streams import LogStream, StreamState
 
 
@@ -881,3 +881,67 @@ def test_stream_join_reraises_same_error_on_second_call(mock_popen, mocker) -> N
         stream.join(timeout=1.0)
 
     assert first.value.__cause__ is second.value.__cause__
+
+
+def test_stream_grouper_only_groups_stdout_not_stderr(mock_popen, mocker) -> None:
+    """A stderr line must not be grouped or misrouted through the shared grouper."""
+    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+
+    grouper = LogGrouper(by=["tag"], threshold_ms=10_000.0, emit_mode="group")
+
+    stdout_items: list[object] = []
+    stderr_items: list[object] = []
+
+    def stdout_cb(item, handle):
+        del handle
+        stdout_items.append(item)
+
+    def stderr_cb(item, handle):
+        del handle
+        stderr_items.append(item)
+
+    stream = LogStream(
+        group_by=grouper, stdout_callback=stdout_cb, stderr_callback=stderr_cb
+    )
+
+    process_mock = mock_popen.return_value
+    process_mock.stdout.readline.side_effect = ["out-1\n", "out-2\n", ""]
+    process_mock.stderr.readline.side_effect = ["err-1\n", ""]
+
+    base_ts = datetime.now(UTC).replace(tzinfo=None)
+
+    def make(line: str, level: LogLevel) -> LogEntry:
+        return LogEntry(
+            timestamp=base_ts,
+            pid=1,
+            tid=1,
+            level=level,
+            tag="SameTag",
+            message=line.strip(),
+            raw=line.strip(),
+        )
+
+    mock_parser = Mock()
+    mock_parser.parse_stdout.side_effect = lambda line: make(line, "D")
+    mock_parser.parse_stderr.side_effect = lambda line: make(line, "E")
+    stream.parser = mock_parser
+
+    stream.start()
+    stream.join(timeout=1.0)
+
+    # stderr bypasses the grouper: delivered as a single entry, never a group and
+    # never carrying stdout content.
+    assert len(stderr_items) == 1
+    err = stderr_items[0]
+    assert isinstance(err, LogEntry)
+    assert err.message == "err-1"
+
+    # The buffered stdout entries flush as one group, only to stdout_callback.
+    assert len(stdout_items) == 1
+    group = stdout_items[0]
+    assert isinstance(group, list)
+    messages = []
+    for entry in group:
+        assert isinstance(entry, LogEntry)
+        messages.append(entry.message)
+    assert messages == ["out-1", "out-2"]

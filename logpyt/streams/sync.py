@@ -841,8 +841,10 @@ class LogStream:
             return
 
         # 3. Group
+        # Grouping applies to stdout only (the shared grouper is flushed on stdout
+        # EOF); feeding stderr through it would flush/misroute stdout groups.
         items_to_emit: list[LogEntry | list[LogEntry]]
-        if self.group_by:
+        if self.group_by and source == "stdout":
             with self._grouper_lock:
                 items_to_emit = self.group_by.process(entry)
         else:
