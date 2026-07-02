@@ -12,6 +12,7 @@ import pytest
 from logpyt.exceptions import (
     LogStreamError,
     LogStreamInternalError,
+    LogStreamKilledError,
     LogStreamTimeoutError,
 )
 from logpyt.filters import Filter
@@ -34,6 +35,22 @@ def mock_popen(mocker):
     process_mock.kill.return_value = None
     mock.return_value = process_mock
     return mock
+
+
+def mock_stream_start_running(stream: LogStream, timeout: float = 1.0):
+    """Start a stream and block until it reaches RUNNING, returning its handle.
+
+    Mirrors the inline RUNNING-wait loop used across these tests so pause/kill
+    tests can assert transitions from a known-live state without duplication.
+    """
+    handle = stream._handle
+    stream.start()
+    start_time = time.time()
+    while stream.state != StreamState.RUNNING:
+        if time.time() - start_time > timeout:
+            raise TimeoutError("Timed out waiting for RUNNING state")
+        time.sleep(0.01)
+    return handle
 
 
 def test_stream_lifecycle(mock_popen, mocker) -> None:
@@ -655,3 +672,212 @@ def test_sync_queue_overflow_policy_drop_oldest_is_configurable(mocker) -> None:
     emitted = queued_items[0]
     assert isinstance(emitted, LogEntry)
     assert emitted.message == "new"
+
+
+def test_stream_kill_transitions_to_killed_and_join_raises(mock_popen, mocker) -> None:
+    """kill() must set KILLED, kill the process, and make join() raise Killed."""
+    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+
+    process_mock = mock_popen.return_value
+    # Keep stdout blocked so the stream sits RUNNING until we kill it, letting
+    # kill() drive the terminal state instead of a natural EOF.
+    release_readline = threading.Event()
+
+    def blocking_readline(*args, **kwargs):
+        del args, kwargs
+        release_readline.wait(timeout=2.0)
+        return ""
+
+    process_mock.stdout.readline.side_effect = blocking_readline
+    process_mock.stderr.readline.return_value = ""
+    # wait() blocks until the process is killed, then reports a terminated code.
+    process_mock.wait.side_effect = lambda *args, **kwargs: release_readline.wait(
+        timeout=2.0
+    )
+
+    def do_kill(*args, **kwargs):
+        del args, kwargs
+        release_readline.set()
+
+    process_mock.kill.side_effect = do_kill
+
+    handle = mock_stream_start_running(LogStream())
+    stream = handle._stream
+
+    handle.kill()
+    assert stream.state == StreamState.KILLED
+
+    with pytest.raises(LogStreamKilledError):
+        handle.join(timeout=1.0)
+
+    # A killed stream terminates the process via kill(), not terminate().
+    process_mock.kill.assert_called()
+    assert stream.state == StreamState.KILLED
+
+
+def test_stream_pause_suspends_dispatch_and_resume_restores_it(
+    mock_popen, mocker
+) -> None:
+    """pause() must gate dispatch; resume() must restore it (PAUSED read-loop branch).
+
+    Each stdout line is released one at a time via an Event so we can assert the
+    dispatch state deterministically at each step, with no bare sleeps.
+    """
+    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+
+    process_mock = mock_popen.return_value
+    # One Event per line release; readline blocks until the current one is set.
+    release_events = [threading.Event() for _ in range(3)]
+    line_index = {"n": 0}
+    index_lock = threading.Lock()
+
+    def gated_readline(*args, **kwargs):
+        del args, kwargs
+        with index_lock:
+            idx = line_index["n"]
+            line_index["n"] += 1
+        if idx >= len(release_events):
+            return ""  # EOF
+        release_events[idx].wait(timeout=2.0)
+        return f"line-{idx + 1}\n"
+
+    process_mock.stdout.readline.side_effect = gated_readline
+    process_mock.stderr.readline.return_value = ""
+    process_mock.wait.side_effect = lambda *args, **kwargs: time.sleep(0.5)
+
+    dispatched: list[str] = []
+    dispatched_event = threading.Event()
+
+    def callback(entry: LogEntry, handle) -> None:
+        del handle
+        dispatched.append(entry.message)
+        dispatched_event.set()
+
+    parser = Mock()
+    parser.parse_stdout.side_effect = lambda line: LogEntry(
+        timestamp=datetime.now(UTC).replace(tzinfo=None),
+        pid=1,
+        tid=1,
+        level="I",
+        tag="T",
+        message=line.strip(),
+        raw=line.strip(),
+    )
+
+    stream = LogStream(stdout_callback=callback, parser=parser)
+    handle = mock_stream_start_running(stream)
+
+    # 1. RUNNING: first line dispatches normally.
+    release_events[0].set()
+    assert dispatched_event.wait(timeout=1.0)
+    assert dispatched == ["line-1"]
+
+    # 2. PAUSED: release the second line; its callback must NOT fire.
+    handle.pause()
+    assert stream.state == StreamState.PAUSED
+    dispatched_event.clear()
+    release_events[1].set()
+    # The read loop hits the PAUSED branch and drops the line before dispatch.
+    assert not dispatched_event.wait(timeout=0.3)
+    assert dispatched == ["line-1"]
+
+    # 3. RESUME: subsequent lines dispatch again.
+    handle.resume()
+    assert stream.state == StreamState.RUNNING
+    release_events[2].set()
+    assert dispatched_event.wait(timeout=1.0)
+    assert dispatched == ["line-1", "line-3"]
+
+    stream.stop()
+    with suppress(LogStreamError):
+        stream.join(timeout=1.0)
+
+
+def test_stream_stderr_callback_receives_entry(mock_popen, mocker) -> None:
+    """stderr_callback must receive a LogEntry; default parser maps stderr -> 'E'."""
+    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+
+    process_mock = mock_popen.return_value
+    # Keep stdout empty so only the stderr path produces a dispatch.
+    process_mock.stdout.readline.return_value = ""
+    process_mock.stderr.readline.side_effect = ["W/x: err\n", ""]
+
+    received: list[LogEntry] = []
+
+    def stderr_callback(entry: LogEntry, handle) -> None:
+        del handle
+        received.append(entry)
+
+    stream = LogStream(stderr_callback=stderr_callback)
+    stream.start()
+    stream.join(timeout=1.0)
+
+    assert len(received) == 1
+    entry = received[0]
+    assert isinstance(entry, LogEntry)
+    # The default parser has no override for stderr, so it maps stderr -> "E".
+    assert entry.level == "E"
+    assert entry.message == "W/x: err"
+
+
+def test_stream_raising_on_start_callback_does_not_break_teardown(
+    mock_popen, mocker
+) -> None:
+    """A raising on_start hook must be swallowed; the stream still tears down cleanly.
+
+    The lifecycle guard (`_invoke_callback`) logs and swallows the user exception,
+    so it must never escape stop()/join() as an unhandled error, and the stream
+    must still reach a terminal state.
+    """
+    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+
+    process_mock = mock_popen.return_value
+    process_mock.stdout.readline.side_effect = ["line-1\n", ""]
+    process_mock.stderr.readline.return_value = ""
+    process_mock.wait.return_value = 0
+
+    on_start_called = threading.Event()
+
+    def raising_on_start() -> None:
+        on_start_called.set()
+        raise RuntimeError("boom in on_start")
+
+    stream = LogStream(on_start=raising_on_start)
+    stream.start()
+
+    assert on_start_called.wait(timeout=1.0)
+
+    # join() must complete without the user RuntimeError escaping.
+    stream.join(timeout=1.0)
+
+    # Natural EOF with exit code 0 => clean terminal state, not an error.
+    assert stream.state == StreamState.STOPPED
+
+    stream.stop()
+    with suppress(LogStreamError):
+        stream.join(timeout=1.0)
+
+
+def test_stream_join_reraises_same_error_on_second_call(mock_popen, mocker) -> None:
+    """join() must be non-destructive: a second call re-raises the same error."""
+    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+
+    process_mock = mock_popen.return_value
+    process_mock.stdout.readline.side_effect = ["bad line\n", ""]
+    process_mock.stderr.readline.return_value = ""
+
+    parser = Mock()
+    parser.parse_stdout.side_effect = ValueError("parse failed")
+
+    stream = LogStream(parser=parser)
+    stream.start()
+
+    with pytest.raises(LogStreamInternalError, match="parse failed") as first:
+        stream.join(timeout=1.0)
+
+    # Second join() peeks the exception queue non-destructively, so the same
+    # terminal error surfaces again rather than a silent success.
+    with pytest.raises(LogStreamInternalError, match="parse failed") as second:
+        stream.join(timeout=1.0)
+
+    assert first.value.__cause__ is second.value.__cause__

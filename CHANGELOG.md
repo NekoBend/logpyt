@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Set supported Python to `>=3.12` (previously `>=3.13`).
+- The default log parser is now `ThreadTimeLogParser` (was a raw pass-through
+  base parser), matching `adb logcat`'s default output format.
 - Adopted a strict `ruff` lint configuration and upgraded the `ruff`/`ty`
   toolchain.
 - Performance optimizations across parsers (hot-path parsing, early-reject),
@@ -47,5 +49,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Honor `join(timeout=...)` during the callback-drain phase, preserve PID
   mappings under throttled async polling, and make async dispatcher shutdown
   non-blocking on a full queue.
+- Robustness against malformed device output: bound parsed PID/TID length (a
+  pathological value could crash `int()` and tear down the stream), parse
+  empty-message lines, roll the year forward across a Dec->Jan boundary, fall
+  back to raw on impossible dates, enlarge the async read buffer so oversized
+  lines no longer permanently stall the reader, and length-guard `pidof` output.
+- Guard user lifecycle callbacks (`on_start`/`on_stop`/`on_error`) so a raising
+  callback cannot corrupt stream state or leak the subprocess; serialize the
+  shared grouper in the sync stream; make `drop_newest` actually drop instead of
+  blocking ingestion; bound the async dispatcher drain so a stuck callback cannot
+  hang shutdown; make sync `join()` re-raise non-destructively like the async one.
+- Treat an empty filter criterion as "no constraint" (was "match nothing"),
+  sanitize CSV output against spreadsheet formula injection, and honor
+  `LogEntry.to_json(ensure_ascii=...)`.
 
 [2.0.0]: https://github.com/NekoBend/logpyt/compare/v1.0.0...v2.0.0
