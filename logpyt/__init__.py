@@ -38,7 +38,7 @@ from .exceptions import (
 )
 from .exporters import export_logs
 from .filters import AdvancedFilter, Filter
-from .groupers import LogGrouper
+from .groupers import LogGrouper, WindowedLogGrouper
 from .models import LogEntry
 from .parsers import LogParser, ThreadTimeLogParser
 from .readers import LogFileReader, read_file
@@ -63,6 +63,7 @@ __all__ = [
     "LogStreamTimeoutError",
     "StreamHandle",
     "ThreadTimeLogParser",
+    "WindowedLogGrouper",
     "enable_debug",
     "export_logs",
     "list_devices",

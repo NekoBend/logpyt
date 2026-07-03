@@ -132,6 +132,18 @@ def test_message_contains_empty_pattern_still_matches(sample_entry: LogEntry) ->
     assert c.check(sample_entry) is True
 
 
+def test_empty_conditions_are_no_constraint(sample_entry: LogEntry) -> None:
+    """Empty low-level conditions match every entry, consistent with Filter.
+
+    Previously an empty collection rejected everything; it is now treated as
+    "no constraint" to match Filter(tag=[]) / Filter(message_contains=[]).
+    """
+    assert Tag([]).check(sample_entry) is True
+    assert Level([]).check(sample_entry) is True
+    assert Package([]).check(sample_entry) is True
+    assert MessageContains([]).check(sample_entry) is True
+
+
 def test_filter_empty_tag_is_no_constraint(sample_entry: LogEntry) -> None:
     """An empty tag collection imposes no constraint (same as None)."""
     f = Filter(tag=[])

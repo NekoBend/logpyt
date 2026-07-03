@@ -25,10 +25,13 @@ def _sanitize_csv_value(value: str) -> str:
         value: The string cell value to sanitize.
 
     Returns:
-        The value unchanged, or prefixed with a single quote if it starts with
-        a character that spreadsheet applications interpret as a formula.
+        The value unchanged, or prefixed with a single quote if its first
+        non-whitespace character is one a spreadsheet interprets as a formula.
     """
-    if value.startswith(_CSV_FORMULA_PREFIXES):
+    # Spreadsheets trim leading whitespace before deciding whether a cell is a
+    # formula, so " =cmd" / "\t=cmd" are just as dangerous as "=cmd". Inspect the
+    # left-stripped value but prefix the original so the data is preserved.
+    if value.lstrip().startswith(_CSV_FORMULA_PREFIXES):
         return "'" + value
     return value
 

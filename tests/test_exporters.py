@@ -174,6 +174,39 @@ def test_csv_exporter_sanitizes_formula_injection(tmp_path: Path) -> None:
     assert json.loads(row["meta"]) == {"k": "=danger"}
 
 
+def test_csv_exporter_sanitizes_whitespace_led_formula(tmp_path: Path) -> None:
+    """A formula char behind leading whitespace is still neutralized.
+
+    Spreadsheets trim leading whitespace before evaluating a cell, so " =cmd"
+    and "\t=cmd" are as dangerous as "=cmd" and must also be quoted.
+    """
+    output_file = tmp_path / "logs_ws_injection.csv"
+    entries = [
+        LogEntry(
+            timestamp=datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC).replace(tzinfo=None),
+            pid=1001,
+            tid=2001,
+            level="W",
+            tag="\t@evil",
+            message=" =cmd|calc!A1",
+            raw="raw log line",
+            meta={"source": "stdout"},
+        )
+    ]
+
+    exporter = CsvLogExporter()
+    exporter.export(entries, output_file)
+
+    with output_file.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["message"] == "' =cmd|calc!A1"
+    assert row["tag"] == "'\t@evil"
+
+
 def test_export_logs_json(tmp_path: Path, sample_entries: list[LogEntry]) -> None:
     """Test the export_logs helper function with JSON format."""
     output_file = tmp_path / "helper_logs.json"

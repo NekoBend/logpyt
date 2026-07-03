@@ -38,7 +38,8 @@ class LogEntry(BaseModel):
         message: The main content of the log message.
         raw: The original, unmodified raw string of the log line.
         meta: A dictionary for additional metadata (e.g., source stream, package name).
-            Defaults to an empty dict.
+            Defaults to an empty dict. A dict passed in is stored by reference
+            (not deep-copied); pass a fresh dict per entry if you mutate it later.
 
     """
 

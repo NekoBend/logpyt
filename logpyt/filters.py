@@ -141,10 +141,15 @@ class _FieldMatchCondition(Condition):
     def check(self, entry: LogEntry) -> bool:
         """Return True if the entry's field matches any of the values.
 
+        An empty value set means "no constraint" and matches every entry,
+        consistent with ``Filter`` (e.g. ``Filter(tag=[])``).
+
         Returns:
             Whether the field value matches.
 
         """
+        if not self.values:
+            return True
         val = self._get_value(entry)
         if val is None:
             return False
@@ -200,12 +205,15 @@ class MessageContains(Condition):
     def check(self, entry: LogEntry) -> bool:
         """Return True if the message contains any pattern.
 
+        No patterns means "no constraint" and matches every entry, consistent
+        with ``Filter``.
+
         Returns:
             Whether a pattern was found.
 
         """
         if self._compiled_pattern is None:
-            return False
+            return True
         return self._compiled_pattern.search(entry.message) is not None
 
 
