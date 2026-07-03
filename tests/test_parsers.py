@@ -148,6 +148,51 @@ def test_thread_time_parser_invalid_level_falls_back() -> None:
     assert "parser" not in entry.meta
 
 
+def test_thread_time_parser_invalid_level_does_not_corrupt_year_rollover() -> None:
+    """A valid-date line rejected for a bad level must not advance rollover state.
+
+    Regression: the year-rollover state was committed inside _parse_timestamp
+    before the level was validated, so a valid-date/invalid-level line would
+    mutate _last_month/_year_offset and spuriously roll subsequent accepted lines.
+    """
+    parser = ThreadTimeLogParser(default_year=2024)
+    dec = parser.parse_stdout("12-31 23:59:59.000  1  1 D T: end of year")
+    # Valid date, invalid level 'G' -> falls back to raw WITHOUT touching rollover.
+    rejected = parser.parse_stdout("01-01 00:00:01.000  1  1 G T: bad level")
+    dec2 = parser.parse_stdout("12-15 12:00:00.000  1  1 D T: still same year")
+
+    assert dec.timestamp.year == 2024
+    assert "parser" not in rejected.meta  # rejected line fell back to raw
+    assert dec2.timestamp.year == 2024  # rollover state untouched, not rolled to 2025
+
+
+def test_thread_time_parser_out_of_order_month_does_not_roll_year() -> None:
+    """A backward month jump that is not Dec->Jan must not advance the year.
+
+    logcat merges ring buffers and is not strictly month-monotonic; one
+    out-of-order line (Jun then May) must not permanently roll the year forward.
+    """
+    parser = ThreadTimeLogParser(default_year=2024)
+    jun = parser.parse_stdout("06-15 10:00:00.000  1  1 I T: a")
+    may = parser.parse_stdout("05-15 10:00:00.000  1  1 I T: b")  # out-of-order
+    jun2 = parser.parse_stdout("06-16 10:00:00.000  1  1 I T: c")
+
+    assert jun.timestamp.year == 2024
+    assert may.timestamp.year == 2024  # not rolled to 2025 by the backward jump
+    assert jun2.timestamp.year == 2024  # drift did not become permanent
+
+
+def test_thread_time_parser_microsecond_precision() -> None:
+    """Threadtime lines with 6-digit fractional seconds parse (not raw fallback)."""
+    parser = ThreadTimeLogParser(default_year=2026)
+    entry = parser.parse_stdout("11-19 12:34:56.123456  1234  5678 D Tag: msg")
+
+    assert entry.meta.get("parser") == "ThreadTimeLogParser"
+    assert entry.timestamp.microsecond == 123456
+    assert entry.tag == "Tag"
+    assert entry.message == "msg"
+
+
 def test_thread_time_parser_tag_with_spaces() -> None:
     """Test parsing a log line where the tag contains spaces."""
     parser = ThreadTimeLogParser()

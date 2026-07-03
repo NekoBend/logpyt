@@ -131,7 +131,7 @@ class ThreadTimeLogParser(LogParser):
     # Group 6: Tag
     # Group 7: Message
     _PATTERN = re.compile(
-        r"^(\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d{3})\s+(\d{1,7})\s+(\d{1,7})\s+([A-Z])\s+(.*?):(?:\s+(.*))?$"
+        r"^(\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d{3,6})\s+(\d{1,7})\s+(\d{1,7})\s+([A-Z])\s+(.*?):(?:\s+(.*))?$"
     )
 
     def __init__(
@@ -156,11 +156,18 @@ class ThreadTimeLogParser(LogParser):
         hour = int(time_str[0:2])
         minute = int(time_str[3:5])
         second = int(time_str[6:8])
-        microsecond = int(time_str[9:12]) * 1000
+        # Fractional part is 3-6 digits (ms to us); right-pad to microseconds.
+        microsecond = int(time_str[9:].ljust(6, "0")[:6])
         offset = self._year_offset
-        if self._last_month is not None and month < self._last_month:
+        # Only a genuine December -> January wrap advances the year. Any other
+        # backward month jump is out-of-order buffer jitter (logcat merges ring
+        # buffers and is not strictly monotonic) and must NOT roll the year, or a
+        # single stray line would permanently corrupt every later timestamp.
+        if self._last_month == 12 and month == 1:
             offset += 1
-        timestamp = datetime(
+        # Device timestamps are naive local wall-clock by design (see module
+        # docstring); build directly rather than attaching and stripping a tz.
+        timestamp = datetime(  # noqa: DTZ001  intentional naive local wall-clock
             self.default_year + offset,
             month,
             day,
@@ -168,8 +175,7 @@ class ThreadTimeLogParser(LogParser):
             minute,
             second,
             microsecond,
-            tzinfo=_LOCAL_TIMEZONE,
-        ).replace(tzinfo=None)
+        )
         # Commit rollover state only after a valid date was constructed.
         self._year_offset = offset
         self._last_month = month
@@ -203,14 +209,16 @@ class ThreadTimeLogParser(LogParser):
 
         date_str, time_str, pid_str, tid_str, level_str, tag, message = match.groups()
 
+        # Validate the level BEFORE parsing the timestamp so a rejected line never
+        # mutates the year-rollover state (which _parse_timestamp commits).
+        if level_str not in {"V", "D", "I", "W", "E", "F"}:
+            return super().parse_stdout(line)
+
         # A malformed calendar value (e.g. month 13) means this is not a real
         # threadtime line: fall back to raw rather than inventing a timestamp.
         try:
             timestamp = self._parse_timestamp(date_str, time_str)
         except ValueError:
-            return super().parse_stdout(line)
-
-        if level_str not in {"V", "D", "I", "W", "E", "F"}:
             return super().parse_stdout(line)
 
         # pid/tid are bounded to <= 7 digits by the regex, so int() cannot blow up.

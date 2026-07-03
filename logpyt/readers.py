@@ -37,8 +37,8 @@ class LogFileReader:
 
         Args:
             file_path: Path to the log file.
-            parser: Parser to use. If None, uses default LogParser which
-                treats each line as a raw message.
+            parser: Parser to use. If None, defaults to ThreadTimeLogParser
+                (which falls back to a raw message for non-threadtime lines).
             filter_by: Optional filter to apply to entries. Only entries
                 passing the filter will be yielded.
             parse_error_log_interval: Minimum interval in seconds between
