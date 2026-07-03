@@ -17,7 +17,7 @@ from logpyt.exceptions import (
 from logpyt.filters import Filter
 from logpyt.groupers import LogGrouper, WindowedLogGrouper
 from logpyt.parsers import LogParser, ThreadTimeLogParser
-from logpyt.utils import resolve_adb
+from logpyt.utils import _CREATE_NO_WINDOW, resolve_adb
 
 from .common import StreamState, build_pidof_command
 
@@ -196,6 +196,7 @@ class AsyncPidMonitor:
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                creationflags=_CREATE_NO_WINDOW,
             )
             stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5.0)
 
@@ -578,6 +579,7 @@ class AsyncLogStream:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=_READ_LIMIT,
+                creationflags=_CREATE_NO_WINDOW,
             )
         except Exception as e:  # noqa: BLE001  subprocess spawn failure must not crash manager
             logger.debug("Failed to start adb logcat subprocess: %s", e)
@@ -739,7 +741,12 @@ class AsyncLogStream:
             return
 
         try:
-            await asyncio.wait_for(self._connection_task, timeout=timeout)
+            # shield so a join() timeout only stops waiting; it must not cancel
+            # the connection task (which would skip lifecycle cleanup and orphan
+            # the reader/dispatcher tasks, PID monitor, and final flush).
+            await asyncio.wait_for(
+                asyncio.shield(self._connection_task), timeout=timeout
+            )
         except TimeoutError as err:
             raise LogStreamTimeoutError("Timeout waiting for connection task") from err
 

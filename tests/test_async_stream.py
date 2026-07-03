@@ -792,12 +792,17 @@ async def test_pause_stops_dispatch_and_resume_continues(
     mock_process.stdout.readline.side_effect = gated_readline
     mock_process.stderr.readline.return_value = b""
 
-    # Keep the process alive so the read loop is not torn down mid-test
+    # Keep the process alive until stop() terminates it, mirroring a real adb
+    # process (terminate() -> wait() returns) so join() drains deterministically
+    # instead of racing a fixed sleep.
+    process_done = asyncio.Event()
+
     async def delayed_wait():
-        await asyncio.sleep(1.0)
+        await process_done.wait()
         return 0
 
     mock_process.wait.side_effect = delayed_wait
+    mock_process.terminate.side_effect = lambda: process_done.set()
 
     mock_parser = MagicMock()
     mock_parser.parse_stdout.side_effect = lambda line: _make_entry(line.strip())

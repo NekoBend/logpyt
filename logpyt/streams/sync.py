@@ -20,7 +20,7 @@ from logpyt.exceptions import (
 from logpyt.filters import Filter
 from logpyt.groupers import LogGrouper, WindowedLogGrouper
 from logpyt.parsers import LogParser, ThreadTimeLogParser
-from logpyt.utils import resolve_adb
+from logpyt.utils import _CREATE_NO_WINDOW, resolve_adb
 
 from .common import StreamState, build_pidof_command
 
@@ -173,7 +173,13 @@ class PidMonitor:
 
         try:
             # Use a timeout to prevent hanging
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5.0)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                creationflags=_CREATE_NO_WINDOW,
+            )
             if result.returncode == 0 and result.stdout.strip():
                 return [
                     int(p) for p in result.stdout.split() if p.isdigit() and len(p) <= 7
@@ -461,6 +467,7 @@ class LogStream:
                     bufsize=1,  # Line buffered
                     encoding="utf-8",
                     errors="replace",
+                    creationflags=_CREATE_NO_WINDOW,
                 )
             except Exception as e:  # noqa: BLE001 (process spawn may fail arbitrarily; must not crash manager)
                 logging.getLogger("logpyt").debug("Failed to start adb process: %s", e)
@@ -517,6 +524,7 @@ class LogStream:
                     self._last_activity = time.time()
                 self._watchdog_thread = threading.Thread(
                     target=self._watchdog_loop,
+                    args=(self._process,),
                     name="LogStream-Watchdog",
                     daemon=True,
                 )
@@ -663,27 +671,32 @@ class LogStream:
         if self.state == StreamState.KILLED:
             raise LogStreamKilledError("Stream was killed")
 
-        # Check for exceptions
-        if not self._exceptions.empty():
-            # Raise the first exception found
-            # We wrap it in LogStreamInternalError if it's not already a LogStreamError
-            # Peek (non-destructive) so re-invoking join() surfaces the same terminal
-            # error, matching AsyncLogStream.join().
-            exc = self._exceptions.queue[0]
+        # Check for exceptions. Peek (non-destructive) under the queue's own mutex
+        # so re-invoking join() surfaces the same terminal error (matching
+        # AsyncLogStream.join()) without racing the deque internals.
+        with self._exceptions.mutex:
+            exc = self._exceptions.queue[0] if self._exceptions.queue else None
+        if exc is not None:
+            # Wrap in LogStreamInternalError unless it is already a LogStreamError.
             if isinstance(exc, LogStreamError):
                 raise exc
             raise LogStreamInternalError(
                 f"Internal error in stream thread: {exc}"
             ) from exc
 
-    def _watchdog_loop(self) -> None:
-        """Monitor stream activity and kill process if hung."""
+    def _watchdog_loop(self, process: subprocess.Popen[str]) -> None:
+        """Monitor one process's activity and kill it if it hangs.
+
+        Bound to the process it was started for (not ``self._process``) so a
+        reconnect that spawns a replacement leaves this watchdog to exit when
+        its own process ends, rather than acting on the new process or lingering.
+        """
         if not self.read_timeout:
             return
 
         while not self._stop_event.is_set():
-            # Check if process is still running
-            if self._process is None or self._process.poll() is not None:
+            # Stop watching once this specific process has exited.
+            if process.poll() is not None:
                 break
 
             with self._activity_lock:
@@ -694,9 +707,8 @@ class LogStream:
                     "LogStream read timeout (%ss). Killing ADB process.",
                     self.read_timeout,
                 )
-                if self._process:
-                    with contextlib.suppress(ProcessLookupError, OSError):
-                        self._process.kill()
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    process.kill()
                 break
 
             time.sleep(1.0)
@@ -759,7 +771,11 @@ class LogStream:
                 with self._grouper_lock:
                     flushed = self.group_by.flush()
                 if flushed:
-                    self._enqueue_callback_item((flushed, source), source=source)
+                    # force so the terminal group is delivered even if the queue
+                    # is saturated (matches the shutdown sentinel).
+                    self._enqueue_callback_item(
+                        (flushed, source), source=source, force=True
+                    )
 
     def _callback_loop(self) -> None:
         """Internal loop to process callbacks."""
@@ -801,14 +817,14 @@ class LogStream:
             pass
 
         if force:
-            try:
+            # Guarantee delivery of a forced item (shutdown sentinel / terminal
+            # flush): evict one to make room, but if a consumer already drained
+            # the queue (get_nowait -> Empty) there is room, so enqueue either way
+            # instead of returning without delivering.
+            with contextlib.suppress(queue.Empty):
                 self._callback_queue.get_nowait()
-            except queue.Empty:
-                return
-            try:
+            with contextlib.suppress(queue.Full):
                 self._callback_queue.put_nowait(item)
-            except queue.Full:
-                return
             return
 
         if self.queue_overflow_policy == "drop_oldest":

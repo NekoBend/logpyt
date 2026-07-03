@@ -17,6 +17,11 @@ import sys
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
+# On Windows, spawning a child from a GUI / pythonw / frozen app pops a transient
+# console window; CREATE_NO_WINDOW suppresses it. The flag does not exist on
+# POSIX, where 0 is the Popen default (a harmless no-op).
+_CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
 
 # Type definitions
 class DeviceInfo(TypedDict, total=False):
@@ -122,6 +127,7 @@ def list_devices(  # noqa: PLR0912
             text=True,
             check=True,
             timeout=timeout,
+            creationflags=_CREATE_NO_WINDOW,
         )
     except subprocess.CalledProcessError as e:
         msg = f"Failed to run adb devices: {e.stderr}"
@@ -236,6 +242,7 @@ def wait_for_device(serial: str | None = None, timeout: float | None = None) -> 
             text=True,
             check=True,
             timeout=timeout,
+            creationflags=_CREATE_NO_WINDOW,
         )
     except subprocess.TimeoutExpired as e:
         msg = f"Timed out waiting for device after {timeout}s"
@@ -271,6 +278,7 @@ async def async_wait_for_device(
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        creationflags=_CREATE_NO_WINDOW,
     )
 
     try:
@@ -316,6 +324,7 @@ def adb_connect(address: str, timeout: float | None = None) -> None:
             text=True,
             timeout=timeout,
             check=False,
+            creationflags=_CREATE_NO_WINDOW,
         )
     except subprocess.TimeoutExpired as e:
         msg = f"Timed out connecting to {address} after {timeout}s"
@@ -360,6 +369,7 @@ async def async_adb_connect(address: str, timeout: float | None = None) -> None:
         address,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        creationflags=_CREATE_NO_WINDOW,
     )
 
     try:
@@ -437,5 +447,11 @@ def extract_json(text: str) -> Any | None:  # noqa: ANN401
             attempts += 1
             next_idx = max(start + 1, exc.pos + 1)
             idx = min(next_idx, scan_limit)
+        except RecursionError:
+            # Pathologically nested brackets (untrusted device output) exceed the
+            # decoder's recursion limit; skip this candidate rather than letting
+            # the error escape into a caller of LogEntry.json_payload.
+            attempts += 1
+            idx = min(start + 1, scan_limit)
 
     return None

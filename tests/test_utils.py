@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from logpyt.utils import (
+    _CREATE_NO_WINDOW,
     adb_connect,
     async_adb_connect,
     async_wait_for_device,
@@ -208,6 +209,7 @@ def test_wait_for_device_success(mocker) -> None:
         text=True,
         check=True,
         timeout=10.0,
+        creationflags=_CREATE_NO_WINDOW,
     )
 
 
@@ -253,6 +255,7 @@ async def test_async_wait_for_device_success(mocker) -> None:
         "wait-for-device",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        creationflags=_CREATE_NO_WINDOW,
     )
     # In the implementation, if timeout is provided, asyncio.wait_for is used.
     # We should verify that wait() was called (either directly or via wait_for).
@@ -316,6 +319,7 @@ def test_adb_connect_success(mocker) -> None:
         text=True,
         timeout=None,
         check=False,
+        creationflags=_CREATE_NO_WINDOW,
     )
 
 
@@ -500,6 +504,17 @@ def test_extract_json_no_json() -> None:
     assert extract_json(text) is None
 
 
+def test_extract_json_deeply_nested_does_not_raise() -> None:
+    """Pathologically nested brackets must not escape as RecursionError.
+
+    Untrusted device output like '[' * N drives the JSON decoder past its
+    recursion limit; extract_json must swallow it and return None rather than
+    crashing a caller of LogEntry.json_payload.
+    """
+    assert extract_json("[" * 6000) is None
+    assert extract_json("{" * 6000) is None
+
+
 def test_extract_json_incomplete() -> None:
     """Test extracting incomplete JSON."""
     text = '{"key": "val"'
@@ -557,4 +572,5 @@ def test_list_devices_custom_timeout(mocker) -> None:
         text=True,
         check=True,
         timeout=5.0,
+        creationflags=_CREATE_NO_WINDOW,
     )
