@@ -123,3 +123,25 @@ def test_grouper_emit_mode_entry(base_time: datetime) -> None:
     entry = cast("LogEntry", res[0])
     assert isinstance(entry, LogEntry)
     assert entry.message == "1"
+
+
+def test_grouper_max_group_size_force_flushes(base_time: datetime) -> None:
+    """A hot key cannot grow one group past max_group_size; it force-flushes."""
+    grouper = LogGrouper(
+        by=("pid",), threshold_ms=10000, emit_mode="group", max_group_size=3
+    )
+
+    emitted: list[LogEntry | list[LogEntry]] = []
+    for i in range(7):
+        entry = create_entry(base_time + timedelta(milliseconds=i), message=str(i))
+        emitted.extend(grouper.process(entry))
+
+    # 7 same-key entries within threshold, cap 3 -> two groups of 3 auto-flushed.
+    groups = [g for g in emitted if isinstance(g, list)]
+    assert len(groups) == 2
+    assert all(len(g) == 3 for g in groups)
+
+    # The 7th entry remains buffered until an explicit flush.
+    final = grouper.flush()
+    assert len(final) == 1
+    assert len(cast("list[LogEntry]", final[0])) == 1

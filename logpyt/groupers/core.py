@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from datetime import datetime
 
     from ..models import LogEntry
 
@@ -54,6 +55,7 @@ class LogGrouper:
         by: Sequence[str],
         threshold_ms: float,
         emit_mode: EmitMode = "entry",
+        max_group_size: int | None = 10000,
     ) -> None:
         """Initialize the LogGrouper.
 
@@ -61,10 +63,15 @@ class LogGrouper:
             by: Sequence of field names to use as grouping keys.
             threshold_ms: Time threshold in milliseconds.
             emit_mode: Emission mode ("entry" or "group").
+            max_group_size: Hard cap on entries per group. When a group reaches
+                this many entries it is force-flushed and a new group started,
+                bounding memory under a hot (possibly adversarial) key. Set to
+                None to disable the cap. Defaults to 10000.
         """
         self.by = tuple(by)
         self.threshold_ms = threshold_ms
         self.emit_mode = emit_mode
+        self.max_group_size = max_group_size
         self._buffer: list[LogEntry] = []
         self._last_key: tuple[Any, ...] | None = None
         # Canonicalize frequently repeated keys to avoid repeated hash work
@@ -126,6 +133,12 @@ class LogGrouper:
 
         if keys_match and within_threshold:
             self._buffer.append(entry)
+            if (
+                self.max_group_size is not None
+                and len(self._buffer) >= self.max_group_size
+            ):
+                # Cap group size so a hot key cannot grow one group without bound.
+                emitted.extend(self.flush())
         else:
             # Flush current group
             emitted.extend(self.flush())
@@ -195,6 +208,7 @@ class WindowedLogGrouper(LogGrouper):
         threshold_ms: float,
         emit_mode: EmitMode = "group",
         max_groups: int = 1000,
+        max_group_size: int | None = 10000,
     ) -> None:
         """Initialize the WindowedLogGrouper.
 
@@ -203,12 +217,27 @@ class WindowedLogGrouper(LogGrouper):
             threshold_ms: Time threshold in milliseconds.
             emit_mode: Emission mode ("entry" or "group").
             max_groups: Maximum number of active groups to maintain.
+            max_group_size: Hard cap on entries per window; a window reaching it
+                is force-flushed, bounding memory under a hot key. None disables
+                the cap. Defaults to 10000.
         """
-        super().__init__(by, threshold_ms, emit_mode)
+        super().__init__(by, threshold_ms, emit_mode, max_group_size)
         self._buffers: OrderedDict[tuple[Any, ...], list[LogEntry]] = OrderedDict()
         self._heap: list[tuple[float, tuple[Any, ...]]] = []
         self._expiries: dict[tuple[Any, ...], float] = {}
         self.max_groups = max_groups
+        self._anchor: datetime | None = None
+
+    def _relative_ms(self, ts: datetime) -> float:
+        """Milliseconds from the first seen timestamp (DST-safe naive delta).
+
+        Uses naive datetime subtraction (matching ``LogGrouper``) rather than
+        ``datetime.timestamp()`` so a local DST offset discontinuity cannot
+        distort window expiry comparisons.
+        """
+        if self._anchor is None:
+            self._anchor = ts
+        return (ts - self._anchor).total_seconds() * 1000.0
 
     def _maybe_compact_heap(self) -> None:
         """Compact stale heap entries when lazy invalidation grows too much."""
@@ -236,7 +265,7 @@ class WindowedLogGrouper(LogGrouper):
         """
         current_key = self._get_key(entry)
         emitted: list[LogEntry | list[LogEntry]] = []
-        current_ts = entry.timestamp.timestamp() * 1000.0
+        current_ts = self._relative_ms(entry.timestamp)
 
         # Check for timeouts using heap
         while self._heap:
@@ -275,6 +304,16 @@ class WindowedLogGrouper(LogGrouper):
         self._expiries[current_key] = new_expiry
         heapq.heappush(self._heap, (new_expiry, current_key))
         self._maybe_compact_heap()
+
+        # Cap per-window size so a hot (possibly adversarial) key cannot grow one
+        # window without bound. _flush_key drops the buffer + its expiry; the
+        # stale heap entry is cleared lazily.
+        if (
+            self.max_group_size is not None
+            and current_key in self._buffers
+            and len(self._buffers[current_key]) >= self.max_group_size
+        ):
+            emitted.extend(self._flush_key(current_key))
 
         return emitted
 

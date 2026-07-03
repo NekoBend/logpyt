@@ -71,6 +71,33 @@ def test_sliding_window_correctness():
     assert group[2].message == "msg3"
 
 
+def test_windowed_grouper_max_group_size_force_flushes():
+    """A hot key cannot grow one window past max_group_size; it force-flushes."""
+    grouper = WindowedLogGrouper(
+        by=["pid", "tid"], threshold_ms=100000.0, emit_mode="group", max_group_size=3
+    )
+    start_ts = datetime.datetime.now(datetime.UTC).replace(microsecond=0, tzinfo=None)
+
+    emitted = []
+    for i in range(7):
+        entry = create_log_entry(
+            start_ts + datetime.timedelta(milliseconds=i), 100, 200, f"msg{i}"
+        )
+        emitted.extend(grouper.process(entry))
+
+    # 7 same-key entries within threshold, cap 3 -> two full windows auto-flushed.
+    groups = [g for g in emitted if isinstance(g, list)]
+    assert len(groups) == 2
+    assert all(len(g) == 3 for g in groups)
+
+    # The 7th entry remains buffered until an explicit flush.
+    final = grouper.flush()
+    assert len(final) == 1
+    last = final[0]
+    assert isinstance(last, list)
+    assert len(last) == 1
+
+
 def test_windowed_grouper_lru_eviction_on_max_groups():
     """A 3rd distinct key over max_groups=2 evicts (flushes) the LRU key."""
     threshold_ms = 1000.0
