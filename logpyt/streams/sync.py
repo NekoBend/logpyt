@@ -479,6 +479,13 @@ class LogStream:
                 else:
                     break
 
+            # stop() may have set the event during Popen() above; it terminated
+            # the previous handle, not this fresh one, so terminate now to avoid
+            # orphaning it on the wait() below.
+            if self._stop_event.is_set():
+                with contextlib.suppress(ProcessLookupError):
+                    self._process.terminate()
+
             self._stdout_thread = threading.Thread(
                 target=self._read_loop,
                 args=(self._process.stdout, "stdout"),
@@ -597,7 +604,11 @@ class LogStream:
             self._process.kill()
 
     def pause(self) -> None:
-        """Pause dispatching of log entries."""
+        """Pause dispatching of log entries.
+
+        Entries read from the device while paused are dropped, not buffered: a
+        live stream cannot buffer unboundedly. Call resume() to continue.
+        """
         with self._state_lock:
             if self._state == StreamState.RUNNING:
                 self._set_state(StreamState.PAUSED)
@@ -690,19 +701,24 @@ class LogStream:
 
             time.sleep(1.0)
 
-    def _warn_queue_full_once(self, message: str) -> None:
-        """Emit queue-full warning with optional rate limiting."""
+    def _warn_queue_full_once(self, message: str, key: str | None = None) -> None:
+        """Emit queue-full warning with optional rate limiting.
+
+        Rate limiting is keyed on ``key`` (falling back to ``message``) so a
+        message carrying a variable count still de-duplicates on a stable key.
+        """
         interval = self._queue_full_warning_interval
         if interval <= 0.0:
             logging.getLogger("logpyt").warning(message)
             return
 
+        dedup_key = key if key is not None else message
         now = time.monotonic()
         should_log = False
         with self._queue_warning_lock:
-            last = self._last_queue_full_warning.get(message)
+            last = self._last_queue_full_warning.get(dedup_key)
             if last is None or (now - last) >= interval:
-                self._last_queue_full_warning[message] = now
+                self._last_queue_full_warning[dedup_key] = now
                 should_log = True
 
         if should_log:
@@ -807,8 +823,14 @@ class LogStream:
                 pass
 
         if source == "stdout" and self.group_by:
+            dropped = (
+                sum(len(x) if isinstance(x, list) else 1 for x in item[0])
+                if item is not None
+                else 0
+            )
             self._warn_queue_full_once(
-                "LogStream callback queue is full. Dropping grouped log entries."
+                f"LogStream callback queue full; dropping {dropped} grouped entries.",
+                key="queue-full-grouped",
             )
         else:
             self._warn_queue_full_once(

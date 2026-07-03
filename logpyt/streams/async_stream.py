@@ -586,6 +586,13 @@ class AsyncLogStream:
             await self._invoke_callback(self.on_error, e)
             return
 
+        # stop() may have set the event while create_subprocess_exec was awaiting;
+        # it terminated the previous handle, not this fresh one, so terminate now
+        # to avoid orphaning it on the wait() below.
+        if self._stop_event.is_set():
+            with contextlib.suppress(ProcessLookupError):
+                self._process.terminate()
+
         if self._process.stdout:
             self._stdout_task = asyncio.create_task(
                 self._read_loop(self._process.stdout, "stdout"),
@@ -689,7 +696,11 @@ class AsyncLogStream:
                 self._process.kill()
 
     async def pause(self) -> None:
-        """Pause dispatching of log entries."""
+        """Pause dispatching of log entries.
+
+        Entries read from the device while paused are dropped, not buffered: a
+        live stream cannot buffer unboundedly. Call resume() to continue.
+        """
         async with self._state_lock:
             should_pause = self._state == StreamState.RUNNING
 
