@@ -1,4 +1,10 @@
-"""Log filtering logic."""
+"""Log filtering logic.
+
+The composable condition classes (``Tag``, ``Level``, ``Package``,
+``MessageContains``, ``CrashCondition``, ``AnrCondition``, and the ``And``/``Or``/
+``Not`` combinators) live here in ``logpyt.filters``. Only ``Filter`` and
+``AdvancedFilter`` are re-exported from the top-level ``logpyt`` package.
+"""
 
 from __future__ import annotations
 

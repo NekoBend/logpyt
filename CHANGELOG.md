@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Re-export `AsyncLogStream`, `AsyncStreamHandle`, `LogFileReader`, `read_file`,
   `export_logs`, and `WindowedLogGrouper` from the top-level `logpyt` package.
+- A `py.typed` marker (PEP 561) so downstream type checkers consume logpyt's
+  annotations.
+- `max_group_size` on `LogGrouper`/`WindowedLogGrouper` (default 10000) to bound
+  per-group memory under a hot (possibly adversarial) grouping key.
 - Configurable parse-error log throttling in `LogFileReader`.
 - Configurable stream callback-queue overflow policy and PID-resolution controls.
 - A `hatchling` build backend so the project is installable and publishable.
@@ -34,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Performance optimizations across parsers (hot-path parsing, early-reject),
   groupers (windowed-grouper heap compaction), PID monitors (adaptive polling
   backoff, fewer map rebuilds), and exporters (compact JSON/CSV serialization).
+- On Windows, adb subprocesses are spawned with `CREATE_NO_WINDOW` so no console
+  window flashes for GUI or frozen (PyInstaller) applications.
 
 ### Fixed
 
@@ -78,5 +84,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evaded sanitization; report the dropped count when a grouped batch overflows.
 - Treat empty low-level filter conditions (`Tag([])`, `Level([])`,
   `MessageContains([])`) as "no constraint", consistent with `Filter`.
+- `extract_json` no longer lets a `RecursionError` from pathologically nested
+  brackets in untrusted device output escape into callers of
+  `LogEntry.json_payload`.
+- `AsyncLogStream.join(timeout=...)` no longer cancels the stream on timeout (it
+  only stops waiting), so a timed-out join cannot orphan reader/dispatcher tasks,
+  the PID monitor, or the final flush.
+- `WindowedLogGrouper` measures windows on a DST-safe naive-time basis, matching
+  `LogGrouper` (they no longer disagree across a DST transition).
+- The read-timeout watchdog is bound to the process it was started for, so
+  reconnects no longer accumulate lingering watchdog threads.
+- The terminal grouper flush is delivered even under callback backpressure; a
+  forced enqueue no longer drops its item when the queue is drained mid-eviction;
+  and `join()` peeks the exception queue under its mutex.
 
 [2.0.0]: https://github.com/NekoBend/logpyt/compare/v1.0.0...v2.0.0

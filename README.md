@@ -78,6 +78,10 @@ with LogStream(
 ### Filtering
 
 Use `Filter` for simple AND conditions, or `AdvancedFilter` for complex logic.
+The composable condition classes (`Tag`, `Level`, `Package`, `MessageContains`,
+`CrashCondition`, `AnrCondition`, and the `&` / `|` / `~` combinators) live in the
+`logpyt.filters` module; only `Filter` and `AdvancedFilter` are re-exported at the
+top level.
 
 ```python
 from logpyt import LogStream
@@ -145,8 +149,8 @@ Read and process log files offline.
 from logpyt import read_file, LogFileReader
 from logpyt.parsers import ThreadTimeLogParser
 
-# Read all logs into a list
-entries = read_file("app.log", parser=ThreadTimeLogParser())
+# Read all logs into a list (read_file yields lazily; wrap in list() to materialize)
+entries = list(read_file("app.log", parser=ThreadTimeLogParser()))
 
 # Iterate over logs (memory efficient)
 reader = LogFileReader("app.log", parser=ThreadTimeLogParser())
