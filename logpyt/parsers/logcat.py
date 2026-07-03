@@ -254,7 +254,11 @@ class BriefLogParser(LogParser):
     # Group 2: Tag
     # Group 3: PID
     # Group 4: Message
-    _PATTERN = re.compile(r"^([VDIWEF])/(.+)\(\s*(\d{1,7})\):\s+(.*)$")
+    # The tag is non-greedy so it binds to the FIRST "( <pid> ):" delimiter; a
+    # greedy tag would let a message containing "( <digits> ):" steal the split.
+    # A parenthesized tag like "Foo(Bar)" still parses because "(Bar)" is not
+    # "( <digits> ):", so the engine extends the tag to the real pid group.
+    _PATTERN = re.compile(r"^([VDIWEF])/(.+?)\(\s*(\d{1,7})\):\s+(.*)$")
 
     def parse_stdout(self, line: str) -> LogEntry:
         """Parse a line from stdout using brief format.

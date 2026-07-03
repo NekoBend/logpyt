@@ -125,6 +125,19 @@ def test_brief_parser_tag_with_parens() -> None:
     assert entry.message == "routeCall()"
 
 
+def test_brief_parser_message_with_paren_digits_does_not_steal_tag() -> None:
+    """A message containing '( <digits> ):' must not hijack the tag/pid split.
+
+    Regression: a greedy tag group backtracked to the last '( <digits> ):' in
+    the line, mis-splitting tag/pid/message.
+    """
+    entry = BriefLogParser().parse_stdout("D/Tag( 100): calling foo( 200): done")
+
+    assert entry.tag == "Tag"
+    assert entry.pid == 100
+    assert entry.message == "calling foo( 200): done"
+
+
 def test_thread_time_parser_fallback() -> None:
     """Test fallback when regex doesn't match."""
     parser = ThreadTimeLogParser()

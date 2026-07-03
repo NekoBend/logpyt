@@ -70,6 +70,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timestamp drift.
 - Parse threadtime lines with microsecond (`.ffffff`) precision instead of
   dropping them to the raw fallback.
+- Match the `BriefLogParser` tag non-greedily so a message containing
+  `( <digits> ):` no longer hijacks the tag/pid split.
 - Terminate an adb process spawned while `stop()` runs (during start/reconnect)
   so it cannot be orphaned and leak.
 - Close a CSV formula-injection bypass where leading whitespace before `=+-@`
