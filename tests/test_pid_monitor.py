@@ -86,7 +86,7 @@ class TestPidMonitor:
             monitor._stop_event.set()
 
         with patch.object(monitor._stop_event, "wait", side_effect=side_effect_wait):
-            monitor._run()
+            monitor._run(monitor._stop_event)
 
         assert monitor._pid_map == {1234: "com.example.app"}
         mock_resolve.assert_called_with("com.example.app")
@@ -140,7 +140,7 @@ class TestPidMonitor:
                 monitor._stop_event.set()
 
         with patch.object(monitor._stop_event, "wait", side_effect=side_effect_wait):
-            monitor._run()
+            monitor._run(monitor._stop_event)
 
         assert intervals == [2.0, 4.0, 4.0]
 
@@ -166,7 +166,7 @@ class TestPidMonitor:
                 monitor._stop_event.set()
 
         with patch.object(monitor._stop_event, "wait", side_effect=side_effect_wait):
-            monitor._run()
+            monitor._run(monitor._stop_event)
 
         assert intervals == [2.0, 4.0, 1.0]
 
@@ -201,7 +201,7 @@ class TestPidMonitor:
             "wait",
             side_effect=stop_after_three_cycles,
         ):
-            monitor._run()
+            monitor._run(monitor._stop_event)
 
         assert monitor._pid_map == {
             1001: "pkg.a",
@@ -239,6 +239,6 @@ class TestPidMonitor:
                 side_effect=stop_after_one_cycle,
             ),
         ):
-            monitor._run()
+            monitor._run(monitor._stop_event)
 
         assert calls["n"] < len(packages)

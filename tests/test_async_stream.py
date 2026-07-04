@@ -840,3 +840,79 @@ async def test_pause_stops_dispatch_and_resume_continues(
     assert "after-resume" in dispatched
     # The line read while paused must never reach the callback
     assert "during-pause" not in dispatched
+
+
+@pytest.mark.asyncio
+async def test_async_stream_groups_stdout_and_flushes_on_eof(
+    mock_resolve_adb, mock_create_subprocess, mock_process
+):
+    """AsyncLogStream with group_by groups stdout entries and flushes on EOF."""
+    from logpyt.groupers import WindowedLogGrouper
+
+    lines = [b"line1\n", b"line2\n", b""]
+    line_iter = iter(lines)
+
+    async def readline(*args, **kwargs):
+        return next(line_iter, b"")
+
+    mock_process.stdout.readline.side_effect = readline
+    mock_process.stderr.readline.return_value = b""
+    mock_process.wait = AsyncMock(return_value=0)
+
+    parser = MagicMock()
+    parser.parse_stdout.side_effect = lambda line: _make_entry(line.strip())
+
+    dispatched: list = []
+
+    async def callback(item, handle):
+        del handle
+        dispatched.append(item)
+
+    stream = AsyncLogStream(
+        parser=parser,
+        stdout_callback=callback,
+        group_by=WindowedLogGrouper(by=["tag"], threshold_ms=100000.0),
+    )
+
+    await stream.start()
+    await stream.join(timeout=2.0)
+
+    # Both stdout entries share tag "T" within threshold, so the EOF flush emits
+    # them as a single grouped list (grouping is stdout-only and forced on flush).
+    groups = [item for item in dispatched if isinstance(item, list)]
+    assert any(len(g) == 2 for g in groups)
+
+
+@pytest.mark.asyncio
+async def test_async_join_timeout_is_nondestructive(
+    mock_resolve_adb, mock_create_subprocess, mock_process
+):
+    """A join(timeout) that expires raises but must not cancel the running stream."""
+    mock_process.stdout.readline.return_value = b""
+    mock_process.stderr.readline.return_value = b""
+
+    # Keep the process (and thus the connection task) running until released.
+    release = asyncio.Event()
+
+    async def blocking_wait(*args, **kwargs):
+        await release.wait()
+        return 0
+
+    mock_process.wait.side_effect = blocking_wait
+
+    stream = AsyncLogStream()
+    await stream.start()
+    await asyncio.wait_for(wait_for_state(stream, StreamState.RUNNING), timeout=1.0)
+
+    # join times out because the process never exits...
+    with pytest.raises(LogStreamTimeoutError):
+        await stream.join(timeout=0.1)
+
+    # ...but the asyncio.shield kept the connection task alive (non-destructive).
+    assert stream._connection_task is not None
+    assert not stream._connection_task.done()
+
+    # Cleanup: release the process and join cleanly.
+    release.set()
+    await stream.stop()
+    await stream.join(timeout=1.0)

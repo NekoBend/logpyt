@@ -29,6 +29,10 @@ if TYPE_CHECKING:
 
     from logpyt.models import LogEntry
 
+# Cap a single readline() so a device that emits output without a newline cannot
+# grow the reader thread's memory without bound (mirrors the async _READ_LIMIT).
+_READ_LIMIT = 8 * 1024 * 1024
+
 
 class PidMonitor:
     """Monitors PIDs for specific packages using ADB."""
@@ -72,9 +76,14 @@ class PidMonitor:
         if not self.packages:
             return
 
-        self._stop_event.clear()
+        # Fresh event per run so a slow previous thread (still inside a pidof call
+        # when stop()'s bounded join timed out) keeps observing its OWN set event
+        # and exits, instead of being resurrected when the next start() clears a
+        # shared one.
+        self._stop_event = threading.Event()
+        stop_event = self._stop_event
         self._thread = threading.Thread(
-            target=self._run, name="PidMonitor", daemon=True
+            target=self._run, args=(stop_event,), name="PidMonitor", daemon=True
         )
         self._thread.start()
 
@@ -96,10 +105,10 @@ class PidMonitor:
         with self._lock:
             return self._pid_map.get(pid)
 
-    def _run(self) -> None:
+    def _run(self, stop_event: threading.Event) -> None:
         """Internal loop to poll PIDs."""
         current_interval = self.poll_interval
-        while not self._stop_event.is_set():
+        while not stop_event.is_set():
             packages = self.packages
             total = len(packages)
             cycle_limit = min(total, self.max_resolves_per_cycle)
@@ -137,7 +146,7 @@ class PidMonitor:
                     current_interval * self.poll_backoff_factor,
                 )
 
-            self._stop_event.wait(current_interval)
+            stop_event.wait(current_interval)
 
     def _update_pid_map(self, new_map: dict[int, str]) -> bool:
         """Apply PID map changes in place.
@@ -572,11 +581,14 @@ class LogStream:
             if self._stop_event.wait(self.reconnect_delay):
                 break
 
-        # Final cleanup
+        # Final cleanup: decide under the lock, but invoke on_state/on_stop
+        # OUTSIDE it (matching the rest of this class and AsyncLogStream) so a
+        # callback that re-enters the stream cannot deadlock on _state_lock.
         with self._state_lock:
-            if self._state != StreamState.KILLED:
-                self._set_state(StreamState.STOPPED)
-                self._invoke_callback(self.on_stop)
+            should_stop = self._state != StreamState.KILLED
+        if should_stop:
+            self._set_state(StreamState.STOPPED)
+            self._invoke_callback(self.on_stop)
 
     def stop(self) -> None:
         """Stop the log stream gracefully."""
@@ -746,7 +758,7 @@ class LogStream:
                 if self._process and self._process.poll() is not None:
                     break
 
-                line = pipe.readline()
+                line = pipe.readline(_READ_LIMIT)
                 if not line:
                     # EOF
                     break

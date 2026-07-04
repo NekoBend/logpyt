@@ -413,6 +413,7 @@ class AsyncLogStream:
         item: LogEntry | list[LogEntry],
         source: str,
         callback: AsyncLogCallback,
+        force: bool = False,  # noqa: FBT001, FBT002  (internal delivery-guarantee flag)
     ) -> None:
         """Dispatch an item to callback queue or directly when queue is unavailable."""
         queue = (
@@ -425,7 +426,9 @@ class AsyncLogStream:
             return
         # Never block ingestion on a full queue: apply the overflow policy instead.
         if queue.full():
-            if self.callback_queue_policy == "drop_oldest":
+            if force or self.callback_queue_policy == "drop_oldest":
+                # force (terminal flush) / drop_oldest: evict one to make room so
+                # the item is still delivered rather than dropped.
                 with contextlib.suppress(asyncio.QueueEmpty):
                     queue.get_nowait()
                     queue.task_done()
@@ -820,6 +823,7 @@ class AsyncLogStream:
                                 item,
                                 source="stdout",
                                 callback=self.stdout_callback,
+                                force=True,
                             )
                         except Exception as e:  # noqa: BLE001  callback must not crash flush
                             logger.debug("Error dispatching flushed item: %s", e)
@@ -888,4 +892,7 @@ class AsyncLogStream:
     ) -> bool | None:
         """Stop the stream on exit."""
         await self.stop()
+        # NOTE: unlike sync __exit__, this deliberately does NOT suppress a join
+        # timeout/kill: async cleanup surfaces a failed shutdown to the caller
+        # (see test_async_context_manager_does_not_swallow_join_timeout).
         await self.join(timeout=1.0)

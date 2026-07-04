@@ -430,7 +430,7 @@ def test_auto_reconnect(mocker) -> None:
 
 
 def test_read_timeout(mock_popen, mocker) -> None:
-    """Test that read timeout terminates the process."""
+    """Test that the read-timeout watchdog kills the hung process."""
     mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
 
     # Mock Popen
@@ -454,14 +454,38 @@ def test_read_timeout(mock_popen, mocker) -> None:
     stream = LogStream(read_timeout=0.1)
     stream.start()
 
-    # Wait for watchdog to fire (it sleeps 1s, so wait > 1s)
+    # Wait for watchdog to fire (it sleeps 1s between checks, so wait > 1s)
     time.sleep(1.5)
+
+    # The watchdog (not stop) kills the hung process; assert that BEFORE stop() so
+    # the test actually detects a watchdog regression. stop() only ever calls
+    # terminate() unconditionally, so asserting terminate() would prove nothing.
+    process_mock.kill.assert_called()
 
     stream.stop()
     stream.join(timeout=1.0)
 
-    # Verify terminate was called
-    process_mock.terminate.assert_called()
+
+def test_read_loop_caps_readline_size(mocker) -> None:
+    """The sync reader caps each readline() so a newline-less flood cannot OOM."""
+    from logpyt.streams.sync import _READ_LIMIT
+
+    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    stream = LogStream()
+
+    calls: list[tuple] = []
+
+    def readline(*args: object) -> str:
+        calls.append(args)
+        return ""  # immediate EOF after the first read
+
+    pipe = mocker.MagicMock()
+    pipe.readline.side_effect = readline
+
+    stream._read_loop(pipe, "stdout")
+
+    # readline must be called with the size cap, never unbounded.
+    assert calls == [(_READ_LIMIT,)]
 
 
 def test_queue_full_warning_rate_limited(caplog, mocker) -> None:
