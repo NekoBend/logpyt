@@ -165,7 +165,8 @@ Export logs to JSON or CSV formats.
 ```python
 from logpyt import read_file, export_logs
 
-entries = read_file("app.log")
+# read_file yields lazily; materialize with list() so it can be exported twice.
+entries = list(read_file("app.log"))
 
 # Export to JSON
 export_logs(entries, "output.json", format="json")

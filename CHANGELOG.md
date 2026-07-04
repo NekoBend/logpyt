@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   annotations.
 - `max_group_size` on `LogGrouper`/`WindowedLogGrouper` (default 10000) to bound
   per-group memory under a hot (possibly adversarial) grouping key.
+- Package metadata: an SPDX `license` expression, `license-files`, and trove
+  classifiers.
 - Configurable parse-error log throttling in `LogFileReader`.
 - Configurable stream callback-queue overflow policy and PID-resolution controls.
 - A `hatchling` build backend so the project is installable and publishable.
@@ -97,5 +99,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The terminal grouper flush is delivered even under callback backpressure; a
   forced enqueue no longer drops its item when the queue is drained mid-eviction;
   and `join()` peeks the exception queue under its mutex.
+- The sync reader caps each `readline()` so a device emitting output without a
+  newline can no longer grow the reader thread without bound (parity with the
+  async read limit); the async terminal grouper flush is likewise force-delivered
+  under callback backpressure (parity with the sync flush).
+- The sync PID monitor uses a fresh stop event per run so a slow previous poll
+  thread cannot be resurrected on reconnect, and the connection-manager final
+  cleanup invokes `on_state`/`on_stop` outside the state lock (matching async).
 
 [2.0.0]: https://github.com/NekoBend/logpyt/compare/v1.0.0...v2.0.0

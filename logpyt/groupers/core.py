@@ -60,7 +60,9 @@ class LogGrouper:
         """Initialize the LogGrouper.
 
         Args:
-            by: Sequence of field names to use as grouping keys.
+            by: Sequence of field names to use as grouping keys. Each must name a
+                hashable scalar LogEntry field (e.g. "pid", "tid", "tag", "level");
+                do not use "meta" (a dict), which is unhashable and cannot be a key.
             threshold_ms: Time threshold in milliseconds.
             emit_mode: Emission mode ("entry" or "group").
             max_group_size: Hard cap on entries per group. When a group reaches
