@@ -8,6 +8,7 @@ through the public `GroupBy.groups`.
 from __future__ import annotations
 
 import dataclasses
+import decimal
 import math
 import random
 from collections.abc import Hashable, Sequence
@@ -131,6 +132,45 @@ def test_gap_ms_is_compared_in_whole_microseconds(
     assert gap_micros(gap_ms) == joins
     assert [len(group) for group in joined] == [2]
     assert [len(group) for group in split] == [1, 1]
+
+
+_TRAPS = [decimal.Inexact, decimal.Rounded, decimal.FloatOperation]
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        decimal.Context(),
+        decimal.Context(prec=3),
+        decimal.Context(prec=3, rounding=decimal.ROUND_CEILING),
+        decimal.Context(prec=3, traps=_TRAPS),
+        decimal.Context(traps=_TRAPS),
+    ],
+    ids=["default", "prec3", "ceiling", "traps-prec3", "traps"],
+)
+def test_gap_ignores_the_decimal_context(context: decimal.Context) -> None:
+    """The caller's decimal context neither moves the gap nor raises.
+
+    The spec is validated and the entries are grouped inside the context. A
+    multiplication in it would round 123.456 ms to 123000 us at ``prec=3``
+    (124000 when rounding up) and raise when Inexact or Rounded is trapped;
+    the default 28 digits round an int of 31 digits.
+    """
+    near = [_entry("a"), _entry("b", us=123_456)]
+    far = [_entry("a"), _entry("b", us=123_457)]
+    huge = 10**30 + 1
+
+    with decimal.localcontext(context) as active:
+        spec = _spec(gap_ms=123.456, idle_flush_ms=0.5)
+        joined = [len(group) for group in spec.groups(near)]
+        split = [len(group) for group in spec.groups(far)]
+        micros = [gap_micros(gap) for gap in (123.456, 123.556, huge, 0.57)]
+        huge_spec = _spec(gap_ms=huge)
+
+    assert (joined, split) == ([2], [1, 1])
+    assert micros == [123_456, 123_556, huge * 1000, 570]
+    assert huge_spec.gap_ms == huge
+    assert not any(active.flags.values())
 
 
 # -- GroupBy validation (F7-2, design 4.2) -----------------------------------------
@@ -619,14 +659,19 @@ def test_equal_expiries_with_unorderable_keys(
     assert {group.reason for group in groups} == {"gap", "size", "end"}
 
 
+def _assert_heap_bound(grouper: Grouper) -> None:
+    """Between calls: at most twice the open groups plus 64, none if none open."""
+    open_groups = grouper.open_groups
+    assert len(grouper._heap) <= (2 * open_groups + 64 if open_groups else 0)
+
+
 def test_windowed_heap_stays_bounded_with_closed_groups() -> None:
     """Groups closed by size leave heap entries behind; they are compacted."""
     grouper = Grouper(_spec(mode="windowed", gap_ms=3_600_000.0, max_group_size=1))
 
     for i in range(5000):
         grouper.add(_entry(str(i), pid=i % 5, us=i), 0.0)
-        # The entry's own group was open when it was pushed.
-        assert len(grouper._heap) <= 2 * (grouper.open_groups + 1) + 64
+        _assert_heap_bound(grouper)
 
 
 def test_windowed_expiry_survives_heap_compaction() -> None:
@@ -635,11 +680,47 @@ def test_windowed_expiry_survives_heap_compaction() -> None:
     grouper.add(_entry("cold", pid=1), 0.0)
     for i in range(400):  # 200 size closes leave 200 heap entries behind
         grouper.add(_entry(f"hot{i}", pid=2, us=1 + i), 0.0)
-    assert len(grouper._heap) <= 2 * (grouper.open_groups + 1) + 64
+        _assert_heap_bound(grouper)
 
     closed = grouper.add(_entry("late", pid=3, us=_ms(20_000)), 0.0)
 
     assert _summary(closed) == [(["cold"], "gap")]
+
+
+@pytest.mark.parametrize("kept", [0, 1], ids=["all", "most"])
+def test_windowed_heap_is_compacted_after_idle_closures(kept: int) -> None:
+    """flush_idle closing 1000 groups, all or all but one, leaves no stale entry.
+
+    The kept group still expires by gap from its rebuilt heap entry.
+    """
+    grouper = Grouper(_spec(mode="windowed", gap_ms=3_600_000.0, idle_flush_ms=100.0))
+    for i in range(1000):
+        grouper.add(_entry(str(i), pid=i, us=i), 0.0)
+    for i in range(kept):
+        grouper.add(_entry("again", pid=i, us=1000), 0.5)  # extended, not pushed
+
+    closed = grouper.flush_idle(0.5)
+
+    assert len(closed) == 1000 - kept
+    assert grouper.open_groups == kept
+    _assert_heap_bound(grouper)
+    if kept:
+        late = _entry("late", pid=5000, us=_ms(3_600_000) + 1001)
+        assert _summary(grouper.add(late, 0.5)) == [(["0", "again"], "gap")]
+
+
+def test_windowed_heap_is_compacted_after_evictions() -> None:
+    """One entry evicting 999 groups by bytes, then joining its own, is no push."""
+    grouper = Grouper(_spec(mode="windowed", gap_ms=3_600_000.0, max_total_bytes=2100))
+    for i in range(1000):
+        grouper.add(_entry("a", pid=i, us=i), 0.0)  # 2 bytes each
+
+    closed = grouper.add(_entry("b", pid=999, us=1000, raw="x" * 2097), 0.0)
+
+    assert [group.reason for group in closed] == ["evicted"] * 999
+    assert (grouper.open_groups, grouper.open_bytes) == (1, 2100)
+    _assert_heap_bound(grouper)
+    assert len(grouper._heap) == 1
 
 
 # -- D-10: idle flush on the host-monotonic clock ----------------------------------
@@ -789,22 +870,44 @@ def test_group_is_frozen_comparable_and_unhashable() -> None:
 
 
 @pytest.mark.parametrize(
-    ("changes", "error"),
+    ("changes", "error", "match"),
     [
-        ({"entries": []}, TypeError),
-        ({"entries": ()}, ValueError),
-        ({"key": [1]}, TypeError),
-        ({"reason": "timeout"}, ValueError),
+        ({"entries": []}, TypeError, "entries must be a tuple"),
+        ({"entries": ()}, ValueError, "at least one"),
+        ({"entries": (42,)}, TypeError, "LogEntry, not int"),
+        ({"entries": ("x", 42)}, TypeError, "LogEntry, not str"),
+        ({"key": [1]}, TypeError, "key must be a tuple"),
+        ({"key": ([],)}, TypeError, "hashable"),
+        ({"key": ((1, {}),)}, TypeError, "hashable"),
+        ({"reason": "timeout"}, ValueError, "one of"),
+        ({"reason": 1}, TypeError, "str, not int"),
+        ({"reason": None}, TypeError, "str, not NoneType"),
+        ({"entries": (), "reason": 1}, TypeError, "reason"),  # types first
     ],
-    ids=["list", "empty", "key-list", "reason"],
+    ids=[
+        "list",
+        "empty",
+        "member",
+        "members",
+        "key-list",
+        "key-list-item",
+        "key-nested",
+        "reason",
+        "reason-int",
+        "reason-none",
+        "types-first",
+    ],
 )
 def test_group_checks_its_fields(
-    changes: dict[str, Any], error: type[Exception]
+    changes: dict[str, Any], error: type[Exception], match: str
 ) -> None:
+    """Design 4.2: TypeError for a type, ValueError for a value."""
     fields: dict[str, Any] = {"key": (1,), "entries": (_entry(),), "reason": "end"}
 
-    with pytest.raises(error):
+    with pytest.raises(error, match=match) as caught:
         LogGroup(**{**fields, **changes})
+
+    assert type(caught.value) is error
 
 
 def test_entry_bytes_counts_the_utf8_line_and_its_terminator() -> None:

@@ -48,9 +48,10 @@ class LogGroup(Sequence[LogEntry]):
 
     Attributes:
         key: The values of the ``GroupBy.keys`` fields, in that order, shared
-            by every entry of the group; ``()`` when ``keys`` is empty.
-        entries: The entries, at least one, in arrival order.
-        reason: Why the group closed.
+            by every entry of the group; ``()`` when ``keys`` is empty. The
+            tuple is hashable.
+        entries: The `LogEntry` objects, at least one, in arrival order.
+        reason: Why the group closed, one of the reasons above.
 
     """
 
@@ -62,10 +63,12 @@ class LogGroup(Sequence[LogEntry]):
     __hash__: ClassVar[None] = None
 
     def __post_init__(self) -> None:
-        """Check the field types and values.
+        """Check the field types, then the values (design 4.2).
 
         Raises:
-            TypeError: ``key`` or ``entries`` is not a tuple.
+            TypeError: ``key`` or ``entries`` is not a tuple, a member of
+                ``entries`` is not a `LogEntry`, ``key`` holds an unhashable
+                value, or ``reason`` is not a str.
             ValueError: ``entries`` is empty or ``reason`` is unknown.
 
         """
@@ -74,6 +77,18 @@ class LogGroup(Sequence[LogEntry]):
             if not isinstance(value, tuple):
                 msg = f"LogGroup.{name} must be a tuple, not {type(value).__name__}"
                 raise TypeError(msg)
+        for entry in self.entries:
+            if not isinstance(entry, LogEntry):
+                msg = f"LogGroup.entries must hold LogEntry, not {type(entry).__name__}"
+                raise TypeError(msg)
+        try:
+            hash(self.key)
+        except TypeError as exc:
+            msg = f"LogGroup.key must hold hashable values: {exc}"
+            raise TypeError(msg) from None
+        if not isinstance(self.reason, str):
+            msg = f"LogGroup.reason must be a str, not {type(self.reason).__name__}"
+            raise TypeError(msg)
         if not self.entries:
             msg = "LogGroup.entries must hold at least one entry"
             raise ValueError(msg)
