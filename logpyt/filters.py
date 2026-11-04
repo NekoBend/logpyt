@@ -17,21 +17,30 @@ a package name raise ValueError, a value of the wrong type raises TypeError.
 
 `And` and `Or` absorb children of their own kind (``a & b & c`` is one `And`
 of three), and every tree is evaluated, walked by `Condition.packages` and
-printed by ``repr`` without recursion, so mixed ``&``/``|`` chains of any
-length work (F7-4). `And` and `Or` short-circuit from left to right, like
-`all` and `any`. A subclass of `And`, `Or` or `Not` that overrides
-``__call__`` is called like any other condition, never taken apart.
+printed by ``repr`` without recursion, so mixed ``&``/``|``/``~`` chains and
+`Where` nodes that wrap a condition nest to any depth (F7-4). `And` and `Or`
+short-circuit from left to right, like `all` and `any`. A subclass of `And`,
+`Or`, `Not` or `Where` that overrides ``__call__`` is called like any other
+condition instead of being evaluated as part of the tree, and one that
+overrides ``__repr__`` prints itself, unless an `And` or `Or` of its own kind
+absorbs it. Because an override of ``__call__``, ``packages()`` or ``__repr__``
+is called, conditions whose classes override them, nested inside each other,
+nest only as deep as the Python stack allows; the built-in classes do not
+recurse.
 
 `Package` matches ``LogEntry.package``, which only package attribution sets. A
 stream attributes the packages of `Condition.packages`: every `Package` in the
-tree, under `Or`, `Not` and a `Where` that wraps a condition too (F5-1). A log
-file carries no attribution, so a `Package` matches none of its entries.
+tree, under `Or`, `Not` and a `Where` that wraps a condition too (F5-1), and
+for a condition anywhere in the tree whose class overrides ``packages()``, what
+that override returns. A log file carries no attribution, so a `Package`
+matches none of its entries.
 """
 
 from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
+from contextvars import ContextVar
 from functools import lru_cache
 from typing import TYPE_CHECKING, Final
 
@@ -91,6 +100,15 @@ _NATIVE_CRASH_PROCESS: Final = re.compile(
     r"pid: [0-9]+, tid: [0-9]+, name: .*  >>> (?P<name>\S+) <<<"
 )
 
+# The overrides of `Condition.packages` that the outermost packages() call in
+# progress has asked, by id(), with what each returned; None outside a call. The
+# walks of nested overrides that call super().packages() share it, so that an
+# override shared below several of them is asked once instead of once per path.
+# Each value holds its condition, so that no id is reused while the call runs.
+_ASKED: Final[ContextVar[dict[int, tuple[Condition, frozenset[str]]] | None]] = (
+    ContextVar("_ASKED", default=None)
+)
+
 
 class Condition(ABC):
     """A predicate over log entries: ``condition(entry)`` is True when it matches.
@@ -125,24 +143,61 @@ class Condition(ABC):
         return Not(self)
 
     def packages(self) -> frozenset[str]:
-        """Return the names of every `Package` in this condition's tree.
+        """Return the packages a stream must attribute for this condition.
 
+        That is the names of every `Package` in this condition's tree.
         `Package` conditions under `Or` and `Not` count too: a stream must
         attribute a package's lines for ``~Package(name)`` to leave them out.
         So does a condition wrapped in `Where`; a plain function is opaque.
+
+        Override it in a condition of your own that matches on
+        ``entry.package``, or that wraps conditions this walk cannot see. For
+        a condition below this one whose class overrides ``packages()``, the
+        walk takes what the override returns and does not look inside that
+        condition; an override may call ``super().packages()`` for the walk of
+        its own tree. In one call, a condition that several parents share is
+        walked once, and an override is asked once however many parents share
+        it, also when overrides that call ``super().packages()`` nest.
         """
+        asked = _ASKED.get()
+        token = None
+        if asked is None:
+            # The outermost call: the overrides that the walks of this call ask
+            # are remembered until it returns.
+            asked = {}
+            token = _ASKED.set(asked)
         names: set[str] = set()
+        # The id() of every condition walked, so that a shared subtree is walked
+        # once: (c & x) | (c & y) nested n times has 3n + 3 conditions but 2**n
+        # paths. Every id stays valid, the tree holds each condition alive.
+        seen: set[int] = set()
         pending: list[Condition] = [self]
-        while pending:
-            node = pending.pop()
-            if isinstance(node, Package):
-                names.update(node.values)
-            elif isinstance(node, _Junction):
-                pending.extend(node.conditions)
-            elif isinstance(node, Not):
-                pending.append(node.condition)
-            elif isinstance(node, Where) and isinstance(node.fn, Condition):
-                pending.append(node.fn)
+        try:
+            while pending:
+                node = pending.pop()
+                if id(node) in seen:
+                    continue
+                seen.add(id(node))
+                # self is always walked: an override that calls super().packages()
+                # gets here with self set to itself. The walk is inline, so that
+                # nested overrides cost two frames each.
+                if node is not self and type(node).packages is not Condition.packages:
+                    answer = asked.get(id(node))
+                    if answer is None:
+                        answer = (node, frozenset(node.packages()))
+                        asked[id(node)] = answer
+                    names.update(answer[1])
+                elif isinstance(node, Package):
+                    names.update(node.values)
+                elif isinstance(node, _Junction):
+                    pending.extend(node.conditions)
+                elif isinstance(node, Not):
+                    pending.append(node.condition)
+                elif isinstance(node, Where) and isinstance(node.fn, Condition):
+                    pending.append(node.fn)
+        finally:
+            if token is not None:
+                _ASKED.reset(token)
         return frozenset(names)
 
 
@@ -152,9 +207,10 @@ class _Junction(Condition):
     __slots__ = ("_flat", "conditions")
 
     conditions: tuple[Condition, ...]
-    # Whether no And, Or or Not that `_combines` is among the conditions, so that
-    # a plain loop evaluates the junction; None until the first call. Computed
-    # lazily because a chain a & b & c & ... builds a junction per operator.
+    # Whether no And, Or, Not or Where that `_combines` is among the conditions,
+    # so that a plain loop evaluates the junction; None until the first call.
+    # Computed lazily because a chain a & b & c & ... builds a junction per
+    # operator.
     _flat: bool | None
 
     def __init__(self, conditions: tuple[Condition, ...]) -> None:
@@ -184,7 +240,7 @@ class And(_Junction):
 
     ``And(a, b)`` is ``a & b``. An `And` among the conditions (`Filter`
     included) contributes its own conditions instead of itself, unless it has
-    none (``Filter()``) or overrides ``__call__``.
+    none (``Filter()``) or overrides ``__call__`` or ``packages()``.
     """
 
     __slots__ = ()
@@ -204,7 +260,8 @@ class Or(_Junction):
     """Matches when at least one of its conditions matches.
 
     ``Or(a, b)`` is ``a | b``. An `Or` among the conditions contributes its own
-    conditions instead of itself, unless it overrides ``__call__``.
+    conditions instead of itself, unless it overrides ``__call__`` or
+    ``packages()``.
     """
 
     __slots__ = ()
@@ -245,14 +302,24 @@ class Not(Condition):
 
 
 def _combines(node: Condition) -> bool:
-    """Whether ``node`` is an `And`, `Or` or `Not` that its built-in ``__call__`` runs.
+    """Whether ``node`` is a combination that its built-in ``__call__`` runs.
 
-    Only such a node is taken apart (flattened and evaluated as a tree node); a
-    subclass that overrides ``__call__`` is called like any other condition.
+    A combination is an `And`, `Or` or `Not`, or a `Where` whose function is an
+    `And`, `Or`, `Not` or `Where` with its built-in ``__call__``. Only such a
+    node is taken apart (evaluated as a tree node, and an `And` or `Or`
+    flattened); a subclass that overrides ``__call__`` is called like any
+    other condition, and so is a `Where` of anything else, which costs one
+    frame more than its function.
     """
     if isinstance(node, _Junction):
         return type(node).__call__ is _Junction.__call__
-    return isinstance(node, Not) and type(node).__call__ is Not.__call__
+    if isinstance(node, Not):
+        return type(node).__call__ is Not.__call__
+    return (
+        isinstance(node, Where)
+        and type(node).__call__ is Where.__call__
+        and type(node.fn).__call__ in _COMBINATION_CALLS
+    )
 
 
 class Tag(Condition):
@@ -572,7 +639,12 @@ class AnrCondition(Condition):
 
 
 class Where(Condition):
-    """Matches entries for which ``fn(entry)`` is true."""
+    """Matches entries for which ``fn(entry)`` is true.
+
+    ``fn`` may be a `Condition`: ``Where(c)`` then matches like ``c``,
+    `Condition.packages` looks into it, and it is evaluated and printed
+    without recursion however deep `Where` nodes nest (F7-4).
+    """
 
     __slots__ = ("fn",)
 
@@ -582,8 +654,9 @@ class Where(Condition):
         """Wrap ``fn``, a function of one `LogEntry`.
 
         A package that ``fn`` compares ``entry.package`` with is not attributed:
-        only `Package` conditions tell a stream which packages to attribute,
-        those of a `Condition` given as ``fn`` included.
+        only `Package` conditions and overrides of `Condition.packages` tell a
+        stream which packages to attribute, those in a `Condition` given as
+        ``fn`` included.
 
         Raises:
             TypeError: ``fn`` is not callable.
@@ -596,10 +669,22 @@ class Where(Condition):
 
     def __call__(self, entry: LogEntry, /) -> bool:
         """Return whether ``fn(entry)`` is true."""
-        return bool(self.fn(entry))
+        fn = self.fn
+        # Only a Where of a Where is taken apart here: an And, Or or Not
+        # evaluates its own tree without recursion, and anything else is a leaf.
+        # The test is on the type, as an isinstance against these ABCs costs
+        # more than calling a leaf.
+        if type(fn).__call__ is Where.__call__:
+            return _evaluate(self, entry)
+        return bool(fn(entry))
 
     def __repr__(self) -> str:
-        return f"Where({self.fn!r})"
+        return _render(self)
+
+
+# The __call__ of each combination; a Where whose function has one of them is a
+# combination too (`_combines`).
+_COMBINATION_CALLS: Final = (_Junction.__call__, Not.__call__, Where.__call__)
 
 
 class Filter(And):
@@ -699,7 +784,8 @@ def _flatten(
 
     A ``kind`` child is already flat, so one level is enough. A child without
     children (``Filter()``) stays, so that ``repr`` still shows it, and so does
-    one that overrides ``__call__`` (`_combines`).
+    one that overrides ``__call__`` (`_combines`) or ``packages()``, so that
+    `Condition.packages` still asks it.
 
     Raises:
         ValueError: ``conditions`` is empty.
@@ -715,6 +801,7 @@ def _flatten(
             isinstance(condition, kind)
             and condition.conditions
             and _combines(condition)
+            and type(condition).packages is Condition.packages
         ):
             flat.extend(condition.conditions)
         else:
@@ -727,10 +814,11 @@ def _evaluate(root: Condition, entry: LogEntry) -> bool:
 
     `And` and `Or` evaluate their children from left to right and stop at the
     first verdict that decides them (False for `And`, True for `Or`), like
-    `all` and `any`; every other condition is called, and so is a combination
-    below ``root`` that overrides ``__call__`` (`_combines`). ``root`` itself
-    is always taken apart: an override that calls ``super().__call__`` gets
-    here with ``root`` set to itself.
+    `all` and `any`; `Not` flips its condition's verdict and a `Where` of a
+    condition passes it on. Every other condition is called, and so is a
+    combination below ``root`` that overrides ``__call__`` (`_combines`).
+    ``root`` itself is always taken apart: an override that calls
+    ``super().__call__`` gets here with ``root`` set to itself.
     """
     # A junction's frame is (its children, the index of the next one, the verdict
     # that decides it); a Not's frame has no children and flips the verdict.
@@ -752,6 +840,12 @@ def _evaluate(root: Condition, entry: LogEntry) -> bool:
             elif combines and isinstance(node, Not):
                 frames.append((None, 0, False))
                 node = node.condition
+            elif (
+                combines and isinstance(node, Where) and isinstance(node.fn, Condition)
+            ):
+                # Where(c) is bool(c(entry)), and every verdict here is a bool
+                # already, so it needs no frame.
+                node = node.fn
             else:
                 verdict = bool(node(entry))
                 break
@@ -771,8 +865,25 @@ def _evaluate(root: Condition, entry: LogEntry) -> bool:
             return verdict
 
 
+def _renders(node: Condition) -> bool:
+    """Whether `_render` takes ``node`` apart: an `And`, `Or`, `Not` or `Where`.
+
+    Only one with the built-in ``__repr__`` is; one that overrides it (`Filter`
+    among them) prints itself.
+    """
+    if isinstance(node, _Junction):
+        return type(node).__repr__ is _Junction.__repr__
+    if isinstance(node, Not):
+        return type(node).__repr__ is Not.__repr__
+    return isinstance(node, Where) and type(node).__repr__ is Where.__repr__
+
+
 def _render(root: Condition) -> str:
-    """The repr of the tree ``root``, built with an explicit stack (F7-4)."""
+    """The repr of the tree ``root``, built with an explicit stack (F7-4).
+
+    ``root`` itself is always taken apart: an override of ``__repr__`` that
+    calls ``super().__repr__()`` gets here with ``root`` set to itself.
+    """
     parts: list[str] = []
     pending: list[Condition | str] = [root]
     while pending:
@@ -780,16 +891,28 @@ def _render(root: Condition) -> str:
         if isinstance(item, str):
             parts.append(item)
             continue
-        if isinstance(item, Filter) or not isinstance(item, _Junction | Not):
+        if item is not root and not _renders(item):
             parts.append(repr(item))
             continue
-        children = item.conditions if isinstance(item, _Junction) else (item.condition,)
+        children: tuple[Condition, ...]
+        if isinstance(item, _Junction):
+            children, opening = item.conditions, f"{type(item).__name__}("
+        elif isinstance(item, Not):
+            children, opening = (item.condition,), f"{type(item).__name__}("
+        elif isinstance(item, Where) and isinstance(item.fn, Condition):
+            children, opening = (item.fn,), "Where("
+        elif isinstance(item, Where):
+            parts.append(f"Where({item.fn!r})")
+            continue
+        else:
+            parts.append(repr(item))
+            continue
         pending.append(")")
         for index in range(len(children) - 1, -1, -1):
             pending.append(children[index])
             if index:
                 pending.append(", ")
-        pending.append(f"{type(item).__name__}(")
+        pending.append(opening)
     return "".join(parts)
 
 

@@ -557,7 +557,436 @@ def test_same_operator_chain_of_10000_is_one_junction() -> None:
     assert condition(_entry(tag="t0")) is False
 
 
+def _tag_is_b(entry: LogEntry) -> bool:
+    return entry.tag == "b"
+
+
+# A step of a chain: ("&", term) or ("|", term) combines the chain with a term,
+# ("~", None) negates it and ("where", None) wraps it in Where.
+type _Step = tuple[str, Condition | None]
+
+
+def _mixed_steps() -> list[_Step]:
+    """10000 steps of a fixed, irregular mix; one term is a Where of a function."""
+    steps: list[_Step] = []
+    for i in range(10_000):
+        kind = (i * i + i // 7) % 6
+        if kind == 0:
+            steps.append(("&", Tag("a")))
+        elif kind == 1:
+            steps.append(("|", Tag("b")))
+        elif kind == 2:
+            steps.append(("~", None))
+        elif kind == 3:
+            steps.append(("|", Package(f"com.example.p{i}")))
+        elif kind == 4:
+            steps.append(("&", Where(_tag_is_b)))  # a plain function: a leaf
+        else:
+            steps.append(("where", None))
+    return steps
+
+
+def _chain(start: Condition, steps: list[_Step]) -> Condition:
+    """The condition that ``steps`` build on ``start``, one operator at a time."""
+    chain = start
+    for kind, term in steps:
+        if kind == "~":
+            chain = ~chain
+        elif kind == "where":
+            chain = Where(chain)
+        elif kind == "&" and term is not None:
+            chain &= term
+        elif term is not None:
+            chain |= term
+    return chain
+
+
+def _chain_verdict(start: Condition, steps: list[_Step], entry: LogEntry) -> bool:
+    """What ``_chain(start, steps)`` must answer for ``entry``, step by step."""
+    verdict = start(entry)
+    for kind, term in steps:
+        if kind == "~":
+            verdict = not verdict
+        elif kind == "&" and term is not None:
+            verdict = verdict and term(entry)
+        elif kind == "|" and term is not None:
+            verdict = verdict or term(entry)
+    return verdict
+
+
+def test_10000_nested_where_do_not_recurse() -> None:
+    """10000 Where(...) around a condition, and a chain of 10000 &, |, ~ and Where
+    steps, are built, evaluated, walked by packages() and printed with 100 frames
+    to spare (F7-4); Where(c) matches like c.
+    """
+    entries = [
+        _entry(tag="a"),
+        _entry(tag="b"),
+        _entry(tag="c"),
+        _entry(tag="c", package="com.a"),
+    ]
+    steps = _mixed_steps()
+    names = {
+        name for _, term in steps if isinstance(term, Package) for name in term.values
+    }
+    wheres = sum(kind == "where" or isinstance(term, Where) for kind, term in steps)
+    expected = [_chain_verdict(Tag("a"), steps, entry) for entry in entries]
+    assert set(expected) == {True, False}, "the chain must yield both verdicts"
+
+    with _recursion_headroom(100):
+        nested: Condition = Package("com.a") | Tag("a")
+        for _ in range(10_000):
+            nested = Where(nested)
+        nested_verdicts = [nested(entry) for entry in entries]
+        nested_packages = nested.packages()
+        nested_text = repr(nested)
+
+        chain = _chain(Tag("a"), steps)
+        verdicts = [chain(entry) for entry in entries]
+        packages = chain.packages()
+        text = repr(chain)
+
+    assert nested_verdicts == [True, False, False, True]
+    assert nested_packages == frozenset({"com.a"})
+    assert nested_text == (
+        "Where(" * 10_000 + "Or(Package('com.a'), Tag('a'))" + ")" * 10_000
+    )
+    assert verdicts == expected
+    assert packages == names
+    assert text.count("Where(") == wheres
+    assert text.count("Package(") == len(names)
+
+
+def test_where_of_a_leaf_is_a_plain_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Where of a leaf condition, a function or a flat Or, alone or in a flat And, is
+    evaluated by plain calls, as cheaply as before Where nodes nested without
+    recursion; a Where of a Where, alone or in an Or, takes the tree walk.
+    """
+    walked: list[Condition] = []
+    evaluate = filters._evaluate
+
+    def walk(root: Condition, entry: LogEntry) -> bool:
+        walked.append(root)
+        return evaluate(root, entry)
+
+    monkeypatch.setattr(filters, "_evaluate", walk)
+    entry, a, b = _entry(tag="a"), Tag("a"), Tag("b")
+    assert Where(a)(entry) is True
+    assert Where(_tag_is_b)(entry) is False
+    assert Where(a | b)(entry) is True
+    assert (a & Where(a) & Where(_tag_is_b))(entry) is False
+    assert walked == []
+
+    twice = Where(Where(a))
+    either = Tag("c") | Where(Where(a))
+    assert twice(entry) is True
+    assert either(entry) is True
+    assert walked == [twice, either]
+
+
+def test_overrides_of_call_and_repr_are_not_taken_apart() -> None:
+    """A Where subclass that overrides __call__ is called, at any depth; an And, Or,
+    Not or Where subclass that overrides __repr__ prints itself when nested, unless
+    an And or Or of its own kind absorbs it, and one whose override calls
+    super().__repr__() prints its own tree.
+    """
+    entry = _entry(tag="a")
+
+    class Inverted(Where):
+        __slots__ = ()
+
+        def __call__(self, entry: LogEntry, /) -> bool:
+            return not super().__call__(entry)
+
+    inverted = Inverted(Tag("a"))
+    assert inverted(entry) is False
+    assert (inverted | Tag("b"))(entry) is False
+    assert Where(Where(inverted))(entry) is False
+    assert (~Where(inverted) & Tag("a"))(entry) is True
+    assert Inverted(Inverted(Where(inverted)))(entry) is False
+
+    class Named(Where):
+        __slots__ = ()
+
+        def __repr__(self) -> str:
+            return "<named>"
+
+    class Short(And):
+        __slots__ = ()
+
+        def __repr__(self) -> str:
+            return f"Short({len(self.conditions)})"
+
+    class Bare(Not):
+        __slots__ = ()
+
+        def __repr__(self) -> str:
+            return "Bare"
+
+    class Marked(Or):
+        __slots__ = ()
+
+        def __repr__(self) -> str:
+            return "!" + super().__repr__()
+
+    assert repr(Named(Tag("a")) | Tag("b")) == "Or(<named>, Tag('b'))"
+    assert repr(Where(Named(Tag("a")))) == "Where(<named>)"
+    assert repr(~Short(Tag("a"), Tag("b"))) == "Not(Short(2))"
+    # an And of its own kind absorbs it, so its __repr__ is not asked
+    assert (
+        repr(Short(Tag("a"), Tag("b")) & Tag("c"))
+        == "And(Tag('a'), Tag('b'), Tag('c'))"
+    )
+    assert repr(Where(Bare(Tag("a"))) & Tag("b")) == "And(Where(Bare), Tag('b'))"
+    assert repr(Marked(Tag("a"), Where(~Tag("b")))) == (
+        "!Marked(Tag('a'), Where(Not(Tag('b'))))"
+    )
+    assert repr(Where(Filter(tag="a"))) == "Where(Filter(tag='a'))"
+
+
 # -- packages() -----------------------------------------------------------------------
+
+
+class _App(Condition):
+    """A condition of a user's own: it wraps a Package where the walk cannot see it,
+    so it names the package in packages().
+    """
+
+    __slots__ = ("_inner",)
+
+    def __init__(self, name: str) -> None:
+        self._inner = Package(name)
+
+    def __call__(self, entry: LogEntry, /) -> bool:
+        return self._inner(entry)
+
+    def packages(self) -> frozenset[str]:
+        return self._inner.values
+
+
+class _WithLauncher(And):
+    """An And that also needs the launcher's lines attributed."""
+
+    __slots__ = ()
+
+    def packages(self) -> frozenset[str]:
+        return super().packages() | {"com.launcher"}
+
+
+def test_packages_takes_the_override_of_a_nested_condition() -> None:
+    """For a condition anywhere in the tree whose class overrides packages(), under &,
+    |, ~ and Where alike, packages() takes what the override returns and does not
+    look inside it; an override may add to super().packages().
+    """
+    app = _App("com.a")
+    assert app.packages() == frozenset({"com.a"})
+    assert (app & Tag("x")).packages() == frozenset({"com.a"})
+    assert (Tag("x") | app).packages() == frozenset({"com.a"})
+    assert (~app).packages() == frozenset({"com.a"})
+    assert Where(app).packages() == frozenset({"com.a"})
+    assert (Where(~app & Tag("x")) | Package("com.b")).packages() == frozenset(
+        {"com.a", "com.b"}
+    )
+
+    class FirstOnly(Or):
+        __slots__ = ()
+
+        def packages(self) -> frozenset[str]:
+            return self.conditions[0].packages()
+
+    first = FirstOnly(Package("com.a"), Package("com.b"))
+    assert first.packages() == frozenset({"com.a"})
+    assert (first & Tag("x")).packages() == frozenset({"com.a"})
+    assert Where(~first).packages() == frozenset({"com.a"})
+
+    launcher = _WithLauncher(Package("com.a"), Tag("x"))
+    assert launcher.packages() == frozenset({"com.a", "com.launcher"})
+    assert (Tag("y") | ~launcher).packages() == frozenset({"com.a", "com.launcher"})
+
+
+def test_combinations_keep_children_that_override_packages() -> None:
+    """An And or Or child whose class overrides packages() stays one child instead of
+    contributing its conditions, so its override still answers; it matches like the
+    built-in.
+    """
+    a, x, error = Package("com.a"), Tag("x"), Level("E")
+    launcher = _WithLauncher(a, x)
+    assert (launcher & error).conditions == (launcher, error)
+    assert And(error, launcher).conditions == (error, launcher)
+    assert (launcher & error).packages() == frozenset({"com.a", "com.launcher"})
+    assert (launcher & error)(_entry(tag="x", package="com.a")) is True
+    assert (launcher & error)(_entry(tag="y", package="com.a")) is False
+
+    class OrLauncher(Or):
+        __slots__ = ()
+
+        def packages(self) -> frozenset[str]:
+            return super().packages() | {"com.launcher"}
+
+    either = OrLauncher(a, x)
+    assert (error | either).conditions == (error, either)
+    assert (error | either).packages() == frozenset({"com.a", "com.launcher"})
+    assert (Level("I") | either)(_entry(tag="x")) is True
+
+
+@pytest.mark.parametrize(
+    "stream_type", [LogStream, AsyncLogStream], ids=["sync", "async"]
+)
+def test_streams_monitor_nested_overrides(
+    stream_type: type[LogStream | AsyncLogStream],
+) -> None:
+    """The 2.x streams start a pid monitor for the packages that overrides of
+    packages() name anywhere in the condition, not only at its root.
+    """
+    condition = (_App("com.a") & Level("E")) | ~Where(_App("com.b"))
+    stream = stream_type(adb_path="adb", filter_by=condition)
+    monitor = stream._pid_monitor
+    assert monitor is not None
+    assert sorted(monitor.packages) == ["com.a", "com.b"]
+
+
+class _Once(Condition):
+    """A leaf whose packages() fails the test when one walk asks it twice."""
+
+    __slots__ = ("calls",)
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, entry: LogEntry, /) -> bool:
+        return entry.package == "com.a"
+
+    def packages(self) -> frozenset[str]:
+        self.calls += 1
+        if self.calls > 1:
+            pytest.fail("packages() walked a shared condition twice")
+        return frozenset({"com.a"})
+
+
+def test_packages_walks_a_shared_subtree_once() -> None:
+    """packages() walks a condition that several parents share once:
+    c = (c & x) | (c & y) nested 40 times has 123 conditions but 2**40 paths to the
+    bottom, whose packages() is asked once. Evaluation still calls a shared
+    condition once per path, in order.
+    """
+    leaf = _Once()
+    x, y = Tag("x"), Tag("y")
+    shared: Condition = leaf
+    for depth in range(1, 41):
+        shared = (shared & x) | (shared & y)
+        if depth in {1, 3, 40}:
+            leaf.calls = 0
+            assert shared.packages() == frozenset({"com.a"}), depth
+            assert leaf.calls == 1, depth
+
+    calls: list[str] = []
+
+    def probe(name: str, *, verdict: bool) -> Where:
+        def check(entry: LogEntry) -> bool:
+            del entry
+            calls.append(name)
+            return verdict
+
+        return Where(check)
+
+    once = probe("s", verdict=True)
+    paths = (once & probe("x", verdict=False)) | (once & probe("y", verdict=True))
+    assert Where(paths)(_entry()) is True
+    assert calls == ["s", "x", "s", "y"]
+
+
+class _AskedOnce(_WithLauncher):
+    """A _WithLauncher that fails the test when one packages() call asks it twice."""
+
+    __slots__ = ("asks",)
+
+    def __init__(self, *conditions: Condition) -> None:
+        super().__init__(*conditions)
+        self.asks = 0
+
+    def packages(self) -> frozenset[str]:
+        self.asks += 1
+        if self.asks > 1:
+            pytest.fail("packages() asked a shared override twice")
+        return super().packages()
+
+
+def test_packages_asks_a_shared_override_once() -> None:
+    """One packages() call asks an override that several parents share once, also
+    when the parents are overrides that call super().packages():
+    c = A(c, x) | A(c, y) nested 40 times has 80 overrides but 2**41 - 2 paths to
+    them. Every call asks again, also after an override raised.
+    """
+    x, y = Tag("x"), Tag("y")
+    shared: Condition = Package("com.a")
+    overrides: list[_AskedOnce] = []
+    for _ in range(40):
+        left, right = _AskedOnce(shared, x), _AskedOnce(shared, y)
+        overrides += [left, right]
+        shared = left | right
+    for _ in range(2):
+        for node in overrides:
+            node.asks = 0
+        assert shared.packages() == frozenset({"com.a", "com.launcher"})
+        assert {node.asks for node in overrides} == {1}
+
+    class Fails(Condition):
+        __slots__ = ("error",)
+
+        def __init__(self) -> None:
+            self.error = True
+
+        def __call__(self, entry: LogEntry, /) -> bool:
+            return False
+
+        def packages(self) -> frozenset[str]:
+            if self.error:
+                raise LookupError
+            return frozenset()
+
+    # asked at both ends, so it is asked before Fails whichever end comes first
+    asked, fails = _AskedOnce(Package("com.b"), x), Fails()
+    condition = Or(asked, fails, asked)
+    with pytest.raises(LookupError):
+        condition.packages()
+    assert asked.asks == 1
+    fails.error = False
+    asked.asks = 0
+    assert condition.packages() == frozenset({"com.b", "com.launcher"})
+    assert asked.asks == 1
+
+
+class _Named(Condition):
+    """A leaf that names its package in packages()."""
+
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __call__(self, entry: LogEntry, /) -> bool:
+        return entry.package == self.name
+
+    def packages(self) -> frozenset[str]:
+        return frozenset({self.name})
+
+
+class _Rebuilt(_Named):
+    """A leaf whose packages() builds a new condition with an override each time."""
+
+    __slots__ = ()
+
+    def packages(self) -> frozenset[str]:
+        return (Tag("q") | _Named(self.name)).packages()
+
+
+def test_packages_does_not_mix_up_conditions_built_during_the_call() -> None:
+    """An override that a packages() call asked is not taken for a condition built
+    later in the same call, which could otherwise reuse its id().
+    """
+    names = [f"com.p{i}" for i in range(20)]
+    condition = Or(*(_Rebuilt(name) for name in names))
+    assert condition.packages() == frozenset(names)
 
 
 def test_packages_collects_every_package_in_the_tree() -> None:
