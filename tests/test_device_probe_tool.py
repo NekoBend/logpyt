@@ -703,7 +703,8 @@ def test_c09_client_wait_is_bounded_and_kills_only_the_client(
         assert time.monotonic() - started < 5
         assert hung
         assert not drained
-        assert proc.returncode == (-signal.SIGKILL if killed else 0)
+        # getattr: signal.SIGKILL does not exist on Windows (ty checks win32 too).
+        assert proc.returncode == (-getattr(signal, "SIGKILL", 9) if killed else 0)
         assert proc.stdout is not None
         assert proc.stderr is not None
         assert proc.stdout.closed
