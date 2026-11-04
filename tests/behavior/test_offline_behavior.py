@@ -1,7 +1,7 @@
 """Behavior of the offline components through the public API.
 
 Covers ``LogFileReader`` / ``read_file``, the format parsers, ``LogEntry``'s
-JSON payload, ``export_logs`` and the groupers. No adb is involved; inputs are
+JSON payload, ``export_logs`` and ``GroupBy``. No adb is involved; inputs are
 real files under ``tmp_path`` or ``LogEntry`` objects built by the test.
 
 Known bugs are written for the correct behavior and marked
@@ -21,11 +21,11 @@ import pytest
 
 from logpyt import (
     Filter,
+    GroupBy,
     LogEntry,
     LogFileReader,
-    LogGrouper,
+    LogGroup,
     ThreadTimeLogParser,
-    WindowedLogGrouper,
     export_logs,
     read_file,
 )
@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from logpyt.models import LogLevel
 
 ExportFormat = Literal["json", "csv"]
+GroupMode = Literal["consecutive", "windowed"]
 
 _T0 = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
 _FORMULA_PREFIXES = ("=", "+", "-", "@")
@@ -73,38 +74,27 @@ def _entry(
     )
 
 
-def _groups(grouper: LogGrouper, entries: Iterable[LogEntry]) -> list[list[LogEntry]]:
-    """Feed ``entries`` then flush; return the emitted groups (emit_mode='group')."""
-    emitted: list[LogEntry | list[LogEntry]] = []
-    for entry in entries:
-        emitted.extend(grouper.process(entry))
-    emitted.extend(grouper.flush())
-    groups: list[list[LogEntry]] = []
-    for item in emitted:
-        assert isinstance(item, list), f"emit_mode='group' emitted {item!r}"
-        groups.append(item)
+def _groups(spec: GroupBy, entries: Iterable[LogEntry]) -> list[LogGroup]:
+    """Group ``entries`` offline; every group, the ones still open at the end too."""
+    groups = list(spec.groups(entries))
+    for group in groups:
+        assert isinstance(group, LogGroup), f"GroupBy.groups yielded {group!r}"
     return groups
 
 
-def _messages(groups: list[list[LogEntry]]) -> list[list[str]]:
+def _messages(groups: Iterable[LogGroup]) -> list[list[str]]:
     return [[entry.message for entry in group] for group in groups]
 
 
 def _built_or_rejected(
-    factory: Callable[[], LogGrouper],
+    factory: Callable[[], GroupBy],
     rejected: tuple[type[Exception], ...] = (ValueError,),
-) -> LogGrouper | None:
-    """Build a grouper; None when construction rejects the arguments."""
+) -> GroupBy | None:
+    """Build a spec; None when construction rejects the arguments."""
     try:
         return factory()
     except rejected:
         return None
-
-
-class _SessionEntry(LogEntry):
-    """A LogEntry carrying an optional custom field, as a custom parser may build."""
-
-    session: str | None = None
 
 
 class _ExportFailedError(Exception):
@@ -674,12 +664,12 @@ def test_export_error_keeps_previous_destination(
     assert dest.read_bytes() == previous
 
 
-# -- groupers ----------------------------------------------------------------------
+# -- grouping ------------------------------------------------------------------------
 
 
 def test_log_grouper_splits_on_key_change_and_time_gap() -> None:
-    """LogGrouper groups consecutive same-key entries; a key change or gap splits."""
-    grouper = LogGrouper(by=["pid"], threshold_ms=10.0, emit_mode="group")
+    """Consecutive grouping: a key change or a time gap splits the group."""
+    spec = GroupBy(keys=("pid",), gap_ms=10.0)
     entries = [
         _entry("a", ms=0, pid=1),
         _entry("b", ms=5, pid=1),
@@ -687,25 +677,27 @@ def test_log_grouper_splits_on_key_change_and_time_gap() -> None:
         _entry("d", ms=500, pid=2),
     ]
 
-    assert _messages(_groups(grouper, entries)) == [["a", "b"], ["c"], ["d"]]
+    groups = _groups(spec, entries)
+
+    assert _messages(groups) == [["a", "b"], ["c"], ["d"]]
+    assert [group.reason for group in groups] == ["key", "gap", "end"]
 
 
 def test_log_grouper_caps_group_size() -> None:
-    """LogGrouper never emits a group larger than max_group_size."""
-    grouper = LogGrouper(
-        by=["pid"], threshold_ms=100.0, emit_mode="group", max_group_size=3
-    )
+    """A group never holds more than max_group_size entries."""
+    spec = GroupBy(keys=("pid",), gap_ms=100.0, max_group_size=3)
     entries = [_entry(str(i), ms=i) for i in range(7)]
 
-    groups = _groups(grouper, entries)
+    groups = _groups(spec, entries)
 
     assert [len(g) for g in groups] == [3, 3, 1]
     assert [e.message for g in groups for e in g] == [str(i) for i in range(7)]
+    assert [group.reason for group in groups] == ["size", "size", "end"]
 
 
 def test_windowed_grouper_keeps_interleaved_keys_apart() -> None:
-    """WindowedLogGrouper keeps interleaved keys in separate groups."""
-    grouper = WindowedLogGrouper(by=["pid"], threshold_ms=100.0, emit_mode="group")
+    """Windowed grouping keeps interleaved keys in separate groups."""
+    spec = GroupBy(keys=("pid",), gap_ms=100.0, mode="windowed")
     entries = [
         _entry("a1", ms=0, pid=1),
         _entry("b1", ms=1, pid=2),
@@ -713,143 +705,97 @@ def test_windowed_grouper_keeps_interleaved_keys_apart() -> None:
         _entry("b2", ms=3, pid=2),
     ]
 
-    groups = _groups(grouper, entries)
+    groups = _groups(spec, entries)
 
     assert sorted(_messages(groups)) == [["a1", "a2"], ["b1", "b2"]]
 
 
 def test_windowed_grouper_emits_window_after_threshold() -> None:
     """A window is emitted when a later entry arrives after its threshold elapsed."""
-    grouper = WindowedLogGrouper(by=["pid"], threshold_ms=10.0, emit_mode="group")
+    spec = GroupBy(keys=("pid",), gap_ms=10.0, mode="windowed")
+    pulled: list[str] = []
 
-    assert grouper.process(_entry("a", ms=0)) == []
-    emitted = grouper.process(_entry("b", ms=50))
+    def source() -> Iterator[LogEntry]:
+        for entry in (_entry("a", ms=0), _entry("b", ms=50)):
+            pulled.append(entry.message)
+            yield entry
 
-    assert [[e.message for e in cast("list[LogEntry]", g)] for g in emitted] == [["a"]]
-    assert _messages(_groups(grouper, [])) == [["b"]]
+    groups = spec.groups(source())
+    first = next(groups)
+
+    assert (_messages([first]), first.reason, pulled) == ([["a"]], "gap", ["a", "b"])
+    assert _messages(groups) == [["b"]]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=TypeError,
-    reason="F7-1: expiry-heap ties compare group keys; None vs str raises TypeError",
-)
-def test_windowed_grouper_tie_with_unorderable_keys() -> None:
+@pytest.mark.parametrize("field", ["package", "uid"])
+def test_windowed_grouper_tie_with_unorderable_keys(
+    field: Literal["package", "uid"],
+) -> None:
     """Same-timestamp entries whose keys cannot be ordered (None vs str) still group.
 
-    Reached through the public API by grouping on an optional field of a
-    LogEntry subclass, as a custom parser may produce.
+    Reached through the public API by grouping on an optional field: ``package``
+    (None or a name) or ``uid`` (None or a number).
     """
-    grouper = WindowedLogGrouper(by=["session"], threshold_ms=100.0, emit_mode="group")
+    spec = GroupBy(keys=(field,), gap_ms=100.0, mode="windowed")
+    value: Any = "com.example" if field == "package" else 10123
     entries = [
-        _SessionEntry(
-            timestamp=_T0,
-            pid=1,
-            tid=1,
-            level="I",
-            tag="T",
-            message=name,
-            raw=name,
-            session=session,
-        )
-        for name, session in (("none", None), ("s1", "s1"))
+        _entry("none").model_copy(update={field: None}),
+        _entry("set").model_copy(update={field: value}),
     ]
 
-    groups = _groups(grouper, entries)
+    groups = _groups(spec, entries)
 
-    assert sorted(_messages(groups)) == [["none"], ["s1"]]
-
-
-_GROUPER_CLASSES = [
-    pytest.param(
-        LogGrouper,
-        id="LogGrouper",
-        marks=pytest.mark.xfail(
-            strict=True,
-            raises=AssertionError,
-            reason="F7-2: the cap is checked only from the 2nd entry; groups of 2",
-        ),
-    ),
-    pytest.param(WindowedLogGrouper, id="WindowedLogGrouper"),
-]
+    assert sorted(_messages(groups)) == [["none"], ["set"]]
 
 
-@pytest.mark.parametrize("grouper_cls", _GROUPER_CLASSES)
+@pytest.mark.parametrize("mode", ["consecutive", "windowed"])
 @pytest.mark.parametrize("max_group_size", [1, 0, -1])
 def test_grouper_tiny_max_group_size_is_rejected_or_respected(
-    grouper_cls: type[LogGrouper], max_group_size: int
+    mode: GroupMode, max_group_size: int
 ) -> None:
-    """max_group_size <= 1 is either rejected or yields groups of one entry."""
-    grouper = _built_or_rejected(
-        lambda: grouper_cls(
-            by=["pid"],
-            threshold_ms=100.0,
-            emit_mode="group",
-            max_group_size=max_group_size,
+    """max_group_size 1 yields groups of one entry; 0 and -1 are rejected."""
+    spec = _built_or_rejected(
+        lambda: GroupBy(
+            keys=("pid",), gap_ms=100.0, mode=mode, max_group_size=max_group_size
         )
     )
-    if grouper is None:
+    if max_group_size < 1:
+        assert spec is None
         return
+    assert spec is not None
 
-    groups = _groups(grouper, [_entry(str(i), ms=i) for i in range(4)])
+    groups = _groups(spec, [_entry(str(i), ms=i) for i in range(4)])
 
     assert [len(g) for g in groups] == [1, 1, 1, 1]
 
 
 @pytest.mark.parametrize("max_groups", [0, -1])
-@pytest.mark.xfail(
-    strict=True,
-    raises=StopIteration,
-    reason="F7-2: max_groups<=0 makes process() raise StopIteration",
-)
 def test_windowed_grouper_nonpositive_max_groups_is_rejected_or_handled(
     max_groups: int,
 ) -> None:
-    """max_groups <= 0 is either rejected or still delivers every entry once."""
-    grouper = _built_or_rejected(
-        lambda: WindowedLogGrouper(
-            by=["pid"], threshold_ms=100.0, emit_mode="group", max_groups=max_groups
-        )
-    )
-    if grouper is None:
-        return
-
-    groups = _groups(grouper, [_entry("a", ms=0, pid=1), _entry("b", ms=1, pid=2)])
-
-    assert sorted(e.message for g in groups for e in g) == ["a", "b"]
+    """max_groups <= 0 is rejected at construction."""
+    with pytest.raises(ValueError, match="max_groups"):
+        GroupBy(keys=("pid",), gap_ms=100.0, mode="windowed", max_groups=max_groups)
 
 
-@pytest.mark.parametrize("grouper_cls", [LogGrouper, WindowedLogGrouper])
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="F7-2: by='pid' becomes ('p', 'i', 'd'), a constant key",
-)
+@pytest.mark.parametrize("mode", ["consecutive", "windowed"])
 def test_grouper_by_bare_string_is_rejected_or_means_that_field(
-    grouper_cls: type[LogGrouper],
+    mode: GroupMode,
 ) -> None:
-    """by='pid' (a bare string) is either rejected or groups by the pid field."""
-    grouper = _built_or_rejected(
-        lambda: grouper_cls(by="pid", threshold_ms=100.0, emit_mode="group"),
-        rejected=(TypeError, ValueError),
-    )
-    if grouper is None:
-        return
+    """keys='pid' (a bare string) is rejected with TypeError (design 4.2)."""
+    bare: Any = "pid"
 
-    groups = _groups(grouper, [_entry("a", ms=0, pid=1), _entry("b", ms=1, pid=2)])
-
-    assert sorted(_messages(groups)) == [["a"], ["b"]]
+    with pytest.raises(TypeError, match="keys"):
+        GroupBy(keys=bare, gap_ms=100.0, mode=mode)
 
 
-@pytest.mark.parametrize("grouper_cls", [LogGrouper, WindowedLogGrouper])
-@pytest.mark.xfail(
-    strict=True,
-    raises=pytest.fail.Exception,
-    reason="F7-2: an emit_mode typo is accepted and silently behaves as 'entry'",
-)
-def test_grouper_rejects_unknown_emit_mode(grouper_cls: type[LogGrouper]) -> None:
-    """An unknown emit_mode (a typo such as 'groups') is rejected at construction."""
-    typo: Any = "groups"
+@pytest.mark.parametrize("mode", ["consecutive", "windowed"])
+def test_grouper_rejects_unknown_emit_mode(mode: str) -> None:
+    """emit_mode is gone (design 2.1): passing it, or a mode typo, is rejected."""
+    removed: dict[str, Any] = {"emit_mode": "group"}
+    typo: Any = mode[:-1]  # "consecutiv", "windowe"
 
-    with pytest.raises((ValueError, TypeError)):
-        grouper_cls(by=["pid"], threshold_ms=100.0, emit_mode=typo)
+    with pytest.raises(TypeError, match="emit_mode"):
+        GroupBy(keys=("pid",), gap_ms=100.0, **removed)
+    with pytest.raises(ValueError, match="mode"):
+        GroupBy(keys=("pid",), gap_ms=100.0, mode=typo)

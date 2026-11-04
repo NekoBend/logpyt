@@ -1,7 +1,11 @@
-import datetime
+"""Windowed grouping, ported from the 2.x WindowedLogGrouper to GroupBy."""
 
-from logpyt.groupers import WindowedLogGrouper
-from logpyt.models import LogEntry
+import datetime
+from typing import Any
+
+from logpyt import GroupBy
+from logpyt._core.grouping import Grouper
+from logpyt.models import LogEntry, LogGroup
 
 
 def create_log_entry(ts, pid, tid, msg):
@@ -16,12 +20,14 @@ def create_log_entry(ts, pid, tid, msg):
     )
 
 
+def _windowed(**changes: Any) -> Grouper:  # noqa: ANN401  (any GroupBy keyword)
+    fields: dict[str, Any] = {"keys": ("pid", "tid"), "mode": "windowed", **changes}
+    return Grouper(GroupBy(**fields))
+
+
 def test_sliding_window_correctness():
     """Verify that groups extend correctly with lazy heap updates."""
-    threshold_ms = 100.0
-    grouper = WindowedLogGrouper(
-        by=["pid", "tid"], threshold_ms=threshold_ms, emit_mode="group"
-    )
+    grouper = _windowed(gap_ms=100.0)
 
     start_ts = datetime.datetime.now(datetime.UTC).replace(microsecond=0, tzinfo=None)
     pid, tid = 100, 200
@@ -29,28 +35,26 @@ def test_sliding_window_correctness():
     # 1. Start a group at T=0
     # Expiry should be T=100
     e1 = create_log_entry(start_ts, pid, tid, "msg1")
-    emitted = grouper.process(e1)
+    emitted = grouper.add(e1, 0.0)
     assert len(emitted) == 0
 
     # 2. Update at T=50.
     # New expiry should be T=150.
-    # Heap still has (100, key) because of lazy push optimization.
+    # The heap still has (100, seq, key): it is replaced lazily.
     e2 = create_log_entry(
         start_ts + datetime.timedelta(milliseconds=50), pid, tid, "msg2"
     )
-    emitted = grouper.process(e2)
+    emitted = grouper.add(e2, 0.0)
     assert len(emitted) == 0
 
     # 3. Update at T=120.
     # Current TS (120) > Heap Expiry (100).
-    # Consumer loop should run, pop (100, key).
-    # It should check buffer, see last entry at T=50, calculate real_expiry=150.
-    # 150 > 120, so it re-pushes (150, key).
-    # Then it processes T=120 update.
+    # The expiry loop pops (100, seq, key), finds the group's real expiry
+    # (150) > 120, and re-pushes it. Then T=120 joins the group.
     e3 = create_log_entry(
         start_ts + datetime.timedelta(milliseconds=120), pid, tid, "msg3"
     )
-    emitted = grouper.process(e3)
+    emitted = grouper.add(e3, 0.0)
 
     # Should NOT flush prematurely
     assert len(emitted) == 0
@@ -60,49 +64,41 @@ def test_sliding_window_correctness():
     e4 = create_log_entry(
         start_ts + datetime.timedelta(milliseconds=300), pid, tid, "msg4"
     )
-    emitted = grouper.process(e4)
+    emitted = grouper.add(e4, 0.0)
 
     assert len(emitted) == 1
     group = emitted[0]
-    assert isinstance(group, list)
-    assert len(group) == 3
-    assert group[0].message == "msg1"
-    assert group[1].message == "msg2"
-    assert group[2].message == "msg3"
+    assert isinstance(group, LogGroup)
+    assert group.reason == "gap"
+    assert [entry.message for entry in group] == ["msg1", "msg2", "msg3"]
 
 
 def test_windowed_grouper_max_group_size_force_flushes():
     """A hot key cannot grow one window past max_group_size; it force-flushes."""
-    grouper = WindowedLogGrouper(
-        by=["pid", "tid"], threshold_ms=100000.0, emit_mode="group", max_group_size=3
-    )
+    grouper = _windowed(gap_ms=100000.0, max_group_size=3)
     start_ts = datetime.datetime.now(datetime.UTC).replace(microsecond=0, tzinfo=None)
 
-    emitted = []
+    emitted: list[LogGroup] = []
     for i in range(7):
         entry = create_log_entry(
             start_ts + datetime.timedelta(milliseconds=i), 100, 200, f"msg{i}"
         )
-        emitted.extend(grouper.process(entry))
+        emitted.extend(grouper.add(entry, 0.0))
 
     # 7 same-key entries within threshold, cap 3 -> two full windows auto-flushed.
-    groups = [g for g in emitted if isinstance(g, list)]
-    assert len(groups) == 2
-    assert all(len(g) == 3 for g in groups)
+    assert [len(g) for g in emitted] == [3, 3]
+    assert {g.reason for g in emitted} == {"size"}
 
     # The 7th entry remains buffered until an explicit flush.
     final = grouper.flush()
     assert len(final) == 1
-    last = final[0]
-    assert isinstance(last, list)
-    assert len(last) == 1
+    assert len(final[0]) == 1
 
 
 def test_windowed_grouper_lru_eviction_on_max_groups():
     """A 3rd distinct key over max_groups=2 evicts (flushes) the LRU key."""
-    threshold_ms = 1000.0
-    grouper = WindowedLogGrouper(
-        by=["tid"], threshold_ms=threshold_ms, emit_mode="group", max_groups=2
+    grouper = Grouper(
+        GroupBy(keys=("tid",), gap_ms=1000.0, mode="windowed", max_groups=2)
     )
 
     start_ts = datetime.datetime.now(datetime.UTC).replace(microsecond=0, tzinfo=None)
@@ -117,57 +113,26 @@ def test_windowed_grouper_lru_eviction_on_max_groups():
         start_ts + datetime.timedelta(milliseconds=20), pid=1, tid=30, msg="C"
     )
 
-    assert grouper.process(e_a) == []
-    assert grouper.process(e_b) == []
+    assert grouper.add(e_a, 0.0) == []
+    assert grouper.add(e_b, 0.0) == []
 
     # Inserting the 3rd distinct key exceeds max_groups=2 and must evict the LRU
     # key (tid=10, "A"), emitting its group.
-    emitted = grouper.process(e_c)
+    emitted = grouper.add(e_c, 0.0)
 
     assert len(emitted) == 1
     group = emitted[0]
-    assert isinstance(group, list)
-    assert len(group) == 1
-    assert group[0].message == "A"
-    assert group[0].tid == 10
+    assert group.reason == "evicted"
+    assert group.key == (10,)
+    assert [entry.message for entry in group] == ["A"]
 
     # The two most-recent keys remain open.
-    assert set(grouper._buffers.keys()) == {(20,), (30,)}
-
-
-def test_windowed_grouper_emit_mode_entry_flattens_on_flush():
-    """emit_mode='entry' yields flat LogEntry items, not list-of-list, on flush."""
-    grouper = WindowedLogGrouper(by=["tid"], threshold_ms=100.0, emit_mode="entry")
-
-    start_ts = datetime.datetime.now(datetime.UTC).replace(microsecond=0, tzinfo=None)
-
-    e1 = create_log_entry(start_ts, pid=1, tid=10, msg="m1")
-    e2 = create_log_entry(
-        start_ts + datetime.timedelta(milliseconds=10), pid=1, tid=10, msg="m2"
-    )
-
-    assert grouper.process(e1) == []
-    assert grouper.process(e2) == []
-
-    emitted = grouper.flush()
-
-    # Two flat LogEntry items, not a single list containing a list.
-    assert len(emitted) == 2
-    messages = []
-    for item in emitted:
-        assert isinstance(item, LogEntry)
-        messages.append(item.message)
-    assert messages == ["m1", "m2"]
+    assert set(grouper._open) == {(20,), (30,)}
 
 
 def test_windowed_grouper_limits_heap_growth_for_hot_key_updates():
     """Repeated updates for one key should not grow heap without bound."""
-    grouper = WindowedLogGrouper(
-        by=["pid", "tid"],
-        threshold_ms=100.0,
-        emit_mode="group",
-        max_groups=64,
-    )
+    grouper = _windowed(gap_ms=100.0, max_groups=64)
 
     start_ts = datetime.datetime.now(datetime.UTC).replace(microsecond=0, tzinfo=None)
 
@@ -178,7 +143,7 @@ def test_windowed_grouper_limits_heap_growth_for_hot_key_updates():
             tid=200,
             msg=f"hot-{i}",
         )
-        grouper.process(entry)
+        grouper.add(entry, 0.0)
 
-    assert len(grouper._buffers) == 1
-    assert len(grouper._heap) <= 64
+    assert grouper.open_groups == 1
+    assert len(grouper._heap) == 1  # one entry per open group, replaced lazily

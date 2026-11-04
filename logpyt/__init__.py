@@ -61,8 +61,8 @@ from .filters import (
     Tag,
     Where,
 )
-from .groupers import LogGrouper, WindowedLogGrouper
-from .models import LogEntry
+from .groupers import GroupBy
+from .models import LogEntry, LogGroup
 from .parsers import LogParser, ThreadTimeLogParser
 from .readers import LogFileReader, read_file
 from .streams import AsyncLogStream, AsyncStreamHandle, LogStream, StreamHandle
@@ -85,11 +85,12 @@ __all__ = [
     "CrashCondition",
     "Filter",
     "Gap",
+    "GroupBy",
     "IncompleteCaptureError",
     "Level",
     "LogEntry",
     "LogFileReader",
-    "LogGrouper",
+    "LogGroup",
     "LogParser",
     "LogStream",
     "LogStreamError",
@@ -116,7 +117,6 @@ __all__ = [
     "ThreadTimeLogParser",
     "UsageError",
     "Where",
-    "WindowedLogGrouper",
     "enable_debug",
     "export_logs",
     "read_file",
