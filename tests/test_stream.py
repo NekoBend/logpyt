@@ -105,12 +105,12 @@ def test_stream_context_manager(mock_popen, mocker) -> None:
     """Test using LogStream as a context manager."""
     mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
 
-    with LogStream() as handle:
-        # Make the process wait block so we can catch the RUNNING state
-        mock_popen.return_value.wait.side_effect = lambda *args, **kwargs: time.sleep(
-            0.5
-        )
+    # Make the process wait block so we can catch the RUNNING state. Set it
+    # before the stream starts: set inside the block, the reader can reach
+    # EOF and stop the stream before the loop below sees RUNNING.
+    mock_popen.return_value.wait.side_effect = lambda *args, **kwargs: time.sleep(0.5)
 
+    with LogStream() as handle:
         # Wait for state to become RUNNING
         start_time = time.time()
         while handle.state != StreamState.RUNNING:

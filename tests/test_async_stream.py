@@ -8,6 +8,7 @@ import pytest
 from logpyt.exceptions import LogStreamInternalError, LogStreamTimeoutError
 from logpyt.models import LogEntry
 from logpyt.streams.async_stream import AsyncLogStream, AsyncPidMonitor, StreamState
+from tests.conftest import async_wait_until
 
 # Fixtures
 
@@ -658,8 +659,17 @@ async def test_auto_reconnect(mock_resolve_adb, mock_create_subprocess):
 
     await stream.start()
 
-    # Wait for a few reconnections
-    await asyncio.sleep(0.1)
+    # Wait (bounded) until a reconnection has completed:
+    # RUNNING -> RECONNECTING -> RUNNING.
+    await async_wait_until(
+        lambda: (
+            sum(
+                s in {StreamState.RUNNING, StreamState.RECONNECTING}
+                for s in state_changes
+            )
+            >= 3
+        )
+    )
 
     await stream.stop()
     await stream.join(timeout=1.0)
