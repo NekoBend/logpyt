@@ -13,6 +13,11 @@ server process from ``/proc``: parent, process group, session, fds 0-2 and
 whether it holds one of the client's pipes. The last run leaves a server
 running. Standard library only.
 
+A client whose pipes stay open past the 20 s wait (it still runs, or a server
+it started holds them) is killed, the client only, never the server, which
+serves every adb user of this host; the remaining output is then read for at
+most ``DRAIN_S`` seconds (:func:`finish_client`).
+
 The answer holds for Linux only (it reads ``/proc``). Whether an adb server
 that our client starts on Windows inherits the client's pipe handles is not
 measured here (``tests/fixtures/device/FINDINGS.md``, open items).
@@ -27,6 +32,8 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+
+DRAIN_S = 5.0
 
 
 def servers() -> list[int]:
@@ -75,6 +82,40 @@ def describe(pid: int) -> dict[str, Any]:
     }
 
 
+def finish_client(
+    proc: subprocess.Popen[bytes], timeout: float, drain: float = DRAIN_S
+) -> tuple[bytes, bool, bool]:
+    """Wait for the client and its pipes; return ``(stderr, hung, drained)``.
+
+    ``hung``: the pipes were still open after ``timeout``. The client is then
+    killed if it still runs (only the client: a server it started is left
+    alone) and reaped, and what is left in the pipes is read for at most
+    ``drain`` seconds. ``drained`` is false when something still held a pipe
+    then; the pipes are closed either way (``communicate`` reads them in this
+    thread, so nothing else is blocked on them) and the output read so far is
+    returned.
+    """
+    try:
+        _, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        pass
+    else:
+        return err, False, True
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait()
+    try:
+        _, err = proc.communicate(timeout=drain)
+    except subprocess.TimeoutExpired as exc:
+        err = exc.stderr or b""
+    else:
+        return err, True, True
+    for pipe in (proc.stdout, proc.stderr):
+        if pipe is not None:
+            pipe.close()
+    return err, True, False
+
+
 def one_run(adb: str, *, new_session: bool) -> dict[str, Any]:
     """Stop the server, let ``adb devices`` start it, describe the new server."""
     subprocess.run([adb, "kill-server"], capture_output=True, timeout=20, check=False)
@@ -100,13 +141,7 @@ def one_run(adb: str, *, new_session: bool) -> dict[str, Any]:
         f"pipe:[{os.fstat(proc.stdout.fileno()).st_ino}]",
         f"pipe:[{os.fstat(proc.stderr.fileno()).st_ino}]",
     }
-    try:
-        _, err = proc.communicate(timeout=20)
-        hung = False
-    except subprocess.TimeoutExpired:
-        hung = True
-        proc.kill()
-        _, err = proc.communicate()
+    err, hung, drained = finish_client(proc, timeout=20)
     elapsed = time.monotonic() - start
     found = []
     for pid in servers():
@@ -122,6 +157,7 @@ def one_run(adb: str, *, new_session: bool) -> dict[str, Any]:
         "client_pgid": client_pgid,
         "client_rc": proc.returncode,
         "client_hung": hung,
+        "client_drained": drained,
         "client_s": round(elapsed, 3),
         "client_stderr": err.decode(errors="replace").splitlines(),
         "servers": found,

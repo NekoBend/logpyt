@@ -7,6 +7,8 @@ recording can show, such as an edge case that a live run hits only sometimes.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from tests import device_facts as facts
@@ -44,6 +46,43 @@ def test_recordings_stay_small_and_hold_no_host_paths():
     assert sum(path.stat().st_size for path in files) < 1_000_000
     for directory in {path.parent for path in files}:
         facts.check_fixture_hygiene(directory)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/home/alice/android-sdk/platform-tools/adb kill-server",
+        "HOME=/home/bob",
+        "/Users/carol/Library/Android/sdk/platform-tools/adb",
+        "/root/android-sdk/platform-tools/adb",
+        "C:\\Users\\dave\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe",
+        "c:/users/erin/adb.exe",
+        "/tmp/claude-1000/scratchpad/adb",  # noqa: S108
+        "Installed as /opt/android/platform-tools/adb",
+    ],
+)
+def test_hygiene_check_rejects_host_paths(tmp_path, text):
+    path = tmp_path / "C04_test.json"
+    path.write_text(json.dumps({"steps": [{"argv": [text]}]}), encoding="utf-8")
+    with pytest.raises(AssertionError, match=r"C04_test\.json contains"):
+        facts.check_fixture_hygiene(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "~/android-sdk/platform-tools/adb kill-server",
+        "<vm-adb> kill-server; sleep 1; <vm-adb> start-server",
+        "/data/user/0/com.android.settings",
+        "/system/bin/logcat",
+        "/data/home/x",
+        "/sysroot/lib",
+    ],
+)
+def test_hygiene_check_accepts_device_paths_and_the_placeholder(tmp_path, text):
+    path = tmp_path / "C04_test.json"
+    path.write_text(json.dumps({"steps": [{"argv": [text]}]}), encoding="utf-8")
+    facts.check_fixture_hygiene(tmp_path)
 
 
 def test_findings_name_every_recording():
@@ -138,8 +177,46 @@ def test_flood_lines_are_dropped_at_the_source_and_reported_as_liblog_events():
 
 def test_c05_check_rejects_a_hole_followed_by_newer_lines():
     rec = load(level_dir(24), "C05")
-    rec["facts"]["fast"]["stalled_reader"]["saw_end"] = True
+    stalled = rec["facts"]["fast"]["stalled_reader"]
+    stalled["saw_end"] = True
+    stalled["lines_read"] += 1  # the end marker line
     with pytest.raises(AssertionError, match="end marker came after the hole"):
+        facts.check_c05(rec)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (lambda r: r["control_reader"].update(received=149999), "received \\+ missing"),
+        (
+            lambda r: r["stalled_reader"].update(missing_ranges=[[74146, 149990]]),
+            "lengths",
+        ),
+        (
+            lambda r: r["stalled_reader"].update(
+                received=74145, missing=75855, missing_ranges=[[74146, 149999]]
+            ),
+            "lengths",
+        ),
+        (
+            lambda r: r["stalled_reader"].update(lines_read=74000),
+            "fewer lines read",
+        ),
+    ],
+)
+def test_c05_check_reconciles_the_sequence_summary(change, message):
+    rec = load(level_dir(24), "C05")
+    change(rec["facts"]["fast"])
+    with pytest.raises(AssertionError, match=message):
+        facts.check_c05(rec)
+
+
+def test_c05_check_needs_the_hole_to_start_where_the_prefix_ends():
+    rec = load(level_dir(24), "C05")
+    stalled = rec["facts"]["fast"]["stalled_reader"]
+    # Consistent counts, but lines 0-9 missing and the rest of the tail came.
+    stalled["missing_ranges"] = [[0, 75853]]
+    with pytest.raises(AssertionError, match="not the tail after the prefix"):
         facts.check_c05(rec)
 
 
@@ -151,17 +228,150 @@ def test_c06_check_accepts_a_notice_at_either_end_of_the_dump():
     facts.check_c06(rec)
 
 
+def _lose_since_now_marker(rec):
+    reader = step(rec, "marker_then_reader_1")
+    reader["stdout"] = reader["stdout"][:1]  # the divider only
+    reader["stdout_total_lines"] = 1
+    rec["facts"]["marker_written_then_reader_delivered"][1] = False
+
+
+def _dup_quiet_marker(rec):
+    reader = step(rec, "quiet_filter")
+    reader["stdout"].append(reader["stdout"][-1])
+    reader["stdout_total_lines"] += 1
+
+
+def _set_lines_before_marker(rec, lines, first_byte_s):
+    # The quiet reader's output, its byte count and its first byte, consistently.
+    reader = step(rec, "quiet_filter")
+    marker = body(reader["stdout"])
+    reader["stdout"] = [*lines, *marker]
+    reader["stdout_total_lines"] = len(reader["stdout"])
+    reader["bytes_read"] = sum(len(line.encode()) + 1 for line in reader["stdout"])
+    reader["first_byte_s"] = first_byte_s
+    quiet = rec["facts"]["quiet_reader"]
+    quiet["lines_before_marker"] = list(lines)
+    quiet["bytes_before_marker"] = sum(len(line.encode()) + 1 for line in lines)
+
+
 def test_c10_check_accepts_any_dividers_before_the_marker_on_24_only():
     rec = load(level_dir(24), "C10")
-    quiet = rec["facts"]["quiet_reader"]
-    quiet["lines_before_marker"] = [
-        "--------- beginning of system",
-        "--------- beginning of main",
-    ]
+    dividers = ["--------- beginning of system", "--------- beginning of main"]
+    _set_lines_before_marker(rec, dividers, 0.05)
     facts.check_c10(rec)
-    quiet["lines_before_marker"] = []
+    _set_lines_before_marker(rec, [], 4.03)
     with pytest.raises(AssertionError, match="no divider"):
         facts.check_c10(rec)
+
+
+@pytest.mark.parametrize(
+    ("level", "change", "message"),
+    [
+        # A partial line before the marker: bytes, not only lines.
+        (
+            36,
+            lambda r: r["facts"]["quiet_reader"].update(bytes_before_marker=9),
+            "not whole lines",
+        ),
+        # Nothing before the marker, but a first byte before it was written.
+        (
+            36,
+            lambda r: step(r, "quiet_filter").update(first_byte_s=0.05),
+            "before the marker was written",
+        ),
+        (24, _dup_quiet_marker, "past the filter"),
+        (
+            24,
+            lambda r: step(r, "log_marker").update(argv=["shell", "log -t x other"]),
+            "marker's tag",
+        ),
+        # %N support comes from the date output, not the stored flag.
+        (36, lambda r: r["facts"].update(date_N_supported=False), "disagrees"),
+        (24, lambda r: step(r, "date_s_N").update(rc=1), "rc 1"),
+        (
+            24,
+            lambda r: r["facts"].update(spawn_to_first_byte_s=[0.1, 0.1, 0.1]),
+            "disagrees with the steps",
+        ),
+    ],
+)
+def test_c10_check_rejects_an_inconsistent_recording(level, change, message):
+    rec = load(level_dir(level), "C10")
+    change(rec)
+    with pytest.raises(AssertionError, match=message):
+        facts.check_c10(rec)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        # A failed or empty T + 1 us read no longer passes vacuously.
+        (lambda r: step(r, "dump_from_T_plus_1us").update(rc=1), "rc 1"),
+        (lambda r: step(r, "dump_from_T_plus_1us").update(stdout=[]), "no line"),
+        (lambda r: step(r, "dump_from_T").update(stdout=[]), "no line"),
+        # A reference line after T that the T + 1 us read did not return.
+        (
+            lambda r: step(r, "dump_from_T_plus_1us")["stdout"].pop(2),
+            "not returned",
+        ),
+        # A line at T in the T + 1 us read.
+        (
+            lambda r: step(r, "dump_from_T_plus_1us")["stdout"].insert(
+                1, step(r, "dump_from_T")["stdout"][1]
+            ),
+            "a line below -T",
+        ),
+        (lambda r: step(r, "dump_from_2001")["stdout"].pop(1), "skipped entries"),
+        (lambda r: step(r, "dump_without_T").update(rc=1), "ring start: rc"),
+        # The stored flag must agree with the captured lines ...
+        (
+            lambda r: step(r, "marker_then_reader_1").update(
+                stdout=[], stdout_total_lines=0
+            ),
+            "flags disagree",
+        ),
+        # ... and the marker must have come.
+        (_lose_since_now_marker, "not delivered"),
+        (lambda r: step(r, "marker_first_2").update(rc=1), "rc 1"),
+    ],
+)
+@pytest.mark.parametrize("level", LEVELS)
+def test_c02_check_reads_the_captured_lines(level, change, message):
+    rec = load(level_dir(level), "C02")
+    change(rec)
+    with pytest.raises(AssertionError, match=message):
+        facts.check_c02(rec)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (lambda r: step(r, "dumpsys_package").update(rc=1), "rc 1"),
+        (lambda r: step(r, "dumpsys_package").update(stdout=[]), "records"),
+        # The package's own uid differs from its record in the full listing.
+        (
+            lambda r: step(r, "dumpsys_package")["stdout"].__setitem__(
+                1, "    appId=1001"
+            ),
+            "com.android.settings",
+        ),
+        (lambda r: r["facts"].update(dumpsys_packages=249), "record count"),
+    ],
+)
+def test_c03_check_validates_the_package_lookup(change, message):
+    rec = load(level_dir(36), "C03")
+    change(rec)
+    with pytest.raises(AssertionError, match=message):
+        facts.check_c03(rec)
+
+
+def test_c03_dumpsys_lists_records_and_fewer_distinct_names_on_36():
+    # Three packages have two records each in the API 36 listing (FINDINGS).
+    rec = load(level_dir(36), "C03")
+    records = facts._dumpsys_records(step(rec, "dumpsys_package_packages")["stdout"])
+    names = [name for name, _, _ in records]
+    assert (len(names), len(set(names))) == (252, 249)
+    assert rec["facts"]["dumpsys_packages"] == 252, "the stored count is of records"
 
 
 @pytest.mark.parametrize("key", ["R1", "C03", "C10"])
