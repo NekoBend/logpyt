@@ -16,6 +16,7 @@ jobs:
   check:
     name: check (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -31,7 +32,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --frozen
+        run: uv sync --locked
 
       - name: Lint (ruff)
         run: uv run ruff check .
@@ -44,3 +45,33 @@ jobs:
 
       - name: Tests (pytest)
         run: uv run pytest -q
+
+  package:
+    name: package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Install the wheel outside the checkout and import it
+        shell: bash
+        run: |
+          wheel=$(ls "$GITHUB_WORKSPACE"/dist/*.whl)
+          cd "$RUNNER_TEMP"
+          uv venv smoke
+          uv pip install --python smoke "$wheel"
+          py=smoke/bin/python
+          [ -x "$py" ] || py=smoke/Scripts/python.exe
+          "$py" -I -c "import importlib.metadata as m, logpyt; assert m.version('logpyt') == logpyt.__version__, (m.version('logpyt'), logpyt.__version__); assert 'site-packages' in logpyt.__file__, logpyt.__file__; print('logpyt', logpyt.__version__, 'from', logpyt.__file__)"
