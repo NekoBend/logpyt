@@ -8,9 +8,12 @@ Every test collected under this directory gets the ``device`` marker, and an
 autouse fixture skips it unless ``LOGPYT_DEVICE`` is set, and skips it with the
 reason when 127.0.0.1:5037 does not accept a TCP connection, whether or not
 the test uses ``probe_ctx``: the device tier talks to an adb server reached
-through a tunnel and never lets an adb client start a server of its own
-(``tools/device_probe.py`` also checks the port before every adb call and fails
-with ``TunnelDownError`` if the tunnel drops mid-run).
+through a tunnel and never lets an adb client start a server of its own.
+``tools/device_probe.py`` gives every adb child
+``ADB_SERVER_SOCKET=tcp:127.0.0.1:5037``, with which the client does not
+start a server even when the tunnel drops mid-run, and raises
+``TunnelDownError`` when the port check before a call fails or adb reports
+that no server answered.
 """
 
 from __future__ import annotations

@@ -25,9 +25,12 @@ import json
 import re
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "device"
 LEVELS = (24, 36)
@@ -290,23 +293,123 @@ def check_r6(rec: dict[str, Any]) -> None:
 # -- C02-C12 -----------------------------------------------------------------
 
 
+def _t_arg(argv: list[str]) -> int:
+    """The ``-T`` value of a logcat argv, in epoch microseconds."""
+    return parse_t(argv[argv.index("-T") + 1])
+
+
+def _check_read_from(
+    rec: dict[str, Any], name: str, start: int, reference: list[str]
+) -> list[str]:
+    """A ``-T <start>`` read: what it captured is the reference from ``start`` on.
+
+    The stored stdout is the read's first 60 lines and the stored reference
+    the lines around the boundary, so the comparison covers the span both
+    hold: every reference line in ``[start, end of both]`` was returned, and
+    nothing below ``start`` was.
+    """
+    s = step(rec, name)
+    assert s["argv"][-2] == "-T"
+    assert _t_arg(s["argv"]) == start
+    if s.get("live"):
+        assert s["rc"] is None, f"C02 {name}: the live reader exited by itself"
+    else:
+        assert s["rc"] == 0, f"C02 {name}: rc {s['rc']}"
+    returned = body(s["stdout"])
+    assert returned, f"C02 {name}: no line returned"
+    keys = [epoch_us(line) for line in returned]
+    assert min(keys) >= start, f"C02 {name}: a line below -T"
+    last = keys[-1]
+    whole = s["stdout_total_lines"] == len(s["stdout"])
+
+    def compared(key: int) -> bool:
+        # A cut read may stop inside the group of lines at its last timestamp.
+        return start <= key <= epoch_us(reference[-1]) and (
+            key <= last if whole else key < last
+        )
+
+    expected = Counter(line for line in reference if compared(epoch_us(line)))
+    assert expected, f"C02 {name}: no reference line in the compared span"
+    missing = expected - Counter(returned)
+    assert not missing, f"C02 {name}: reference lines not returned: {list(missing)}"
+    # Computed by the tool on the whole read, which is not stored: check that
+    # it agrees with the stored part.
+    facts = rec["facts"][name]
+    assert facts["first_key_returned"] == keys[0]
+    assert facts["lines_below_boundary"] == 0
+    assert len(returned) <= facts["lines_returned"] <= s["stdout_total_lines"]
+    return returned
+
+
+def _check_since_now(rec: dict[str, Any]) -> None:
+    """The since="now" order: marker written, then a ``-T <clock - 1 s>`` reader.
+
+    Each reader's captured lines (stored whole) hold the marker of its tag,
+    at or after its ``-T``; the stored booleans must agree.
+    """
+    delivered = []
+    for i in range(3):
+        marker = step(rec, f"marker_first_{i}")
+        assert marker["rc"] == 0, f"C02 marker_first_{i}: rc {marker['rc']}"
+        _, _, tag, text = marker["argv"][-1].split()  # log -t <tag> m0
+        reader = step(rec, f"marker_then_reader_{i}")
+        assert reader["argv"][-2:] == ["-s", f"{tag}:V"]
+        assert reader["stdout_total_lines"] == len(reader["stdout"])
+        found = [m for line in body(reader["stdout"]) if (m := u1a(line))["tag"] == tag]
+        assert all(m["msg"].rstrip() == text for m in found), found
+        assert all(epoch_us(m.string) >= _t_arg(reader["argv"]) for m in found)
+        delivered.append(len(found) == 1)
+    assert rec["facts"]["marker_written_then_reader_delivered"] == delivered, (
+        "the stored delivery flags disagree with the captured lines"
+    )
+    assert delivered == [True, True, True], "the marker was not delivered"
+
+
 def check_c02(rec: dict[str, Any]) -> None:
     """C02: ``-T <sec>.<usec>`` returns every line at T, none at T exactly +1 us."""
     t = parse_t(rec["facts"]["T"])
-    reference = body(step(rec, "reference")["stdout"])
+    ref_step = step(rec, "reference")
+    assert ref_step["rc"] == 0
+    reference = body(ref_step["stdout"])
     at_t = Counter(line for line in reference if epoch_us(line) == t)
     assert at_t, "the boundary timestamp is not in the reference"
+    # The tool stores every boundary line plus ten on each side, so this count
+    # is recomputed from the stored lines.
+    for name in ("dump_from_T", "dump_from_T_plus_1us", "live_from_T"):
+        assert rec["facts"][name]["boundary_lines_in_reference"] == at_t.total()
     for name in ("dump_from_T", "live_from_T"):
-        returned = body(step(rec, name)["stdout"])
-        assert not at_t - Counter(returned), f"C02 {name}: not inclusive at T"
+        returned = _check_read_from(rec, name, t, reference)
         assert epoch_us(returned[0]) == t, f"C02 {name}: first line is not at T"
-    above = body(step(rec, "dump_from_T_plus_1us")["stdout"])
-    assert not any(epoch_us(line) == t for line in above), "-T T+1us returned T"
-    early = rec["facts"]["before_ring_start"]
-    assert early["rc"] == 0
-    assert early["same_first_entry"], "-T before the ring start returns the whole ring"
-    # The since="now" order (marker, then -T <clock - 1 s>) delivered every time.
-    assert rec["facts"]["marker_written_then_reader_delivered"] == [True, True, True]
+        assert rec["facts"][name]["boundary_lines_missing"] == 0
+    # No line at T: _check_read_from finds none below T + 1 us.
+    _check_read_from(rec, "dump_from_T_plus_1us", t + 1, reference)
+    assert rec["facts"]["dump_from_T_plus_1us"]["boundary_lines_missing"] == (
+        at_t.total()
+    )
+    _check_before_ring_start(rec)
+    _check_since_now(rec)
+
+
+def _check_before_ring_start(rec: dict[str, Any]) -> None:
+    """``-T 1000000000.000000`` (2001) returns the ring from its first entry."""
+    early, full = step(rec, "dump_from_2001"), step(rec, "dump_without_T")
+    assert early["argv"][-2:] == ["-T", "1000000000.000000"]
+    assert "-T" not in full["argv"]
+    assert early["rc"] == full["rc"] == 0, (
+        f"C02 before the ring start: rc {early['rc']} and {full['rc']}"
+    )
+    early_body, full_body = body(early["stdout"]), body(full["stdout"])
+    assert early_body, "-T before the ring start returned nothing"
+    assert early_body[0] == full_body[0], "-T before the ring start skipped entries"
+    # Only the first lines are stored; the line counts the tool computed on
+    # the whole dumps must agree with the stored totals (dividers aside: at
+    # most one per buffer, and there are 8 buffers).
+    facts = rec["facts"]["before_ring_start"]
+    assert facts["rc"] == 0
+    assert facts["same_first_entry"]
+    for count, s in (("lines", early), ("lines_without_T", full)):
+        assert 0 <= s["stdout_total_lines"] - facts[count] <= 8, (count, facts)
+    assert facts["lines"] > 1000
 
 
 def check_c03(rec: dict[str, Any]) -> None:
@@ -334,19 +437,86 @@ def check_c03(rec: dict[str, Any]) -> None:
     assert len(names) > 50
     for name in names:
         assert PACKAGE_NAME.match(name), f"package name {name!r} fails the F5-3 grammar"
-    dumpsys = step(rec, "dumpsys_package_packages")["stdout"]
-    keys = {
-        line.strip().partition("=")[0]
-        for line in dumpsys
-        if line.strip().startswith(("userId=", "appId="))
-    }
+    full = step(rec, "dumpsys_package_packages")
+    assert full["rc"] == 0
+    records = _dumpsys_records(full["stdout"])
+    keys = {key for _, key, _ in records}
     assert len(keys) == 1, f"dumpsys package packages: uid keys {keys}"
+    by_name: dict[str, set[int]] = {}
+    for name, _, uid in records:
+        by_name.setdefault(name, set()).add(uid)
+    assert all(len(uids) == 1 for uids in by_name.values()), "one uid per name"
+    _check_record_counts(rec, records)
+    if not no_u_option:
+        # FINDINGS: every uid from pm list packages -U equals dumpsys's.
+        for line in listing["stdout"]:
+            m = PM_U_LINE.match(line)
+            assert m
+            assert by_name.get(m["name"]) == {int(m["uid"])}, line
+    key, uid = _check_dumpsys_one_package(rec, by_name)
+    assert key in keys
     mapping = rec["facts"]["app_uid_tokens_to_packages"]
     assert mapping
     assert all(mapping.values()), "every app uid in the log maps to a package"
     api = recorded_level(rec, "the package-to-uid commands")
     assert no_u_option is (api == 24), "pm list packages -U exists on 36 only"
     assert keys == {{24: "userId", 36: "appId"}[api]}
+    assert (key, uid) == ({24: "userId", 36: "appId"}[api], 1000), "Settings is system"
+
+
+_DUMPSYS_PACKAGE = re.compile(r"^  Package \[(?P<name>[^\]]+)\]")
+_DUMPSYS_UID = re.compile(r"^    (?P<key>userId|appId)=(?P<uid>\d+)")
+
+
+def _dumpsys_records(lines: list[str]) -> list[tuple[str, str, int]]:
+    """``(name, uid key, uid)`` per package record of ``dumpsys package``.
+
+    The uid is the first ``userId=``/``appId=`` line after the record's
+    ``Package [<name>]`` header.
+    """
+    records: list[tuple[str, str, int]] = []
+    current: str | None = None
+    for line in lines:
+        if m := _DUMPSYS_PACKAGE.match(line):
+            current = m["name"]
+        elif current is not None and (m := _DUMPSYS_UID.match(line)):
+            records.append((current, m["key"], int(m["uid"])))
+            current = None
+    return records
+
+
+def _check_record_counts(
+    rec: dict[str, Any], records: list[tuple[str, str, int]]
+) -> None:
+    """The tool's counts: records (a name can have two) and distinct names."""
+    facts = rec["facts"]
+    # Recordings before the distinct count was added call the record count
+    # dumpsys_packages.
+    stored = facts.get("dumpsys_package_records", facts.get("dumpsys_packages"))
+    assert stored == len(records), "the stored record count disagrees with the listing"
+    if "dumpsys_package_names" in facts:
+        assert facts["dumpsys_package_names"] == len({name for name, _, _ in records})
+
+
+def _check_dumpsys_one_package(
+    rec: dict[str, Any], by_name: dict[str, set[int]]
+) -> tuple[str, int]:
+    """``dumpsys package <pkg>`` (the lookup FINDINGS recommends for PR-11).
+
+    Its uid, parsed from the package's own record, equals the uid of the
+    package's record in the full listing; returns ``(uid key, uid)``.
+    """
+    s = step(rec, "dumpsys_package")
+    command = s["argv"][-1].split()
+    assert command[:2] == ["dumpsys", "package"]
+    assert len(command) == 3
+    package = command[2]
+    assert s["rc"] == 0, f"dumpsys package {package}: rc {s['rc']}"
+    own = [r for r in _dumpsys_records(s["stdout"]) if r[0] == package]
+    assert len(own) == 1, f"dumpsys package {package}: records {own}"
+    _, key, uid = own[0]
+    assert by_name.get(package) == {uid}, (package, uid, by_name.get(package))
+    return key, uid
 
 
 def check_c08(rec: dict[str, Any]) -> None:
@@ -357,18 +527,102 @@ def check_c08(rec: dict[str, Any]) -> None:
         assert PROCESS_LINE.match(line), f"-v process line {line!r}"
 
 
+def _line_bytes(lines: list[str]) -> int:
+    """The bytes ``lines`` were read from: UTF-8, one LF each."""
+    return sum(len(line.encode()) + 1 for line in lines)
+
+
+# Recordings before marker_written_s was stored: the tool slept 4 s after the
+# quiet reader's spawn before it wrote the marker, so the marker was written
+# 4 s or later after the spawn.
+_QUIET_S_BEFORE_MARKER = 4.0
+
+
+def _check_quiet_reader(rec: dict[str, Any]) -> tuple[list[str], int]:
+    """The filtered reader's captured marker and bytes.
+
+    Returns ``(lines before the marker, bytes before it)``.
+    """
+    quiet = rec["facts"]["quiet_reader"]
+    reader = step(rec, "quiet_filter")
+    assert reader["live"]
+    assert reader["rc"] is None, "the filtered reader exited by itself"
+    assert reader["stdout_total_lines"] == len(reader["stdout"])  # stored whole
+    assert reader["stdout_clipped_lines"] == 0
+    _, _, tag, text = step(rec, "log_marker")["argv"][-1].split()  # log -t <tag> <m>
+    assert reader["argv"][-2:] == ["-s", f"{tag}:V"], (
+        "the filter is not the marker's tag"
+    )
+    lines = [u1a(line) for line in body(reader["stdout"])]
+    assert len(lines) == 1, f"C10 quiet_filter: lines past the filter: {lines}"
+    assert (lines[0]["tag"], lines[0]["msg"].rstrip()) == (tag, text)
+    assert epoch_us(lines[0].string) >= _t_arg(reader["argv"])
+    # Bytes, not only lines: the stdout read is exactly the stored lines, and
+    # what came before the marker is whole lines (no partial line).
+    assert reader["bytes_read"] == _line_bytes(reader["stdout"])
+    before, before_bytes = quiet["lines_before_marker"], quiet["bytes_before_marker"]
+    assert before_bytes == _line_bytes(before), (
+        "bytes before the marker: not whole lines"
+    )
+    assert reader["stdout"][: len(before)] == before
+    first = reader["first_byte_s"]
+    assert first is not None
+    written = quiet.get("marker_written_s")
+    if before_bytes == 0:
+        # Nothing came before the marker was written.
+        assert first >= (_QUIET_S_BEFORE_MARKER if written is None else written), (
+            "a byte came before the marker was written"
+        )
+    elif written is not None:
+        assert first < written
+    assert quiet["marker_write_to_arrival_s"] is not None
+    assert quiet["marker_write_to_arrival_s"] < 2
+    return before, before_bytes
+
+
+def _check_clock(rec: dict[str, Any]) -> bool:
+    """``date +%s`` and ``date +%s.%N``; returns whether %N printed nanoseconds."""
+    facts = rec["facts"]
+    seconds = step(rec, "date_s")
+    assert seconds["rc"] == 0
+    assert seconds["stdout"], "date +%s printed nothing"
+    assert seconds["stdout"][0].strip().isdigit()
+    assert facts["date_s"] == seconds["stdout"][0].strip()
+    nanos = step(rec, "date_s_N")
+    assert nanos["rc"] == 0, f"date +%s.%N: rc {nanos['rc']}"
+    assert nanos["stdout"], "date +%s.%N printed nothing"
+    whole, dot, fraction = nanos["stdout"][0].strip().partition(".")
+    assert whole.isdigit()
+    assert dot
+    has_n = re.fullmatch(r"\d{9}", fraction) is not None
+    assert facts["date_N_supported"] is has_n, "the stored flag disagrees with date"
+    if "device_minus_host_bounds_s" in facts:  # not in the stored recordings
+        # The floored device second against the host interval of the read;
+        # the midpoint estimate lies inside, up to its rounding to 0.1 s.
+        low, high = facts["device_minus_host_bounds_s"]
+        assert low < high
+        assert low - 0.05 <= facts["device_minus_host_s"] <= high + 0.05
+    return has_n
+
+
 def check_c10(rec: dict[str, Any]) -> None:
     """C10: device clock commands; output starts within a second of the spawn."""
     facts = rec["facts"]
-    assert facts["date_s"].isdigit()
-    assert all(x is not None and x < 2 for x in facts["spawn_to_first_byte_s"])
-    quiet = facts["quiet_reader"]
-    assert quiet["marker_write_to_arrival_s"] is not None
-    assert quiet["marker_write_to_arrival_s"] < 2
+    has_n = _check_clock(rec)
+    firsts = [step(rec, f"first_byte_{i}") for i in range(3)]
+    assert [s["first_byte_s"] for s in firsts] == facts["spawn_to_first_byte_s"], (
+        "spawn_to_first_byte_s disagrees with the steps"
+    )
+    for s in firsts:
+        assert s["bytes_read"] > 0
+        assert s["first_byte_s"] is not None
+        assert s["first_byte_s"] < 2
+    before, before_bytes = _check_quiet_reader(rec)
     api = recorded_level(rec, "date +%s.%N and the filtered reader's output")
-    assert facts["date_N_supported"] is (api == 36)
-    before = quiet["lines_before_marker"]
+    assert has_n is (api == 36)
     if api == 24:
+        # 7.0's date prints a plain N for %N (recorded: 1793766304.N).
+        assert step(rec, "date_s_N")["stdout"][0].strip().endswith(".N")
         # 7.0 prints one divider per buffer as soon as logd delivers an entry of
         # that buffer at or after T, whatever the filter (C12 tags_silent shows
         # the same). The tool logs an unmatched main line before it connects,
@@ -379,6 +633,7 @@ def check_c10(rec: dict[str, Any]) -> None:
         assert f"{DIVIDER}main" in before
     else:
         assert before == [], "16 prints nothing before the first matching line"
+        assert before_bytes == 0, "16 prints no byte before the first matching line"
 
 
 def check_c11(rec: dict[str, Any]) -> None:
@@ -450,7 +705,10 @@ def check_c05(rec: dict[str, Any]) -> None:
     for run in ("fast", "slow", "slow_reader"):
         result = facts[run]
         control, stalled = result["control_reader"], result["stalled_reader"]
+        for reader in (control, stalled):
+            _check_sequence_summary(run, reader, result["lines_written"])
         assert control["missing"] == 0, f"C05 {run}: the source lost lines"
+        assert control["received"] == result["lines_written"]
         assert control["saw_end"]
         # adb blocks writing into our full pipe whatever logd does meanwhile.
         assert result["stalled_reader_rc_during_stall"] is None, (
@@ -464,7 +722,10 @@ def check_c05(rec: dict[str, Any]) -> None:
             assert stalled["saw_end"]
             continue
         assert stalled["missing_range_count"] == 1, f"C05 {run}: a hole, then lines"
-        assert stalled["missing_ranges"][0][1] == result["lines_written"] - 1
+        # The one hole is the tail: lines 0 .. received - 1 came, none after.
+        assert stalled["missing_ranges"] == [
+            [stalled["received"], result["lines_written"] - 1]
+        ], f"C05 {run}: the missing range is not the tail after the prefix"
         assert not stalled["saw_end"], f"C05 {run}: the end marker came after the hole"
         assert result["stalled_reader_rc_after_resume"] == 1, "disconnected (EOF)"
         assert reader["rc"] == 1
@@ -473,6 +734,30 @@ def check_c05(rec: dict[str, Any]) -> None:
         assert facts[run]["stalled_reader"]["missing"] > 0, (
             f"C05 {run} did not overflow"
         )
+
+
+def _check_sequence_summary(run: str, reader: dict[str, Any], written: int) -> None:
+    """The counts of one reader's sequence summary agree with each other."""
+    received, missing = reader["received"], reader["missing"]
+    assert received + missing == written, f"C05 {run}: received + missing != written"
+    ranges = reader["missing_ranges"]
+    lengths = sum(last - first + 1 for first, last in ranges)
+    assert all(0 <= first <= last < written for first, last in ranges), ranges
+    if reader["missing_range_count"] == len(ranges):
+        assert lengths == missing, f"C05 {run}: missing != the ranges' lengths"
+    else:  # the tool stores the first 40 ranges only
+        assert len(ranges) == 40
+        assert lengths < missing
+    # Every line read is one of ours (once or more), a marker, or another
+    # line (the first 30 kept).
+    counted = (
+        received
+        + reader["duplicates"]
+        + reader["saw_start"]
+        + reader["saw_end"]
+        + len(reader["other_lines"])
+    )
+    assert reader["lines_read"] >= counted, f"C05 {run}: fewer lines read than counted"
 
 
 def check_c04(rec: dict[str, Any]) -> None:
@@ -580,12 +865,42 @@ def check_c09(rec: dict[str, Any]) -> None:
         assert server["fd0"] == "/dev/null"
 
 
+# A path that names a user of the host: a home directory on Linux or macOS,
+# root's home, a Windows profile directory (either slash), or the agent's
+# scratch directory; and adb's "Installed as <path>" line.
+HOST_PATH = re.compile(
+    r"(?<![\w.-])/(?:home|Users)/[^/\s\"'<>]+"
+    r"|(?<![\w.-])/root(?:/|$)"
+    r"|(?i:(?<![\w])[a-z]:[\\/]+users[\\/]+[^\\/\s\"'<>]+)"
+    r"|/tmp/claude"
+    r"|Installed as"
+)
+
+
+def _strings(value: object) -> Iterator[str]:
+    """Every string in a decoded JSON value, keys included."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield str(key)
+            yield from _strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _strings(item)
+
+
 def check_fixture_hygiene(directory: Path) -> None:
-    """No host paths or adb install lines in the recordings of ``directory``."""
+    """No host paths or adb install lines in the recordings of ``directory``.
+
+    The decoded strings are checked, so a Windows path is matched with its
+    single backslashes, not as JSON escapes.
+    """
     for path in directory.glob("*.json"):
-        text = path.read_text(encoding="utf-8")
-        for needle in ("/tmp/claude", "/home/dev", "Installed as", "C:\\\\Users"):  # noqa: S108
-            assert needle not in text, f"{path.name} contains {needle!r}"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for text in _strings(data):
+            m = HOST_PATH.search(text)
+            assert m is None, f"{path.name} contains {m[0]!r}: {text[:200]!r}"
 
 
 CHECKS = {

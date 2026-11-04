@@ -25,6 +25,39 @@ Re-record with `python tools/device_probe.py --adb <adb> --serial <serial>
 [--root] [--vm-ssh <wrapper> --disruptive]`. The live tier is
 `LOGPYT_DEVICE=<serial> LOGPYT_DEVICE_API=24|36 pytest -m device tests/device`.
 
+### The adb server is never started
+
+Design 9.4: the container never starts an adb server. A check that
+127.0.0.1:5037 accepts a connection, made before adb is spawned, leaves a
+window: the tunnel can drop between the check and the spawn. What the adb
+client does when it finds no server depends on its server socket spec.
+Observed on 2026-11-04 with the container's adb client (37.0.1-15733141,
+Linux), while nothing listened on 127.0.0.1:5037 (a Python connect was
+refused), each command under `timeout 15` with `ANDROID_SERIAL` and
+`ANDROID_LOG_TAGS` unset (and `HOME`, `TMPDIR` in a scratch directory):
+
+| Server socket | Command | rc | stderr after adb's own warning line | adb server |
+|---|---|---|---|---|
+| `ADB_SERVER_SOCKET=tcp:127.0.0.1:5037` | `adb devices` | 1 | `* cannot start server on remote host`, `adb: failed to check server version: cannot connect to daemon at tcp:127.0.0.1:5037: failed to connect to '127.0.0.1:5037': Connection refused` | none |
+| `ADB_SERVER_SOCKET=tcp:127.0.0.1:5037` | `adb -s emulator-5554 logcat -d -t 1` | 1 | `* cannot start server on remote host`, `- waiting for device -`, `error: cannot connect to daemon at tcp:127.0.0.1:5037: ...` | none |
+| unset, `-H 127.0.0.1 -P 5037` | `adb devices` | 1 | as in the first row | none |
+| `ADB_SERVER_SOCKET=tcp:localhost:5037` | `adb devices` | 0 | `* daemon not running; starting now at tcp:localhost:5037`, `* daemon started successfully` | `adb -L tcp:localhost:5037 fork-server server --reply-fd 4`, port open |
+| unset | `adb devices` | 0 | `* daemon not running; starting now at tcp:5037`, `* daemon started successfully` | `adb -L tcp:5037 fork-server server --reply-fd 4`, port open |
+
+Every client returned within 0.11 s. The two servers were stopped with `adb
+kill-server` (same environment), and afterwards no adb process was left and
+5037 refused connections again.
+
+So the client starts a server only when the spec is unset (its default,
+`tcp:5037`, has an empty host) or names `localhost`; with the numeric host
+`127.0.0.1` it fails at once and starts nothing. `tools/device_probe.py`
+therefore gives every adb child `ADB_SERVER_SOCKET=tcp:127.0.0.1:5037`,
+refuses a server host that is not an IPv4 address and any override of the
+variable, keeps the port check for a clear `TunnelDownError`, and raises the
+same error when adb reports `cannot connect to daemon` after a passed check.
+Only the Linux client was run; that the Windows client behaves the same was
+not observed.
+
 ### What has not been run on a device
 
 - The recordings were made by earlier revisions of `tools/device_probe.py`.
@@ -35,6 +68,26 @@ Re-record with `python tools/device_probe.py --adb <adb> --serial <serial>
   that covers every token; C06 stores `between_list_neighbors: null` for a
   notice in the first or last row; C09 needs `--disruptive` and follows
   `--out`. None of these changes has run on a device.
+- Also changed since the recordings, and not run on a device or on emuvm
+  either (unit tests with fake children only):
+  - the server socket guard above (IPv4 host only, no override, adb's
+    `cannot connect to daemon` raises `TunnelDownError`);
+  - a child's pipes are read for at most 5 s after it exits or is killed and
+    reaped (every adb and VM command, `LiveReader.stop`); a step whose pipes
+    a descendant still held then stores `drained: false`. C09's
+    `adb_server_group.py` bounds its client wait the same way, kills only
+    the client, never the server, and stores `client_drained`;
+  - a live reader stamps its child's exit in a watcher thread, and C04's
+    `seconds_to_exit` comes from that stamp, next to the new `action_s`
+    (check 4: the stored times are upper bounds);
+  - C10 stores `host_before_s`, `host_after_s` and
+    `device_minus_host_bounds_s` (check 10), and the quiet reader's
+    `marker_written_s`;
+  - C03 stores `dumpsys_package_records` (the stored recordings call that
+    count `dumpsys_packages`) and `dumpsys_package_names` (check 3);
+  - VM commands and their output store `<vm-adb>` instead of the `--vm-adb`
+    path (the stored C04 and C09 hold the default
+    `~/android-sdk/platform-tools/adb`).
 - The live tier (`tests/device/`): an earlier revision gave 12 passed on each
   level on 2026-11-04 (about 05:30 UTC). The tool, the checks and the live
   test changed after that run; the revision in this PR has not been run on a
@@ -157,11 +210,18 @@ test. The 36 lines below T are what the `below_cursor` rule covers.
   substring filter: `pm list packages -U com.android.settings` returned
   `com.android.settings uid:1000` and
   `com.android.settings.auto_generated_rro_product__ uid:10010`.
-- `dumpsys package packages` prints `userId=<uid>` per package on 24 (98
-  packages) and `appId=<uid>` on 36 (252 packages); on 36 every uid from
-  `pm list packages -U` equals the `appId`. `dumpsys package
-  com.android.settings` answers on both (`userId=1000` on 24, `appId=1000` on
-  36).
+- `dumpsys package packages` prints `userId=<uid>` per package record on 24
+  (98 records, 98 distinct names) and `appId=<uid>` on 36 (252 records, 249
+  distinct names: `com.google.android.webview`, `com.android.chrome` and
+  `com.google.android.trichromelibrary_694313738` have two records each, with
+  the same uid; the filtered output does not show why). The stored fact
+  `dumpsys_packages` counts records. On 36 every one of the 248
+  `pm list packages -U` entries has the `appId` of its dumpsys records; the
+  one name dumpsys lists and `pm` does not is
+  `com.google.android.trichromelibrary_694313738`.
+- `dumpsys package com.android.settings` answers on both (rc 0; `userId=1000`
+  on 24, `appId=1000` on 36), the same uid as the package's record in the full
+  listing.
 - Every listed package name (98 on 24, 248 on 36) passes the F5-3 grammar of
   design 2.7 (risk 13).
 - Shared uids exist on both levels: uid 10014 on 24 maps to 4 packages
@@ -177,15 +237,24 @@ recorded.
 
 ### Open check 4: disconnects and an absent serial (`C04_disconnects.json`, `R4_absent_serial.json`)
 
-A running `adb logcat -v threadtime`, then one action; the time is from the
-start of the action to the exit of `adb logcat`.
+A running `adb logcat -v threadtime`, then one action. The time runs from
+the start of the action until the tool saw `adb logcat` exit, and the tool
+ran the action to completion before it waited for the exit, so every time is
+an upper bound that includes the whole action. The action's own steps took
+the time in parentheses (their `elapsed_s`): the kill, reconnect and server
+restart times are within 0.01 s of it, so these recordings do not show when
+during the action `adb logcat` exited; only the unplug exit came well after
+its action had ended.
 
 | Action | 24 | 36 | stderr |
 |---|---|---|---|
-| device logcat killed (SIGTERM) | rc 143 after 0.02 s | rc 143 after 0.03 s | empty |
-| `adb reconnect` | rc 255 after 0.02 s | rc 255 after 0.01 s | empty |
-| adb server restart on emuvm | rc 255 after 1.32 s | rc 255 after 1.11 s | empty |
-| emulator killed (`emu kill`, the unplug) | rc 255 after 0.85 s | rc 255 after 2.1 s | empty |
+| device logcat killed (SIGTERM) | rc 143, at most 0.02 s (0.018 s) | rc 143, at most 0.03 s (0.031 s) | empty |
+| `adb reconnect` | rc 255, at most 0.02 s (0.019 s) | rc 255, at most 0.01 s (0.004 s) | empty |
+| adb server restart on emuvm | rc 255, at most 1.32 s (1.320 s) | rc 255, at most 1.11 s (1.105 s) | empty |
+| emulator killed (`emu kill`, the unplug) | rc 255, at most 0.85 s (0.080 s) | rc 255, at most 2.1 s (0.085 s) | empty |
+
+The current tool stamps the exit while the action runs, so a new recording
+has the exit time itself (`seconds_to_exit`) and the action's (`action_s`).
 
 - After the unplug: `adb get-state` rc 1 `error: device offline`, `adb shell
   date` rc 1 `adb: device offline`, both within 4 ms; `adb logcat -d -t 1`
@@ -197,9 +266,9 @@ start of the action to the exit of `adb logcat`.
   each within 9 ms. The same on both levels.
 
 For the design (3.2, 5.6): every disconnect kind ends `adb logcat` by itself
-within about 2 s, with nothing on stderr, so the exit code is the only signal,
-and only the device-logcat kill (143) differs from the rest (255). An absent or
-unplugged device never ends `adb logcat`, so the state check after
+within 2.1 s at most, with nothing on stderr, so the exit code is the only
+signal, and only the device-logcat kill (143) differs from the rest (255). An
+absent or unplugged device never ends `adb logcat`, so the state check after
 `connect_timeout` is needed; `get-state` answers at once in both cases.
 
 ### Open check 5: a stalled reader under heavy logging (`C05_stalled_reader.json`)
@@ -353,8 +422,18 @@ stays, as it is correct either way. Windows was not measured (open item 5).
 ### Check 10: device clock and first byte (`C10_clock_first_byte.json`)
 
 - `date +%s` works on both levels. `date +%s.%N` prints `1793766304.N` on 24
-  (no `%N`) and nanoseconds on 36 (`1793766309.369942584`). The device clock
-  was 4.2 s ahead of the host clock on both.
+  (no `%N`) and nanoseconds on 36 (`1793766309.369942584`).
+- The device clock against the host clock, a coarse estimate:
+  `device_minus_host_s` is 4.2 on both, `date +%s` (d, the floor of the
+  device clock) minus the midpoint of the host times read before and after
+  the command, rounded to 0.1 s. Because d is floored, the offset lies in
+  `[d - host_after, d + 1 - host_before]`: about 4.2 to 5.2 s, widened by half
+  the time between the two host reads (not stored; the adb command itself
+  took 8 ms on 24 and 20 ms on 36) and by the rounding, so roughly 4.1 to
+  5.3 s. The stored recordings lack `host_before` and `host_after`, so the
+  bounds cannot be recomputed; the current tool stores them
+  (`host_before_s`, `host_after_s`) and the interval
+  (`device_minus_host_bounds_s`).
 - `adb shell true` took 5 to 6 ms on 24 and 8 to 9 ms on 36. A reader without a
   filter printed its first byte 8 to 12 ms (24) and 15 to 19 ms (36) after the
   spawn.
@@ -459,7 +538,9 @@ byte-identical lines at one timestamp are common in a fresh backlog (X-1).
 5. C09 on Windows: whether an adb server that our client starts inherits the
    client's pipe handles. From memory, adb starts its server there with
    CreateProcess, so fork and setsid do not apply, and handle inheritance is
-   the open question.
+   the open question. If it does, the client's pipes stay open after the
+   client exits: the probe tool stops reading them 5 s later and marks the
+   step `drained: false`, so a recording would show it.
 6. C10 with the current filtered-reader order, and the live tier as it is in
    this PR: not run on a device.
 7. Not probed: an adb client/server version restart; a TCP device

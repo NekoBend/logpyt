@@ -10,11 +10,18 @@ R1-R6 re-record the facts first observed on 2026-11-04 (R6 is the U-1 (a)
 argv, open check 1); C02-C12 are the open checks of design section 9.4.
 
 The adb server is never started from here. Every adb child runs with
-``ADB_SERVER_SOCKET=tcp:127.0.0.1:5037`` and without ``ANDROID_LOG_TAGS`` and
-``ANDROID_SERIAL``, and before every adb call the probe checks that
-127.0.0.1:5037 accepts a TCP connection (the tunnel to the remote adb server).
-If it does not, :class:`TunnelDownError` stops the run before adb is spawned,
-because an adb client that finds no server starts one itself.
+``ADB_SERVER_SOCKET=tcp:127.0.0.1:5037`` (a numeric address, never
+``localhost``) and without ``ANDROID_LOG_TAGS`` and ``ANDROID_SERIAL``. With
+that socket spec the adb client does not start a server when it finds none: it
+prints ``* cannot start server on remote host`` and exits 1, while an unset
+spec or ``tcp:localhost:5037`` makes it start one (observed with the 37.0.1
+client, ``tests/fixtures/device/FINDINGS.md``, "The adb server is never
+started"). So the guarantee holds even when the tunnel to the remote adb
+server drops between a check and the spawn. Before every adb call the probe
+also checks that 127.0.0.1:5037 accepts a TCP connection, so that a tunnel
+that is down stops the run with :class:`TunnelDownError` before adb is
+spawned, and an adb child that reports it could not reach the server raises
+the same error instead of being recorded as a device fact.
 
 Usage::
 
@@ -40,6 +47,7 @@ import argparse
 import calendar
 import contextlib
 import datetime as dt
+import ipaddress
 import json
 import os
 import re
@@ -52,13 +60,19 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, Self
+from typing import IO, TYPE_CHECKING, Any, Final, Self
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
     from types import TracebackType
 
 SERVER: Final = ("127.0.0.1", 5037)
+# How long the pipes of a child that has exited (or was killed and reaped) are
+# still read: a descendant that inherited them keeps them open after the child.
+DRAIN_S: Final = 5.0
+# Stored instead of the configured --vm-adb path, which may name a home
+# directory on the server host.
+VM_ADB_PLACEHOLDER: Final = "<vm-adb>"
 U1A_FORMAT: Final = (
     "-v",
     "threadtime",
@@ -103,6 +117,11 @@ _THREADTIME_TAG_RE: Final = re.compile(
     r"^\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} +\d+ +\d+ [VDIWEFA] (.*?) *: "
 )
 _PM_LINE_RE: Final = re.compile(r"^package:(\S+) uid:(\d+)")
+# What the adb client prints when nothing accepts its connection to the
+# server (FINDINGS.md, "The adb server is never started").
+_SERVER_LOST_RE: Final = re.compile(
+    r"cannot connect to daemon|cannot start server on remote host"
+)
 _CRASH_TAGS: Final = frozenset(
     {
         "AndroidRuntime",
@@ -262,40 +281,119 @@ def _utc_now() -> str:
     return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
 
 
+def _read_all(pipe: IO[bytes] | None, sink: bytearray) -> None:
+    """Thread body: append ``pipe`` to ``sink`` until EOF, then close it."""
+    if pipe is None:
+        return
+    try:
+        # ValueError, OSError: _finish_readers closed the pipe under us (POSIX).
+        with contextlib.suppress(OSError, ValueError):
+            while chunk := pipe.read(65536):
+                sink.extend(chunk)
+    finally:
+        pipe.close()
+
+
+def _write_all(pipe: IO[bytes] | None, data: bytes) -> None:
+    """Thread body: write ``data`` to the child's stdin, then close it."""
+    if pipe is None:
+        return
+    try:
+        view = memoryview(data)
+        with contextlib.suppress(OSError, ValueError):  # the child is gone
+            while view:
+                view = view[pipe.write(view) or 0 :]
+    finally:
+        with contextlib.suppress(OSError):
+            pipe.close()
+
+
+def _finish_readers(
+    readers: Sequence[tuple[threading.Thread, IO[bytes] | None]], deadline: float
+) -> bool:
+    """Wait until ``deadline`` for each reader to reach EOF; return whether all did.
+
+    Called once the child has exited or was killed and reaped. A descendant
+    that inherited a pipe keeps it open after the child, so the wait is
+    bounded. A pipe whose reader finished is closed. A pipe still being read
+    is closed too on POSIX: the blocked read goes on on the open pipe and the
+    reader ends at its next read. On Windows it is left to its reader, which
+    closes it at EOF: closing a descriptor while another thread reads it may
+    wait for that read to return (from memory, the C runtime holds a
+    per-descriptor lock during both).
+    """
+    drained = True
+    for thread, pipe in readers:
+        if thread.is_alive():
+            thread.join(max(0.0, deadline - time.monotonic()))
+        if thread.is_alive():
+            drained = False
+            if os.name == "nt":
+                continue
+        if pipe is not None:
+            pipe.close()
+    return drained
+
+
 def _exec(
     argv: Sequence[str],
     *,
     timeout: float,
     env: Mapping[str, str] | None = None,
     stdin: bytes | None = None,
-) -> tuple[int | None, bytes, bytes, float]:
+    drain: float = DRAIN_S,
+) -> tuple[int | None, bytes, bytes, float, bool]:
     """Run ``argv``; on timeout kill it and return rc ``None``.
+
+    Returns ``(rc, stdout, stderr, elapsed_s, drained)``. Threads read both
+    pipes while the child runs. Once it has exited, or was killed and reaped
+    after ``timeout``, the readers get ``drain`` more seconds to reach EOF;
+    ``drained`` is false when a descendant still held a pipe then, and the
+    output read until then is returned (:func:`_finish_readers`).
 
     The child runs in its own session, so a Ctrl-C in the terminal does not
     reach it: on any exception (``KeyboardInterrupt`` included) it is killed
-    and reaped before the exception propagates.
+    and reaped, with the same bounded drain, before the exception propagates.
     """
     start = time.monotonic()
-    with subprocess.Popen(
+    proc = subprocess.Popen(
         argv,
         stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        bufsize=0,
         env=None if env is None else dict(env),
         start_new_session=True,
-    ) as proc:
+    )
+    out, err = bytearray(), bytearray()
+    readers = [
+        (threading.Thread(target=_read_all, args=(pipe, sink), daemon=True), pipe)
+        for pipe, sink in ((proc.stdout, out), (proc.stderr, err))
+    ]
+    writer = (
+        threading.Thread(
+            target=_write_all, args=(proc.stdin, stdin or b""), daemon=True
+        ),
+        proc.stdin,
+    )
+    try:
+        for thread, _ in (*readers, writer):
+            thread.start()
         try:
-            out, err = proc.communicate(stdin, timeout=timeout)
-            rc: int | None = proc.returncode
+            rc: int | None = proc.wait(timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            out, err = proc.communicate()
             rc = None
-        except BaseException:
             proc.kill()
             proc.wait()
-            raise
-    return rc, out, err, time.monotonic() - start
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        _finish_readers([*readers, writer], time.monotonic() + drain)
+        raise
+    deadline = time.monotonic() + drain
+    drained = _finish_readers(readers, deadline)
+    _finish_readers([writer], deadline)  # stdin: closed, nothing to report
+    return rc, bytes(out), bytes(err), time.monotonic() - start, drained
 
 
 @dataclass
@@ -311,6 +409,9 @@ class Step:
     stderr: list[str]
     env: dict[str, str | None] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
+    # False: a descendant still held stdout or stderr when the probe stopped
+    # reading (DRAIN_S after the child's exit), so the output may be cut short.
+    drained: bool = True
 
     @property
     def timed_out(self) -> bool:
@@ -336,12 +437,39 @@ class Step:
         }
         if self.env:
             data["env"] = self.env
+        if not self.drained:
+            data["drained"] = False
         data.update(self.extra)
         return data
 
 
+def _check_server_reached(step: Step) -> None:
+    """Raise :class:`TunnelDownError` if adb reports that no server answered.
+
+    The port check before the spawn passed, so the tunnel dropped in between;
+    the step holds adb's error, not a device fact.
+    """
+    lost = [line.strip() for line in step.stderr if _SERVER_LOST_RE.search(line)]
+    if lost:
+        msg = (
+            f"adb ({step.name}) could not reach the adb server: {lost[-1]}; the "
+            "tunnel dropped after the port check (adb did not start a server)"
+        )
+        raise TunnelDownError(msg)
+
+
 class Adb:
     """The adb client, guarded so that it can never start a server of its own.
+
+    The guard is the socket spec every child gets, ``ADB_SERVER_SOCKET=
+    tcp:<IPv4 address>:<port>`` (:meth:`env`): with a numeric host the adb
+    client never starts a server, it fails with ``cannot start server on
+    remote host``; it starts one for an unset spec, an empty host or
+    ``localhost`` (FINDINGS.md, "The adb server is never started"). So the
+    server host must be an IPv4 address, and no override may change the spec.
+    The TCP check before each spawn (:meth:`ensure_server`) only turns a tunnel
+    that is down into a clear :class:`TunnelDownError`; a tunnel that drops
+    after it is caught from adb's error (:func:`_check_server_reached`).
 
     ``deadline`` (a ``time.monotonic()`` value, set by
     :meth:`Context.time_limit`) caps every command timeout and reader wait to
@@ -356,11 +484,26 @@ class Adb:
         server: tuple[str, int] = SERVER,
         connect_timeout: float = 2.0,
     ) -> None:
+        host, port = server
+        try:
+            ipaddress.IPv4Address(host)
+        except ValueError:
+            msg = (
+                f"adb server host {host!r} is not an IPv4 address: for an empty "
+                "host or 'localhost' the adb client starts a server of its own"
+            )
+            raise ValueError(msg) from None
         self.path = path
         self.serial = serial
-        self.server = server
+        self.server = (host, port)
         self.connect_timeout = connect_timeout
         self.deadline: float | None = None
+
+    @property
+    def server_socket(self) -> str:
+        """The ``ADB_SERVER_SOCKET`` value of every child: ``tcp:<IPv4>:<port>``."""
+        host, port = self.server
+        return f"tcp:{host}:{port}"
 
     def ensure_server(self) -> None:
         """Raise :class:`TunnelDownError` unless the server address accepts TCP."""
@@ -388,15 +531,24 @@ class Adb:
         return timeout if left is None else min(timeout, left)
 
     def env(self, overrides: Mapping[str, str | None] | None = None) -> dict[str, str]:
-        """Return the child environment: the host's, cleaned, plus ``overrides``."""
+        """Return the child environment: the host's, cleaned, plus ``overrides``.
+
+        ``ADB_SERVER_SOCKET`` is always :attr:`server_socket`; an override
+        that would change or remove it raises ``ValueError``.
+        """
+        if overrides and any(key.upper() == "ADB_SERVER_SOCKET" for key in overrides):
+            msg = (
+                "ADB_SERVER_SOCKET cannot be overridden: it keeps adb from "
+                "starting a server of its own"
+            )
+            raise ValueError(msg)
         env = {key: value for key, value in os.environ.items() if key not in _CLEAN_ENV}
-        host, port = self.server
-        env["ADB_SERVER_SOCKET"] = f"tcp:{host}:{port}"
         for key, value in (overrides or {}).items():
             if value is None:
                 env.pop(key, None)
             else:
                 env[key] = value
+        env["ADB_SERVER_SOCKET"] = self.server_socket
         return env
 
     def run(
@@ -412,10 +564,10 @@ class Adb:
         self.ensure_server()
         selected = self.serial if serial == "" else serial
         argv = adb_args(args, selected)
-        rc, out, err, elapsed = _exec(
+        rc, out, err, elapsed, drained = _exec(
             [self.path, *argv], timeout=self.budget(timeout), env=self.env(env)
         )
-        return Step(
+        step = Step(
             name=name,
             where="adb",
             argv=argv,
@@ -424,7 +576,10 @@ class Adb:
             stdout=split_lines(out),
             stderr=split_lines(err),
             env=dict(env or {}),
+            drained=drained,
         )
+        _check_server_reached(step)
+        return step
 
     def shell(self, name: str, command: str, *, timeout: float = 30.0) -> Step:
         """Run ``adb shell <command>`` (the device shell parses ``command``)."""
@@ -438,6 +593,14 @@ class Vm:
         self.ssh = ssh
         self.adb = adb
 
+    def scrub(self, text: str) -> str:
+        """Replace the configured adb path with :data:`VM_ADB_PLACEHOLDER`.
+
+        The path (``--vm-adb``) may name a home directory on the server host,
+        so it is never stored; the ssh wrapper's path is not stored either.
+        """
+        return text.replace(self.adb, VM_ADB_PLACEHOLDER) if self.adb else text
+
     def run(
         self,
         name: str,
@@ -447,20 +610,29 @@ class Vm:
         stdin: bytes | None = None,
     ) -> Step:
         """Run ``command`` through the ssh wrapper."""
-        rc, out, err, elapsed = _exec([self.ssh, command], timeout=timeout, stdin=stdin)
+        rc, out, err, elapsed, drained = _exec(
+            [self.ssh, command], timeout=timeout, stdin=stdin
+        )
         return Step(
             name=name,
             where="vm",
-            argv=[command],
+            argv=[self.scrub(command)],
             rc=rc,
             elapsed_s=elapsed,
-            stdout=split_lines(out),
-            stderr=split_lines(err),
+            stdout=[self.scrub(line) for line in split_lines(out)],
+            stderr=[self.scrub(line) for line in split_lines(err)],
+            drained=drained,
         )
 
 
 class LiveReader:
-    """A long-running adb child whose stdout one thread reads, or stops reading."""
+    """A long-running adb child whose stdout one thread reads, or stops reading.
+
+    A third thread waits for the child's exit and stamps it (``exited_at``),
+    whatever the caller is doing meanwhile. If anything fails after the spawn,
+    construction kills and reaps the child, ends the threads it started and
+    closes the pipes before the exception propagates.
+    """
 
     def __init__(
         self,
@@ -481,6 +653,7 @@ class LiveReader:
         self.bytes_read = 0
         self.first_byte_s: float | None = None
         self.last_byte_at: float | None = None
+        self.exited_at: float | None = None
         self._keep = keep
         self._on_line = on_line
         self._partial = b""
@@ -490,6 +663,10 @@ class LiveReader:
         self._reading.set()
         self.read_rate: float | None = None
         self._step: Step | None = None
+        self._stdout_pump = threading.Thread(target=self._pump_stdout, daemon=True)
+        self._stderr_pump = threading.Thread(target=self._pump_stderr, daemon=True)
+        self._exit_watch = threading.Thread(target=self._watch_exit, daemon=True)
+        env = adb.env()
         self.started_at = time.monotonic()
         self.proc = subprocess.Popen(
             [adb.path, *self.argv],
@@ -497,15 +674,15 @@ class LiveReader:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
-            env=adb.env(),
+            env=env,
             start_new_session=True,
         )
-        self._threads = [
-            threading.Thread(target=self._pump_stdout, daemon=True),
-            threading.Thread(target=self._pump_stderr, daemon=True),
-        ]
-        for thread in self._threads:
-            thread.start()
+        try:
+            for thread in (self._stdout_pump, self._stderr_pump, self._exit_watch):
+                thread.start()
+        except BaseException:
+            self._abort()
+            raise
 
     def __enter__(self) -> Self:
         return self
@@ -516,7 +693,32 @@ class LiveReader:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        self.stop()
+        if exc is None:
+            self.stop()
+            return
+        # Another exception is on its way: end the child, keep that exception.
+        with contextlib.suppress(TunnelDownError):
+            self.stop()
+
+    def _abort(self) -> None:
+        """Undo a construction that failed after the spawn."""
+        self.proc.kill()
+        self.proc.wait()
+        self._reading.set()
+        self._end_threads(time.monotonic() + DRAIN_S)
+
+    def _end_threads(self, deadline: float) -> bool:
+        """After the child is reaped: end the threads, close the pipes; drained?"""
+        drained = _finish_readers(
+            [
+                (self._stdout_pump, self.proc.stdout),
+                (self._stderr_pump, self.proc.stderr),
+            ],
+            deadline,
+        )
+        if self._exit_watch.is_alive():
+            self._exit_watch.join(max(0.0, deadline - time.monotonic()))
+        return drained
 
     def _take(self, raw: bytes) -> None:
         line = raw.decode("utf-8", errors="replace")
@@ -530,34 +732,43 @@ class LiveReader:
         pipe = self.proc.stdout
         if pipe is None:
             return
-        while True:
-            self._reading.wait()
-            chunk = pipe.read(65536)
-            if not chunk:
-                break
-            now = time.monotonic()
-            with self._lock:
-                if self.first_byte_s is None:
-                    self.first_byte_s = now - self.started_at
-                self.last_byte_at = now
-                self.bytes_read += len(chunk)
-                *complete, self._partial = (self._partial + chunk).split(b"\n")
-                for raw in complete:
-                    self._take(raw)
-            if self.read_rate:
-                time.sleep(len(chunk) / self.read_rate)
+        # ValueError, OSError: _finish_readers closed the pipe under us (POSIX).
+        with contextlib.suppress(OSError, ValueError):
+            while True:
+                self._reading.wait()
+                chunk = pipe.read(65536)
+                if not chunk:
+                    break
+                now = time.monotonic()
+                with self._lock:
+                    if self.first_byte_s is None:
+                        self.first_byte_s = now - self.started_at
+                    self.last_byte_at = now
+                    self.bytes_read += len(chunk)
+                    *complete, self._partial = (self._partial + chunk).split(b"\n")
+                    for raw in complete:
+                        self._take(raw)
+                if self.read_rate:
+                    time.sleep(len(chunk) / self.read_rate)
         with self._lock:
             if self._partial:
                 self._take(self._partial)
                 self._partial = b""
+        pipe.close()
 
     def _pump_stderr(self) -> None:
         pipe = self.proc.stderr
         if pipe is None:
             return
-        while chunk := pipe.read(65536):
-            with self._lock:
-                self._stderr += chunk
+        with contextlib.suppress(OSError, ValueError):
+            while chunk := pipe.read(65536):
+                with self._lock:
+                    self._stderr += chunk
+        pipe.close()
+
+    def _watch_exit(self) -> None:
+        self.proc.wait()
+        self.exited_at = time.monotonic()
 
     def pause(self) -> None:
         """Stop reading stdout after the current chunk (the pipe fills up)."""
@@ -583,6 +794,11 @@ class LiveReader:
                 return False
             time.sleep(0.05)
 
+    def snapshot(self) -> tuple[int, list[str]]:
+        """Return ``(bytes_read, lines)`` as of one moment (both under the lock)."""
+        with self._lock:
+            return self.bytes_read, list(self.lines)
+
     def wait_lines(self, count: int, timeout: float) -> bool:
         """Wait until ``count`` lines were read."""
         return self.wait_until(lambda: self.line_count >= count, timeout)
@@ -594,8 +810,13 @@ class LiveReader:
         except subprocess.TimeoutExpired:
             return None
 
-    def stop(self, *, grace: float = 3.0) -> Step:
-        """End the child (if still running), drain both pipes, return the step."""
+    def stop(self, *, grace: float = 3.0, drain: float = DRAIN_S) -> Step:
+        """End the child (if still running), drain both pipes, return the step.
+
+        Draining is bounded by ``drain`` seconds after the child is reaped
+        (:func:`_finish_readers`). Raises :class:`TunnelDownError` (the step is
+        kept for a later call) when adb reports that no server answered.
+        """
         if self._step is not None:
             return self._step
         rc = self.proc.poll()
@@ -607,11 +828,7 @@ class LiveReader:
                 self.proc.kill()
                 self.proc.wait()
         self._reading.set()
-        for thread in self._threads:
-            thread.join(10)
-        for pipe in (self.proc.stdout, self.proc.stderr):
-            if pipe is not None:
-                pipe.close()
+        drained = self._end_threads(time.monotonic() + drain)
         with self._lock:
             self._step = Step(
                 name=self.name,
@@ -629,7 +846,9 @@ class LiveReader:
                     "bytes_read": self.bytes_read,
                     "lines_read": self.line_count,
                 },
+                drained=drained,
             )
+        _check_server_reached(self._step)
         return self._step
 
 
@@ -1124,7 +1343,11 @@ def _record_pm(ctx: Context, rec: Recording) -> dict[int, list[str]]:
 
 
 def _record_dumpsys_uids(ctx: Context, rec: Recording) -> dict[int, list[str]]:
-    """``dumpsys package packages``: uid -> packages (``userId=`` or ``appId=``)."""
+    """``dumpsys package packages``: uid -> packages (``userId=`` or ``appId=``).
+
+    A name can have more than one record (API 36 lists three packages twice),
+    so a name can appear twice under its uid.
+    """
     grep = r"grep -E '^  Package \[|^    (userId|appId)='"
     step = rec.add(
         ctx.adb.shell("dumpsys_package_packages", f"dumpsys package packages | {grep}")
@@ -1159,7 +1382,13 @@ def probe_c03(ctx: Context) -> Recording:
     uids = _record_pm(ctx, rec)
     rec.fact("pm_U_packages", sum(len(names) for names in uids.values()))
     dumpsys = _record_dumpsys_uids(ctx, rec)
-    rec.fact("dumpsys_packages", sum(len(names) for names in dumpsys.values()))
+    # Records with a uid line, and distinct names (recordings before this
+    # change hold only the record count, as dumpsys_packages).
+    rec.fact("dumpsys_package_records", sum(len(names) for names in dumpsys.values()))
+    rec.fact(
+        "dumpsys_package_names",
+        len({name for names in dumpsys.values() for name in names}),
+    )
     by_name = {name: uid for uid, names in dumpsys.items() for name in names}
     rec.fact(
         "pm_U_uid_differs_from_dumpsys",
@@ -1188,19 +1417,7 @@ def probe_c10(ctx: Context) -> Recording:
     """C10: ``date +%s`` / ``+%s.%N`` and the time from spawn to the first byte."""
     rec = Recording(ctx, "C10", "date +%s and +%s.%N; spawn to first byte")
     adb = ctx.adb
-    host_before = time.time()
-    seconds = rec.add(adb.shell("date_s", "date +%s"))
-    host_after = time.time()
-    nanos = rec.add(adb.shell("date_s_N", "date +%s.%N"))
-    value = seconds.stdout[0].strip() if seconds.stdout else ""
-    rec.fact("date_s", value)
-    if value.isdigit():
-        rec.fact(
-            "device_minus_host_s", round(int(value) - (host_before + host_after) / 2, 1)
-        )
-    text = nanos.stdout[0].strip() if nanos.stdout else ""
-    rec.fact("date_s_N", text)
-    rec.fact("date_N_supported", re.fullmatch(r"\d+\.\d{9}", text) is not None)
+    _clock_facts(ctx, rec)
     rtts = [rec.add(adb.shell(f"shell_true_{i}", "true")).elapsed_s for i in range(3)]
     rec.fact("shell_true_s", [round(x, 3) for x in rtts])
     firsts: list[float | None] = []
@@ -1215,6 +1432,41 @@ def probe_c10(ctx: Context) -> Recording:
     )
     _quiet_reader(ctx, rec)
     return rec
+
+
+def _clock_facts(
+    ctx: Context, rec: Recording, *, clock: Callable[[], float] = time.time
+) -> None:
+    """``date +%s`` and ``date +%s.%N``, and the device clock against the host's.
+
+    ``date +%s`` is the floor of the device clock, read at some host time
+    between ``host_before_s`` and ``host_after_s``, so the device clock minus
+    the host clock lies in ``device_minus_host_bounds_s``:
+    ``[d - host_after, d + 1 - host_before]``. ``device_minus_host_s`` (``d``
+    minus the host midpoint, as in the stored recordings) is a coarse
+    estimate within those bounds, up to its rounding to 0.1 s.
+    """
+    adb = ctx.adb
+    host_before = clock()
+    seconds = rec.add(adb.shell("date_s", "date +%s"))
+    host_after = clock()
+    nanos = rec.add(adb.shell("date_s_N", "date +%s.%N"))
+    value = seconds.stdout[0].strip() if seconds.stdout else ""
+    rec.fact("date_s", value)
+    rec.fact("host_before_s", round(host_before, 3))
+    rec.fact("host_after_s", round(host_after, 3))
+    if value.isdigit():
+        device = int(value)
+        rec.fact(
+            "device_minus_host_s", round(device - (host_before + host_after) / 2, 1)
+        )
+        rec.fact(
+            "device_minus_host_bounds_s",
+            [round(device - host_after, 3), round(device + 1 - host_before, 3)],
+        )
+    text = nanos.stdout[0].strip() if nanos.stdout else ""
+    rec.fact("date_s_N", text)
+    rec.fact("date_N_supported", re.fullmatch(r"\d+\.\d{9}", text) is not None)
 
 
 def _quiet_reader(ctx: Context, rec: Recording) -> None:
@@ -1240,7 +1492,7 @@ def _quiet_reader(ctx: Context, rec: Recording) -> None:
     args = ["logcat", *U1A_FORMAT, "-T", since, "-s", f"{tag}:V"]
     with LiveReader(adb, "quiet_filter", args, on_line=on_line) as live:
         time.sleep(4)
-        quiet = {"bytes": live.bytes_read, "lines": list(live.lines)}
+        bytes_before, lines_before = live.snapshot()
         written_at = time.monotonic()
         rec.add(adb.shell("log_marker", f"log -t {tag} quiet-{ctx.run_id}"))
         live.wait_until(lambda: bool(arrivals), timeout=10)
@@ -1248,8 +1500,10 @@ def _quiet_reader(ctx: Context, rec: Recording) -> None:
     rec.fact(
         "quiet_reader",
         {
-            "bytes_before_marker": quiet["bytes"],
-            "lines_before_marker": quiet["lines"],
+            "bytes_before_marker": bytes_before,
+            "lines_before_marker": lines_before,
+            # From the reader's spawn, like the step's first_byte_s.
+            "marker_written_s": round(written_at - live.started_at, 3),
             "marker_write_to_arrival_s": round(arrivals[0] - written_at, 3)
             if arrivals
             else None,
@@ -1761,6 +2015,14 @@ def _wait_device(ctx: Context, rec: Recording, label: str) -> None:
 def _stream_case(
     ctx: Context, rec: Recording, name: str, action: Callable[[], object]
 ) -> None:
+    """Run ``action`` against a running ``adb logcat``; record how it ended.
+
+    ``seconds_to_exit`` runs from the start of the action to the child's exit
+    as the reader's exit watcher stamped it, so an exit during a long action
+    is not counted as late as the action's end. ``action_s`` is how long the
+    action took. (Recordings before this change measured until ``wait_exit``
+    returned, after the action had finished: an upper bound.)
+    """
     with LiveReader(
         ctx.adb, f"{name}_stream", ["logcat", "-v", "threadtime"], keep=0
     ) as live:
@@ -1769,16 +2031,20 @@ def _stream_case(
         before = live.line_count
         acted_at = time.monotonic()
         action()
+        action_s = time.monotonic() - acted_at
         rc = live.wait_exit(30)
-        to_exit = time.monotonic() - acted_at
-    step = live.stop()
+    step = live.stop()  # also joins the exit watcher, so exited_at is final
     rec.add(step, stdout=[])
+    exited_at = live.exited_at
     rec.fact(
         name,
         {
             "exited_by_itself": rc is not None,
             "rc": rc,
-            "seconds_to_exit": round(to_exit, 2) if rc is not None else None,
+            "seconds_to_exit": round(exited_at - acted_at, 2)
+            if rc is not None and exited_at is not None
+            else None,
+            "action_s": round(action_s, 3),
             "stderr": step.stderr[:5],
             "lines_before_action": before,
             "lines_read": live.line_count,
@@ -1915,7 +2181,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--vm-adb",
         default="~/android-sdk/platform-tools/adb",
-        help="adb path on the server host",
+        help=f"adb path on the server host (recorded as {VM_ADB_PLACEHOLDER})",
     )
     parser.add_argument(
         "--disruptive",
