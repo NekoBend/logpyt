@@ -27,6 +27,11 @@ build-backend = "hatchling.build"
 [tool.hatch.version]
 path = "logpyt/__init__.py"
 
+[tool.uv]
+# The version is dynamic (read from logpyt/__init__.py by hatch): rebuild the
+# project's metadata when that file changes, not only when pyproject.toml does.
+cache-keys = [{ file = "pyproject.toml" }, { file = "logpyt/__init__.py" }]
+
 [tool.hatch.build.targets.wheel]
 packages = ["logpyt"]
 
@@ -44,8 +49,9 @@ asyncio_mode = "strict"
 markers = [
     "device: needs a live device or emulator (LOGPYT_DEVICE=<serial>, adb server on 127.0.0.1:5037); skipped otherwise",
 ]
-# An exception that escapes a library thread or a __del__ must fail the test
-# that caused it, not scroll by as a warning.
+# An exception that escapes a library thread or a __del__ must fail the run,
+# not scroll by as a warning. pytest reports it at the test, setup or teardown
+# where it surfaces, which is not always the one that caused it.
 filterwarnings = [
     "error::pytest.PytestUnhandledThreadExceptionWarning",
     "error::pytest.PytestUnraisableExceptionWarning",
