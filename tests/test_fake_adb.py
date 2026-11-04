@@ -438,7 +438,11 @@ def test_an_unreleased_gate_times_out_and_fails_the_teardown(
     result = _adb(fake_adb, "logcat")  # held by this very thread: times out
 
     assert result.returncode == 0
-    assert time.monotonic() - started >= 0.2
+    # Python 3.12 on Windows reads the monotonic clock from GetTickCount64, in
+    # 15.6 ms ticks, and the gate's wait can end by that coarse clock too, so
+    # allow two ticks (CI measured 0.188 s once).
+    tick = time.get_clock_info("monotonic").resolution
+    assert time.monotonic() - started >= 0.2 - 2 * tick
     with pytest.raises(AssertionError, match="spawn gate never released"):
         fake_adb.close()
 
