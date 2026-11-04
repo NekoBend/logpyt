@@ -136,6 +136,9 @@ _TCP_SERIAL = re.compile(r"(?:\[[^\]\s]+\]|[^\s:\[\]]+):[0-9]{1,5}")
 _MDNS_SERIAL = re.compile(r"\S+\._adb(?:-tls-connect)?\._tcp\.?")
 _PLAIN_SERIAL = re.compile(r"[A-Za-z0-9._-]+")
 
+# adb prints its server start on stderr with this prefix (FINDINGS.md, check 9).
+_SERVER_START_PREFIX = "* daemon "
+
 # F9-2: adb connect succeeded only when a line starts like this.
 _CONNECTED = re.compile(r"^(?:already )?connected to ", re.MULTILINE)
 
@@ -463,8 +466,11 @@ def _drain(proc: subprocess.Popen[bytes]) -> tuple[bytes, bytes, bool]:
     Called once adb has exited or was killed. Returns stdout, stderr and whether
     both pipes reached EOF and adb exited. When not, a process adb started
     holds the pipes: on POSIX they are closed here and the output is what was
-    read until then; on Windows communicate()'s reader threads keep them until
-    that process lets go, and hand over nothing before.
+    read until then. On Windows communicate()'s reader threads stay blocked
+    until that process lets go, hand over nothing before, and keep two threads
+    and the two pipe handles until then: Python has no way to end a blocking
+    read there. adb's own server holds none of the client's pipes on Linux
+    (FINDINGS.md, check 9); on Windows that is not recorded (open item 5).
     """
     deadline = time.monotonic() + _REAP_TIMEOUT
     while True:
@@ -494,15 +500,29 @@ def _close_pipes(proc: subprocess.Popen[bytes]) -> None:
 
 
 def _kill_and_reap(proc: subprocess.Popen[bytes]) -> None:
-    """Kill ``proc`` unless it has exited, then reap it; bounded by _REAP_TIMEOUT."""
+    """Kill ``proc`` unless it has exited, then reap it; bounded by _REAP_TIMEOUT.
+
+    Interrupted itself (a second Ctrl+C), it still closes the pipes on POSIX and
+    reaps the killed child, bounded the same way, before the interrupt
+    propagates.
+    """
     with contextlib.suppress(OSError):
         proc.kill()
-    if not _drain(proc)[2]:
+    try:
+        at_eof = _drain(proc)[2]
+    except BaseException:
+        if sys.platform != "win32":
+            _close_pipes(proc)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=_REAP_TIMEOUT)
+        raise
+    if not at_eof:
         _log_unfinished(proc.pid, proc.poll(), killed=True)
 
 
-# The reads of an async adb child's stdout and stderr (`_read_into`).
-type _Reads = asyncio.Future[tuple[None, None]]
+# The reads of an async adb child's stdout and stderr (`_read_into`), one task
+# each, so that a failed read is told apart from one still waiting for EOF.
+type _Readers = tuple[asyncio.Task[None], asyncio.Task[None]]
 
 
 async def _async_run_adb(argv: Sequence[str], *, timeout: float | None) -> _AdbResult:
@@ -510,7 +530,9 @@ async def _async_run_adb(argv: Sequence[str], *, timeout: float | None) -> _AdbR
 
     adb's exit is told by polling ``returncode`` (A-14), and once adb has
     exited its pipes get ``_REAP_TIMEOUT`` more to reach EOF, as in `_run_adb`;
-    on every platform the result then carries what was read until then.
+    on every platform the result then carries what was read until then. A
+    cancellation that arrives while a killed child is being reaped waits for
+    that bounded reap before it propagates.
 
     Raises:
         AdbError: adb could not be started (``returncode`` None; the
@@ -519,6 +541,8 @@ async def _async_run_adb(argv: Sequence[str], *, timeout: float | None) -> _AdbR
             and reaped.
         asyncio.CancelledError: The task was cancelled; the child was killed
             and reaped first.
+        OSError: Reading a pipe failed; the child was killed and reaped and
+            its pipes closed first.
     """
     args = tuple(argv)
     started = time.monotonic()
@@ -528,22 +552,24 @@ async def _async_run_adb(argv: Sequence[str], *, timeout: float | None) -> _AdbR
         raise _spawn_failure(args, exc) from exc
     stdout: list[bytes] = []
     stderr: list[bytes] = []
-    reads = asyncio.gather(
-        _read_into(proc.stdout, stdout), _read_into(proc.stderr, stderr)
+    readers = (
+        asyncio.ensure_future(_read_into(proc.stdout, stdout)),
+        asyncio.ensure_future(_read_into(proc.stderr, stderr)),
     )
     try:
         async with asyncio.timeout(timeout):
-            returncode = await _async_until_exit(proc, reads)
+            returncode = await _async_until_exit(proc, readers)
     except TimeoutError:
-        await _async_kill_and_reap(proc, reads)
+        await _async_kill_and_reap(proc, readers)
         raise TimeoutError(_timeout_message(args, timeout)) from None
     except BaseException:
-        await _async_kill_and_reap(proc, reads)
+        await _async_kill_and_reap(proc, readers)
         raise
-    if await _async_settle(proc, reads):
-        reads.result()  # a failed read raises here
-    else:
+    settled = await _async_settle(proc, readers)
+    if not settled:
         _log_unfinished(proc.pid, returncode, killed=False)
+    if (failure := _failed_read(readers)) is not None:
+        raise failure
     return _finished(args, returncode, b"".join(stdout), b"".join(stderr), started)
 
 
@@ -555,45 +581,81 @@ async def _read_into(stream: asyncio.StreamReader | None, chunks: list[bytes]) -
         chunks.append(chunk)
 
 
-async def _async_until_exit(proc: asyncio.subprocess.Process, reads: _Reads) -> int:
-    """Return adb's exit status once it has exited; ``reads`` run meanwhile."""
+def _failed_read(readers: _Readers) -> BaseException | None:
+    """The exception of the first reader that failed, or None.
+
+    Retrieves every finished reader's exception, so that asyncio reports none
+    of them as never retrieved.
+    """
+    failures = [
+        exc
+        for task in readers
+        if task.done() and not task.cancelled() and (exc := task.exception())
+    ]
+    return failures[0] if failures else None
+
+
+async def _async_until_exit(proc: asyncio.subprocess.Process, readers: _Readers) -> int:
+    """Return adb's exit status once it has exited; ``readers`` run meanwhile.
+
+    Raises:
+        OSError: A read failed while adb ran.
+    """
     while (returncode := proc.returncode) is None:
-        if reads.done():
-            reads.result()  # a failed read raises here
+        if (failure := _failed_read(readers)) is not None:
+            raise failure
+        pending = [task for task in readers if not task.done()]
+        if not pending:
             # Both pipes are at EOF, so wait() returns at the exit on every
             # CPython version.
             return await proc.wait()
-        await asyncio.wait({reads}, timeout=_EXIT_POLL)
+        await asyncio.wait(pending, timeout=_EXIT_POLL)
     return returncode
 
 
-async def _async_settle(proc: asyncio.subprocess.Process, reads: _Reads) -> bool:
-    """Wait at most ``_REAP_TIMEOUT`` for EOF on adb's pipes and for its exit.
+async def _async_settle(proc: asyncio.subprocess.Process, readers: _Readers) -> bool:
+    """Wait at most ``_REAP_TIMEOUT`` for adb's exit and for both readers to end.
 
-    Called once adb has exited or was killed. Returns whether both came. When
-    not, or when the wait is interrupted, `_async_abandon` closes the pipes, so
+    Called once adb has exited or was killed. A failed read counts as ended.
+    Returns whether all of it came. When not, or when the wait is
+    interrupted, `_async_abandon` stops the readers and closes the pipes, so
     the output is what was read until then.
     """
     deadline = time.monotonic() + _REAP_TIMEOUT
     try:
-        while proc.returncode is None or not reads.done():
+        while proc.returncode is None or not all(task.done() for task in readers):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                _async_abandon(proc, reads)
+                await _async_abandon(proc, readers)
                 return False
-            if reads.done():
-                await asyncio.sleep(min(_EXIT_POLL, remaining))
+            pending = [task for task in readers if not task.done()]
+            if pending:
+                await asyncio.wait(pending, timeout=min(_EXIT_POLL, remaining))
             else:
-                await asyncio.wait({reads}, timeout=min(_EXIT_POLL, remaining))
+                await asyncio.sleep(min(_EXIT_POLL, remaining))
     except BaseException:
-        _async_abandon(proc, reads)
+        _abandon_now(proc, readers)
         raise
     return True
 
 
-def _async_abandon(proc: asyncio.subprocess.Process, reads: _Reads) -> None:
-    """Stop reading adb's pipes and close them, which a process it started holds."""
-    reads.cancel()
+async def _async_abandon(proc: asyncio.subprocess.Process, readers: _Readers) -> None:
+    """`_abandon_now`, then wait for the cancelled readers to end."""
+    _abandon_now(proc, readers)
+    await asyncio.wait(readers)
+    _failed_read(readers)
+
+
+def _abandon_now(proc: asyncio.subprocess.Process, readers: _Readers) -> None:
+    """Cancel the readers still running and close adb's pipes.
+
+    A process adb started may hold the pipes for as long as it runs. A
+    cancelled reader ends at the next loop iteration.
+    """
+    for task in readers:
+        if not task.done():
+            task.cancel()
+    _failed_read(readers)
     # asyncio has no public way to close a child's pipes. Process keeps its
     # transport as _transport (asyncio/subprocess.py, CPython 3.12 to 3.14), and
     # closing it closes the pipe transports. Left open, they are closed by the
@@ -604,16 +666,33 @@ def _async_abandon(proc: asyncio.subprocess.Process, reads: _Reads) -> None:
         transport.close()
 
 
-async def _async_kill_and_reap(proc: asyncio.subprocess.Process, reads: _Reads) -> None:
-    """Async twin of `_kill_and_reap`."""
+async def _async_kill_and_reap(
+    proc: asyncio.subprocess.Process, readers: _Readers
+) -> None:
+    """Async twin of `_kill_and_reap`.
+
+    The bounded reap runs in a task of its own. A cancellation of the caller
+    that arrives meanwhile waits for it, then propagates, so the child is
+    reaped and its pipes closed before the caller's task ends.
+    """
     if proc.returncode is None:
         with contextlib.suppress(OSError):  # ProcessLookupError: it has just exited
             proc.kill()
-    if not await _async_settle(proc, reads):
+    reap = asyncio.ensure_future(_async_settle(proc, readers))
+    interrupted: asyncio.CancelledError | None = None
+    while not reap.done():
+        try:
+            await asyncio.shield(reap)
+        except asyncio.CancelledError as exc:
+            interrupted = exc
+    if reap.cancelled():  # the loop is shutting down and cancelled it too
+        _abandon_now(proc, readers)
+    elif not reap.result():
         _log_unfinished(proc.pid, proc.returncode, killed=True)
-    elif not reads.cancelled():
-        # Retrieve a failed read's exception: the one propagating already wins.
-        reads.exception()
+    # Retrieve a failed read's exception: the one propagating already wins.
+    _failed_read(readers)
+    if interrupted is not None:
+        raise interrupted
 
 
 def _log_unfinished(pid: int, returncode: int | None, *, killed: bool) -> None:
@@ -714,6 +793,20 @@ def _failure(result: _AdbResult, what: str, *, prefer_stdout: bool = False) -> A
         returncode=result.returncode,
         stderr=result.stderr,
     )
+
+
+def _adb_complaints(result: _AdbResult) -> list[str]:
+    """The non-blank stderr lines of ``result`` other than adb's server start.
+
+    A client that finds no server starts one and says so on stderr, with exit
+    status 0 (``* daemon not running; starting now at tcp:5037``, ``* daemon
+    started successfully``: FINDINGS.md, check 9).
+    """
+    return [
+        line
+        for line in _lines(result.stderr)
+        if line.strip() and not line.startswith(_SERVER_START_PREFIX)
+    ]
 
 
 def _require_success(result: _AdbResult, what: str) -> None:
@@ -1037,7 +1130,7 @@ def _parse_pidof(result: _AdbResult) -> tuple[int, ...]:
             pids.
     """
     tokens = result.stdout.split()
-    if result.returncode in {0, 1} and not tokens and not result.stderr.strip():
+    if result.returncode in {0, 1} and not tokens and not _adb_complaints(result):
         return ()
     if result.returncode != 0:
         raise _failure(result, "adb shell pidof failed")
@@ -1200,10 +1293,12 @@ def _log_marker_argv(adb_path: str, serial: str | None, marker: str) -> tuple[st
 def _parse_log_marker(result: _AdbResult) -> None:
     """Check a ``log -t`` result: status 0 and no output.
 
+    adb's lines about starting its server are no output of ``log``.
+
     Raises:
-        AdbError: adb or ``log`` failed, or printed anything.
+        AdbError: adb or ``log`` failed, or printed anything else.
     """
-    if result.returncode != 0 or result.stdout.strip() or result.stderr.strip():
+    if result.returncode != 0 or result.stdout.strip() or _adb_complaints(result):
         raise _failure(result, "adb shell log failed")
 
 
