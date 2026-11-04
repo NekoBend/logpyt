@@ -1024,6 +1024,9 @@ def test_process_log_parser_missing_close_paren_fallback() -> None:
         "D(" + " " * 50_000,
         "D/(" + " (" * 25_000,
     ],
+    # Short ids: pytest puts the test id in PYTEST_CURRENT_TEST, and Windows
+    # rejects an environment variable longer than 32767 characters.
+    ids=["brief-tag", "threadtime-header", "spaces-only", "brief-paren", "paren-runs"],
 )
 @pytest.mark.parametrize(
     "parser_cls", [ThreadTimeLogParser, BriefLogParser, ProcessLogParser, TagLogParser]
