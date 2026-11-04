@@ -11,6 +11,7 @@ from __future__ import annotations
 import _thread
 import asyncio
 import contextlib
+import gc
 import logging
 import os
 import signal
@@ -1117,6 +1118,30 @@ def _assert_async_reaped_and_closed(proc: asyncio.subprocess.Process) -> None:
         assert pipe.is_closing()
 
 
+# Enough loop iterations for cancelled readers (and a gather of them) to end
+# before the exception handler is checked.
+LOOP_SETTLE = 0.1
+
+
+@contextlib.contextmanager
+def _no_loop_errors() -> Iterator[list[dict[str, Any]]]:
+    """Collect what the running loop's exception handler gets, and expect nothing.
+
+    An exception of a future nobody retrieved reaches it when the future is
+    collected, so the garbage collector runs before the check.
+    """
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    errors: list[dict[str, Any]] = []
+    loop.set_exception_handler(lambda _loop, context: errors.append(context))
+    try:
+        yield errors
+        gc.collect()
+    finally:
+        loop.set_exception_handler(previous)
+    assert errors == []
+
+
 @pytest.mark.usefixtures("quick_reap")
 @pytest.mark.parametrize("timeout", [None, TIMEOUT])
 def test_sync_runner_returns_when_adb_exits_while_its_pipes_are_held(
@@ -1160,14 +1185,19 @@ async def test_async_runner_returns_when_adb_exits_while_its_pipes_are_held(
     spawned: list[Any],
     timeout: float | None,
 ) -> None:
-    """The exit is told by polling returncode (A-14), and the output read is kept."""
+    """The exit is told by polling returncode (A-14), and the output read is kept.
+
+    The readers given up on end without an unretrieved exception.
+    """
     with (
         _adb_leaving_a_holder(tmp_path, "exit") as argv,
         caplog.at_level(logging.WARNING, logger="logpyt.adb"),
+        _no_loop_errors(),
     ):
         started = time.monotonic()
         result = await adb._async_run_adb(argv, timeout=timeout)
         elapsed = time.monotonic() - started
+        await asyncio.sleep(LOOP_SETTLE)
 
     assert elapsed < HELD_LIMIT
     assert result.returncode == 0
@@ -1205,16 +1235,134 @@ async def test_async_runner_timeout_is_bounded_while_its_pipes_are_held(
     with (
         _adb_leaving_a_holder(tmp_path, "hang") as argv,
         caplog.at_level(logging.WARNING, logger="logpyt.adb"),
+        _no_loop_errors(),
     ):
         started = time.monotonic()
         with pytest.raises(TimeoutError, match="the adb process was killed"):
             await adb._async_run_adb(argv, timeout=HOLDER_START)
         elapsed = time.monotonic() - started
+        await asyncio.sleep(LOOP_SETTLE)
 
     assert elapsed < HOLDER_START + HELD_LIMIT
     assert "was killed, but its output pipes were still open" in caplog.text
     (proc,) = spawned
     _assert_async_reaped_and_closed(proc)
+
+
+def _pending_readers() -> list[asyncio.Task[Any]]:
+    """The runner's reader tasks that have not ended."""
+    return [
+        task
+        for task in asyncio.all_tasks()
+        if not task.done() and "_read_into" in repr(task.get_coro())
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("quick_reap")
+@pytest.mark.parametrize("then", ["exit", "hang"])
+async def test_async_read_failure_closes_the_pipes_while_they_are_held(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    spawned: list[Any],
+    then: str,
+) -> None:
+    """A failed read propagates only after adb was reaped and both readers ended.
+
+    The stdout reader fails after its first chunk, while the stderr reader
+    still waits for a holder that keeps the pipes open, before ("hang") or
+    after ("exit") adb exited.
+    """
+    read_into = adb._read_into
+
+    async def failing_stdout(stream, chunks):
+        if stream is not spawned[0].stdout:
+            return await read_into(stream, chunks)
+        await stream.read(adb._READ_CHUNK)
+        msg = "injected read failure"
+        raise OSError(msg)
+
+    monkeypatch.setattr(adb, "_read_into", failing_stdout)
+    with _adb_leaving_a_holder(tmp_path, then) as argv, _no_loop_errors():
+        started = time.monotonic()
+        with pytest.raises(OSError, match="injected read failure"):
+            await adb._async_run_adb(argv, timeout=TIMEOUT)
+        elapsed = time.monotonic() - started
+        await asyncio.sleep(LOOP_SETTLE)
+        assert _pending_readers() == []
+
+    assert elapsed < HELD_LIMIT
+    (proc,) = spawned
+    _assert_async_reaped_and_closed(proc)
+
+
+# _REAP_TIMEOUT for the interrupted-cleanup tests: long enough that the
+# interrupt lands while the reap still waits for the held pipes.
+INTERRUPTED_REAP = 3.0
+
+
+def test_sync_ctrl_c_during_the_reap_still_closes_the_held_pipes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spawned: list[Any]
+) -> None:
+    """A second Ctrl+C while a killed adb is reaped ends the wait, and the pipes
+    a holder keeps open are still closed (POSIX) and adb reaped.
+    """
+    monkeypatch.setattr(adb, "_REAP_TIMEOUT", INTERRUPTED_REAP)
+    drain = adb._drain
+    draining = threading.Event()
+
+    def recording_drain(proc):
+        draining.set()
+        return drain(proc)
+
+    def interrupt() -> None:
+        if draining.wait(HOLDER_START + TIMEOUT):
+            _thread.interrupt_main()
+
+    monkeypatch.setattr(adb, "_drain", recording_drain)
+    helper = threading.Thread(target=interrupt, daemon=True)
+    with _adb_leaving_a_holder(tmp_path, "hang") as argv:
+        helper.start()
+        started = time.monotonic()
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                adb._run_adb(argv, timeout=HOLDER_START)
+        finally:
+            draining.set()
+            helper.join(TIMEOUT)
+        elapsed = time.monotonic() - started
+
+    assert elapsed < HOLDER_START + INTERRUPTED_REAP
+    (proc,) = spawned
+    _assert_reaped_and_closed(proc)
+
+
+@pytest.mark.asyncio
+async def test_async_cancel_during_the_reap_waits_for_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spawned: list[Any]
+) -> None:
+    """A cancellation while a killed adb is reaped propagates only once adb was
+    reaped and its held pipes closed.
+    """
+    monkeypatch.setattr(adb, "_REAP_TIMEOUT", REAP * 5)
+    settle = adb._async_settle
+    settling = asyncio.Event()
+
+    async def recording_settle(proc, readers):
+        settling.set()
+        return await settle(proc, readers)
+
+    monkeypatch.setattr(adb, "_async_settle", recording_settle)
+    with _adb_leaving_a_holder(tmp_path, "hang") as argv, _no_loop_errors():
+        task = asyncio.ensure_future(adb._async_run_adb(argv, timeout=HOLDER_START))
+        await asyncio.wait_for(settling.wait(), HOLDER_START + TIMEOUT)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        (proc,) = spawned
+        _assert_async_reaped_and_closed(proc)
+        await asyncio.sleep(LOOP_SETTLE)
+        assert _pending_readers() == []
 
 
 # -- argv builders -----------------------------------------------------------------
@@ -1343,6 +1491,33 @@ def test_pidof_parser_rejects_the_recorded_injection_output(level: int) -> None:
 
     with pytest.raises(AdbError, match="INJECTED_VIA_SEMICOLON"):
         adb._parse_pidof(_recorded(injected))
+
+
+def _server_start_banner() -> str:
+    """What a client that started the adb server printed on stderr (C09)."""
+    rec = load(facts.FIXTURES / "host", "C09")
+    banner = rec["facts"]["result"]["runs"][0]["client_stderr"]
+    assert banner
+    assert all(line.startswith("* daemon ") for line in banner)
+    return "".join(f"{line}\n" for line in banner)
+
+
+def test_parsers_ignore_the_recorded_server_start_on_stderr() -> None:
+    """A client that had to start the server still succeeded (FINDINGS check 9)."""
+    banner = _server_start_banner()
+
+    assert adb._parse_pidof(_result(returncode=1, stderr=banner)) == ()
+    assert adb._parse_pidof(_result(stdout="42\n", stderr=banner)) == (42,)
+    adb._parse_log_marker(_result(stderr=banner))
+    with pytest.raises(AdbError, match="adb shell log failed"):
+        adb._parse_log_marker(_result(stderr=f"{banner}log: unexpected\n"))
+    with pytest.raises(AdbError, match="cannot connect to daemon"):
+        adb._parse_pidof(
+            _result(
+                returncode=1,
+                stderr="* daemon still not running\nerror: cannot connect to daemon\n",
+            )
+        )
 
 
 def test_pidof_parser_raises_on_an_adb_failure() -> None:
