@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic_core import to_jsonable_python
 
 from .._json import extract_json
 
@@ -108,8 +109,28 @@ class LogEntry(BaseModel):
             its ``repr()``.
 
         """
-        return json.dumps(
-            self.model_dump(mode="json", fallback=repr),
-            ensure_ascii=ensure_ascii,
-            indent=indent,
-        )
+        try:
+            data = self.model_dump(mode="json", fallback=repr)
+        except ValueError:  # e.g. bytes in meta that are not UTF-8
+            data = self.model_dump(mode="json", exclude={"meta"})
+            data["meta"] = _jsonable(self.meta)
+        return json.dumps(data, ensure_ascii=ensure_ascii, indent=indent)
+
+
+def _jsonable(value: Any) -> Any:  # noqa: ANN401  (any meta value)
+    """``value`` as JSON-ready data: what pydantic writes, else its ``repr()``.
+
+    Containers are walked, so one bad value inside a nested dict or list costs
+    only that value.
+    """
+    if isinstance(value, dict):
+        return {
+            key if isinstance(key, str) else repr(key): _jsonable(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list | tuple):
+        return [_jsonable(item) for item in value]
+    try:
+        return to_jsonable_python(value, fallback=repr)
+    except ValueError:
+        return repr(value)

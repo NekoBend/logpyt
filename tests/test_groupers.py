@@ -5,7 +5,7 @@ from typing import cast
 
 import pytest
 
-from logpyt.groupers import LogGrouper
+from logpyt.groupers import LogGrouper, WindowedLogGrouper
 from logpyt.models import LogEntry
 
 
@@ -145,3 +145,33 @@ def test_grouper_max_group_size_force_flushes(base_time: datetime) -> None:
     final = grouper.flush()
     assert len(final) == 1
     assert len(cast("list[LogEntry]", final[0])) == 1
+
+
+@pytest.mark.parametrize("grouper_cls", [LogGrouper, WindowedLogGrouper])
+def test_grouper_takes_aware_and_naive_timestamps_in_one_stream(
+    grouper_cls: type[LogGrouper],
+) -> None:
+    """A zoned line (aware) next to an unparsed one (naive host-local) groups.
+
+    The naive time is read as host-local, so the same moment in both forms is
+    0 ms apart, on any host zone.
+    """
+    aware = datetime(2026, 11, 4, 4, 21, 44, tzinfo=UTC)
+    naive = aware.astimezone().replace(tzinfo=None)
+    entries = [
+        _mixed_entry(aware),
+        _mixed_entry(naive),
+        _mixed_entry(aware + timedelta(milliseconds=10)),
+    ]
+    grouper = grouper_cls(by=["tag"], threshold_ms=1000, emit_mode="group")
+
+    emitted = [item for entry in entries for item in grouper.process(entry)]
+    emitted += grouper.flush()
+
+    assert emitted == [entries]
+
+
+def _mixed_entry(timestamp: datetime) -> LogEntry:
+    return LogEntry(
+        timestamp=timestamp, pid=1, tid=1, level="I", tag="T", message="m", raw="m"
+    )

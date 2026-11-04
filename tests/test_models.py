@@ -270,6 +270,26 @@ def test_to_json_writes_non_json_meta_as_repr() -> None:
     assert json.loads(entry.to_json())["meta"] == {"obj": "<opaque>", "n": 1}
 
 
+@pytest.mark.parametrize(
+    ("meta", "expected"),
+    [
+        ({"value": b"\xff"}, {"value": "b'\\xff'"}),
+        (
+            {"n": {"b": b"\xfe", "ok": b"abc"}, "l": [b"\xff", 1]},
+            {"n": {"b": "b'\\xfe'", "ok": "abc"}, "l": ["b'\\xff'", 1]},
+        ),
+    ],
+    ids=["direct", "nested"],
+)
+def test_to_json_writes_non_utf8_bytes_as_repr(
+    meta: dict[str, Any], expected: dict[str, Any]
+) -> None:
+    """pydantic writes bytes as UTF-8 text and fails on others: those are repr()."""
+    entry = _entry(meta=meta)
+
+    assert json.loads(entry.to_json())["meta"] == expected
+
+
 def test_to_json_options_are_keyword_only() -> None:
     """to_json takes indent and ensure_ascii as keywords only."""
     with pytest.raises(TypeError):

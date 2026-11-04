@@ -1038,3 +1038,52 @@ def test_long_runs_of_spaces_parse_in_linear_time(
     start = time.perf_counter()
     parser_cls().parse(line, _ctx())
     assert time.perf_counter() - start < 0.5
+
+
+def test_first_feb29_line_looks_back_past_a_century_without_leap_day() -> None:
+    """2100 is no leap year: the latest Feb 29 before 2101-03-01 is in 2096 (A.15)."""
+    line = "02-29 12:00:00.000  1  1 I T: x"
+
+    entry = ThreadTimeLogParser().parse(line, ParseContext(anchor=datetime(2101, 3, 1)))  # noqa: DTZ001
+
+    assert entry is not None
+    assert entry.timestamp == datetime(2096, 2, 29, 12)  # noqa: DTZ001
+
+
+def test_epoch_line_whose_zone_passes_year_9999_is_rejected() -> None:
+    """The UTC moment fits, its wall clock at +0100 does not: no entry, no raise."""
+    line = "253402300799.999999 +0100  1  1 I T: x"
+
+    assert ThreadTimeLogParser().parse(line, ParseContext()) is None
+
+
+@pytest.mark.parametrize(
+    ("zone", "anchor"),
+    [
+        ("EST5", datetime.min.replace(tzinfo=UTC)),
+        ("XXX-14", datetime.max.replace(tzinfo=UTC)),
+    ],
+    ids=["min-west", "max-east"],
+)
+def test_explicit_year_ignores_an_anchor_the_host_zone_cannot_hold(
+    monkeypatch: pytest.MonkeyPatch, zone: str, anchor: datetime
+) -> None:
+    """year= decides the first line, so the anchor is never converted."""
+    if sys.platform == "win32":
+        pytest.skip(
+            "time.tzset() is POSIX-only; the Windows jobs have no in-process TZ check"
+        )
+    else:
+        try:
+            monkeypatch.setenv("TZ", zone)
+            time.tzset()
+            ctx = ParseContext(year=2026, anchor=anchor)
+            entry = ThreadTimeLogParser().parse("06-01 12:00:00.000  1  1 I T: x", ctx)
+            fallback = ctx.anchor
+        finally:
+            monkeypatch.undo()
+            time.tzset()
+
+        assert entry is not None
+        assert entry.timestamp == datetime(2026, 6, 1, 12)  # noqa: DTZ001
+        assert fallback == anchor.replace(tzinfo=None)

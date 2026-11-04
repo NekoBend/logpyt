@@ -19,6 +19,9 @@ _NEIGHBOUR_YEARS = (-1, 0, 1)
 # Feb 29 exists only in leap years, so its candidates are the leap years
 # within this many years of the reference (D-12).
 _LEAP_SEARCH_YEARS = 4
+# The first line looks back further for Feb 29 (A.15): leap years are up to
+# eight years apart around a century that is no leap year (2096, 2104).
+_FIRST_LINE_LEAP_SEARCH_YEARS = 8
 # Half a year: a candidate in the reference's own year that is this close is
 # the nearest one without trying the neighbours (fast path).
 _SAME_YEAR_SPAN = timedelta(days=182)
@@ -44,12 +47,26 @@ def _naive_local(moment: datetime) -> datetime:
     return moment.astimezone().replace(tzinfo=None)
 
 
+def _local_or_wall_clock(moment: datetime) -> datetime:
+    """``moment`` as naive host-local time, or its own wall clock when the
+    host-local zone cannot represent it (an anchor near year 1 or 9999).
+    """
+    try:
+        return _naive_local(moment)
+    except (OverflowError, ValueError, OSError):
+        return moment.replace(tzinfo=None)
+
+
 def _candidate_years(
-    month: int, day: int, year: int, spread: tuple[int, ...]
+    month: int,
+    day: int,
+    year: int,
+    spread: tuple[int, ...],
+    leap_search: int = _LEAP_SEARCH_YEARS,
 ) -> list[int]:
     """The years a ``month``-``day`` date may be placed in, near ``year``."""
     if month == 2 and day == 29:
-        span = range(year - _LEAP_SEARCH_YEARS, year + _LEAP_SEARCH_YEARS + 1)
+        span = range(year - leap_search, year + leap_search + 1)
         years = [y for y in span if calendar.isleap(y)]
     else:
         years = [year + delta for delta in spread]
@@ -114,7 +131,7 @@ class ParseContext:
             msg = f"anchor must be a datetime, not {type(anchor).__name__}"
             raise TypeError(msg)
         self._year = year
-        self._anchor = None if anchor is None else _naive_local(anchor)
+        self._anchor = None if anchor is None else _local_or_wall_clock(anchor)
         self._previous: datetime | None = None
 
     @property
@@ -124,7 +141,11 @@ class ParseContext:
 
     @property
     def anchor(self) -> datetime | None:
-        """The naive host-local moment the first yearless line is placed before."""
+        """The naive host-local moment the first yearless line is placed before.
+
+        An aware anchor the host-local zone cannot represent keeps its wall
+        clock.
+        """
         return self._anchor
 
     def now(self) -> datetime:  # noqa: PLR6301  (per-session interface; no state yet)
@@ -259,7 +280,9 @@ class ParseContext:
             latest = datetime.max  # noqa: DTZ901  (naive, like the candidates)
         candidates = [
             candidate
-            for year in _candidate_years(month, day, anchor.year, _NEIGHBOUR_YEARS)
+            for year in _candidate_years(
+                month, day, anchor.year, _NEIGHBOUR_YEARS, _FIRST_LINE_LEAP_SEARCH_YEARS
+            )
             if (candidate := cls._build(year, month, day, hour, minute, second, us))
             is not None
         ]

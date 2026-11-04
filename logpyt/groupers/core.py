@@ -16,6 +16,24 @@ if TYPE_CHECKING:
 EmitMode = Literal["entry", "group"]
 
 
+def _like(ts: datetime, other: datetime) -> datetime:
+    """``ts`` with the awareness of ``other``, so the two can be subtracted.
+
+    Zoned and epoch lines carry aware timestamps, while unparsed entries (a
+    buffer divider, a malformed line) carry naive host-local ones, so one
+    stream can mix both. An aware time becomes naive host-local; a naive time
+    is read as host-local. A time the host-local zone cannot represent keeps
+    its wall clock instead.
+    """
+    if (ts.tzinfo is None) == (other.tzinfo is None):
+        return ts
+    try:
+        local = ts.astimezone()
+    except (OverflowError, ValueError, OSError):
+        return ts.replace(tzinfo=other.tzinfo)
+    return local.replace(tzinfo=None) if other.tzinfo is None else local
+
+
 class LogGrouper:
     """Groups consecutive log entries based on fields and time threshold.
 
@@ -125,7 +143,8 @@ class LogGrouper:
 
         # 2. Time difference must be within threshold
         last_entry = self._buffer[-1]
-        time_diff = (entry.timestamp - last_entry.timestamp).total_seconds() * 1000
+        previous = last_entry.timestamp
+        time_diff = (_like(entry.timestamp, previous) - previous).total_seconds() * 1000
         # We assume logs are mostly ordered, but take abs just in case of slight jitter,
         # though strictly speaking "consecutive" usually implies forward flow.
         # If the new entry is OLDER than the last one by more than threshold,
@@ -239,7 +258,7 @@ class WindowedLogGrouper(LogGrouper):
         """
         if self._anchor is None:
             self._anchor = ts
-        return (ts - self._anchor).total_seconds() * 1000.0
+        return (_like(ts, self._anchor) - self._anchor).total_seconds() * 1000.0
 
     def _maybe_compact_heap(self) -> None:
         """Compact stale heap entries when lazy invalidation grows too much."""
