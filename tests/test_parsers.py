@@ -218,6 +218,11 @@ def test_divider_lines_are_recognised() -> None:
     assert is_divider("--------- switch to crash")
     assert not is_divider("-------- not quite")
     assert not is_divider("11-19 12:34:56.789  1  1 D T: --------- beginning of")
+    # The whole line must have the divider shape: a -v raw message that only
+    # starts with one is a log line.
+    assert not is_divider("--------- beginning of main loop")
+    assert not is_divider("--------- switch to crash: x")
+    assert not is_divider("--------- beginning of Main")
 
 
 # -- ThreadTimeLogParser -------------------------------------------------------------

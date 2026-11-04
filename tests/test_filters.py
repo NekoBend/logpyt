@@ -27,7 +27,7 @@ from logpyt.filters import (
     Where,
 )
 from logpyt.models import LogEntry
-from logpyt.readers import LogFileReader, read_file
+from logpyt.readers import read_file
 from logpyt.streams import AsyncLogStream, LogStream
 from logpyt.streams.common import build_pidof_command
 
@@ -1414,9 +1414,9 @@ def test_repr_shows_the_tree() -> None:
 
 
 def test_entry_points_take_any_condition(tmp_path: Path) -> None:
-    """LogStream, AsyncLogStream, LogFileReader and read_file take any Condition; a
-    bare function raises TypeError that points to Where (read_file, a generator,
-    raises it at the first next()).
+    """LogStream, AsyncLogStream (filter_by=) and read_file (where=) take any
+    Condition; a bare function raises TypeError that points to Where, read_file
+    when it is called.
     """
     path = tmp_path / "app.log"
     path.write_text(
@@ -1426,8 +1426,8 @@ def test_entry_points_take_any_condition(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     anr = AnrCondition(package="com.android.settings")
-    assert [e.level for e in read_file(path, filter_by=anr, year=2026)] == ["E"]
-    assert [e.level for e in LogFileReader(path, filter_by=~anr, year=2026)] == ["I"]
+    assert [e.level for e in read_file(path, where=anr, year=2026)] == ["E"]
+    assert [e.level for e in read_file(path, where=~anr, year=2026)] == ["I"]
     assert LogStream(adb_path="adb", filter_by=anr | Tag("x")).filter_by is not None
     assert AsyncLogStream(adb_path="adb", filter_by=Where(bool)).filter_by is not None
 
@@ -1438,11 +1438,8 @@ def test_entry_points_take_any_condition(tmp_path: Path) -> None:
         LogStream(adb_path="adb", filter_by=keep)  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError, match=r"filter_by must be a Condition.*Where"):
         AsyncLogStream(adb_path="adb", filter_by=keep)  # ty: ignore[invalid-argument-type]
-    with pytest.raises(TypeError, match=r"filter_by must be a Condition.*Where"):
-        LogFileReader(path, filter_by=keep)  # ty: ignore[invalid-argument-type]
-    lazy = read_file(path, filter_by=keep)  # ty: ignore[invalid-argument-type]
-    with pytest.raises(TypeError, match=r"filter_by must be a Condition.*Where"):
-        next(lazy)
+    with pytest.raises(TypeError, match=r"where must be a Condition.*Where"):
+        read_file(path, where=keep)  # ty: ignore[invalid-argument-type]
 
 
 def test_pidof_names_are_validated_where_they_reach_adb() -> None:

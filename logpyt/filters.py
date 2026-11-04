@@ -32,8 +32,9 @@ recurse.
 stream attributes the packages of `Condition.packages`: every `Package` in the
 tree, under `Or`, `Not` and a `Where` that wraps a condition too (F5-1), and
 for a condition anywhere in the tree whose class overrides ``packages()``, what
-that override returns. A log file carries no attribution, so a `Package`
-matches none of its entries.
+that override returns. A log file carries no attribution of its own:
+`logpyt.read_file` attributes its lines only from a ``uid_packages`` map, and
+refuses a condition whose ``packages()`` is not empty without one (F5-4).
 """
 
 from __future__ import annotations

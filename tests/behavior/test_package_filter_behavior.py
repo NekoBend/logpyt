@@ -43,7 +43,6 @@ import pytest
 from logpyt import (
     AsyncLogStream,
     Filter,
-    LogFileReader,
     LogStream,
     ThreadTimeLogParser,
     read_file,
@@ -1096,21 +1095,44 @@ def _write_log(path: Path) -> Path:
     return path
 
 
-def test_file_reader_package_filter_yields_nothing(tmp_path: Path) -> None:
-    """LogFileReader with Filter(package=...) yields no entries: a log file carries no
-    pid-to-package mapping, so no line can match (pinned; F5-4 is a docs item).
-    """
-    path = _write_log(tmp_path / "app.log")
-
-    assert [e.message for e in LogFileReader(path)] == ["mine 1", "mine 2"]
-    assert list(LogFileReader(path, filter_by=Filter(package=PACKAGE))) == []
-
-
-def test_read_file_package_condition_yields_nothing(tmp_path: Path) -> None:
-    """read_file with a bare Package(...) condition yields no entries for the same
-    reason as Filter(package=...) (pinned; F5-4 is a docs item).
+@pytest.mark.parametrize(
+    "where",
+    [Filter(package=PACKAGE), Package(PACKAGE)],
+    ids=["filter", "package"],
+)
+def test_read_file_package_condition_needs_a_uid_map(
+    tmp_path: Path, where: Condition
+) -> None:
+    """read_file with a package condition and no uid map raises ValueError: a log
+    file carries no package attribution, so the condition could match nothing
+    (F5-4). The error comes before the file is read.
     """
     path = _write_log(tmp_path / "app.log")
 
     assert [e.message for e in read_file(path)] == ["mine 1", "mine 2"]
-    assert list(read_file(path, filter_by=Package(PACKAGE))) == []
+    with pytest.raises(ValueError, match="uid_packages"):
+        read_file(path, where=where)
+
+
+def test_read_file_package_condition_with_uid_map_yields_its_lines(
+    tmp_path: Path,
+) -> None:
+    """With uid_packages, a package condition keeps the lines whose -v uid column
+    the map names for that package.
+    """
+    path = tmp_path / "uid.log"
+    path.write_text(
+        "2026-11-04 05:11:16.661446 +0000 10065  1234  1234 I App: mine\n"
+        "2026-11-04 05:11:16.661447 +0000 10066  5678  5678 I App: theirs\n"
+        "2026-11-04 05:11:16.661448 +0000 10065  4321  4321 I App: mine again\n",
+        encoding="utf-8",
+    )
+
+    entries = list(
+        read_file(path, where=Filter(package=PACKAGE), uid_packages={10065: PACKAGE})
+    )
+
+    assert [(e.message, e.package) for e in entries] == [
+        ("mine", PACKAGE),
+        ("mine again", PACKAGE),
+    ]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 from ..models import LogEntry
@@ -13,8 +14,11 @@ if TYPE_CHECKING:
 __all__ = ["is_divider", "strip_terminator", "unparsed_entry"]
 
 # logcat's buffer dividers ("--------- beginning of main", "--------- switch
-# to crash"): output of logcat itself, not a log line of any format.
+# to crash"): output of logcat itself, not a log line of any format. The whole
+# line must have that shape, buffer name included: readers drop dividers, so a
+# looser match would drop a -v raw message that starts with dashes.
 _DIVIDER_PREFIX = "--------- "
+_DIVIDER = re.compile(r"--------- (?:beginning of|switch to) [a-z]+")
 
 
 def strip_terminator(line: str) -> str:
@@ -30,7 +34,8 @@ def strip_terminator(line: str) -> str:
 
 def is_divider(text: str) -> bool:
     """Is ``text`` (a line without its terminator) a logcat buffer divider?"""
-    return text.startswith(_DIVIDER_PREFIX)
+    # startswith first: the regex runs only for the rare candidate.
+    return text.startswith(_DIVIDER_PREFIX) and _DIVIDER.fullmatch(text) is not None
 
 
 def unparsed_entry(line: str, ctx: ParseContext, *, level: LogLevel = "I") -> LogEntry:

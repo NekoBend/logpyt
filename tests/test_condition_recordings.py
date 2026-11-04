@@ -193,7 +193,7 @@ def test_read_file_filters_a_recording_by_crash_or_anr(
     )
     condition = CrashCondition(package=APP) | AnrCondition(package=APP)
 
-    found = [(e.tag, e.level, e.message) for e in read_file(path, filter_by=condition)]
+    found = [(e.tag, e.level, e.message) for e in read_file(path, where=condition)]
 
     expected = [
         (tag, lvl, message)

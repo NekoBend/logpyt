@@ -76,3 +76,11 @@ Rules:
 | tests/test_utils.py::test_wait_for_device_timeout | tests/test_adb.py::test_wait_for_device_timeout_kills_the_child |
 | tests/test_groupers.py::test_grouper_emit_mode_entry | tests/test_grouping.py::test_group_is_a_sequence_of_its_entries |
 | tests/test_windowed_grouper_lazy.py::test_windowed_grouper_emit_mode_entry_flattens_on_flush | tests/test_grouping.py::test_group_is_a_sequence_of_its_entries |
+| tests/test_readers.py::test_log_file_reader_basic_reading | tests/test_readers.py::test_read_file_yields_parsed_and_unparsed_entries |
+| tests/test_readers.py::test_log_file_reader_error_handling | tests/test_readers.py::test_parser_exception_propagates |
+| tests/test_readers.py::test_log_file_reader_filtering | tests/test_readers.py::test_where_filters_entries |
+| tests/test_readers.py::test_log_file_reader_parse_error_logging_sanitizes_and_caps_preview | tests/test_readers.py::test_unparsed_line_becomes_fallback_entry |
+| tests/test_readers.py::test_log_file_reader_parse_error_logging_throttled | covered by tests/test_readers.py::test_parser_exception_propagates |
+| tests/behavior/test_offline_behavior.py::test_reader_filter_by_yields_only_matching_entries | tests/behavior/test_offline_behavior.py::test_reader_where_yields_only_matching_entries |
+| tests/behavior/test_package_filter_behavior.py::test_file_reader_package_filter_yields_nothing | tests/behavior/test_package_filter_behavior.py::test_read_file_package_condition_needs_a_uid_map |
+| tests/behavior/test_package_filter_behavior.py::test_read_file_package_condition_yields_nothing | tests/behavior/test_package_filter_behavior.py::test_read_file_package_condition_needs_a_uid_map |
