@@ -5,16 +5,20 @@ API only (constructor arguments, start/stop/kill/join, callbacks, hooks,
 exceptions, ``async with``), so they must survive an internal rewrite.
 
 Known bugs are written for the correct behavior and marked
-``xfail(strict=True)`` with the plan id from
-``.docs/review-findings-2.0.1.md``. Where the correct behavior is still an open
-API decision (``D-*``), only what is clearly required is asserted.
+``xfail(strict=True, raises=AssertionError)`` with the plan id from
+``.docs/review-findings-2.0.1.md``, so a harness error or timeout is reported
+as a failure, not as the expected defect. Where the correct behavior is still
+an open API decision (``D-*``), only what is clearly required is asserted.
+
+Interleavings "during the spawn" use the harness spawn gate
+(``FakeAdb.hold_spawn``), and "adb is gone" checks use the harness child
+registry (``FakeAdb.async_survivors``), so both hold on every platform.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import os
 import sys
 from typing import TYPE_CHECKING
 
@@ -39,6 +43,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable
 
     from logpyt import AsyncStreamHandle, LogEntry
+    from tests.conftest import SpawnedChild
 
 # Generous bound for "the stream finishes" when nothing should block it. It also
 # bounds every start()/stop()/kill() call, so a hang fails the test, not CI.
@@ -98,30 +103,15 @@ async def shutdown(stream: AsyncLogStream) -> None:
         await asyncio.wait_for(stream.join(), JOIN_TIMEOUT)
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)  # signal 0 only probes; nothing is delivered on POSIX
-    except (ProcessLookupError, PermissionError):
-        return False
-    return True
-
-
-async def live_adb_pids(
+async def logcat_survivors(
     fake: FakeAdb, timeout: float = PROMPT_END_TIMEOUT
-) -> list[int]:
-    """PIDs of fake ``adb logcat`` children still alive after up to ``timeout``.
+) -> list[SpawnedChild]:
+    """Fake ``adb logcat`` children still alive after up to ``timeout``.
 
-    POSIX only: on Windows ``os.kill`` terminates instead of probing, so this
-    returns ``[]`` there and only the stream-level assertions of a test apply.
+    Reads the harness child registry, so it checks on every platform and
+    never takes an exit status away from the library.
     """
-    if sys.platform == "win32":
-        return []
-    pids = [call["pid"] for call in fake.calls("logcat")]
-    with contextlib.suppress(TimeoutError):
-        await async_wait_until(
-            lambda: not any(_pid_alive(pid) for pid in pids), timeout=timeout
-        )
-    return [pid for pid in pids if _pid_alive(pid)]
+    return await fake.async_survivors(timeout, command="logcat")
 
 
 class Recorder:
@@ -229,32 +219,42 @@ async def test_stderr_output_reaches_only_stderr_callback(fake_adb: FakeAdb) -> 
     assert [e.message for e in rec.stderr_entries] == ["adb: warning from stderr"]
 
 
-# On Windows the pipe read size (and so the burst seen per event-loop turn) is
-# different and was not observed; only Linux reproduces X-1 for certain.
 @pytest.mark.xfail(
-    strict=sys.platform != "win32",
+    strict=True,
+    raises=AssertionError,
     reason="X-1: default queue drops a burst; ingestion starves the dispatcher",
 )
 @pytest.mark.asyncio
 async def test_burst_of_10000_lines_is_fully_delivered_with_defaults(
     fake_adb: FakeAdb,
 ) -> None:
-    """A one-shot burst of 10,000 lines with a trivial callback is fully delivered.
+    """A 10,000-line burst waiting at start is fully delivered to a trivial callback.
 
-    ``adb logcat`` dumps its whole ring buffer on start, so this is default use.
+    ``adb logcat`` dumps its whole ring buffer on start (tens of thousands of
+    lines on a booted emulator, .docs/device-probes-2026-11-04.md), so this is
+    default use. The spawn gate holds the spawn until adb has written the
+    whole burst: asyncio keeps reading adb's pipe meanwhile, so all of the
+    burst except what the OS pipe still holds is already buffered when the
+    stream reads its first line. Without the gate, the lines read per
+    event-loop turn follow the platform's pipe size (Windows CI passed it).
     """
     count = 10_000
-    fake_adb.logcat(run(lines(count, threadtime("m{i}"))))
+    fake_adb.logcat(run(lines(count, threadtime("m{i}")), touch("burst-written")))
     delivered: list[str] = []
 
     async def on_entry(entry: LogEntry, _handle: AsyncStreamHandle) -> None:
         delivered.append(entry.message)
 
     stream = AsyncLogStream(stdout_callback=on_entry)
+    gate = fake_adb.hold_spawn(command="logcat")
     try:
         await bounded(stream.start())
+        await gate.async_wait_entered()
+        await fake_adb.async_wait_for("burst-written")
+        gate.release()
         outcome = await join_outcome(stream)
     finally:
+        gate.release()
         await shutdown(stream)
 
     assert outcome is None
@@ -264,6 +264,7 @@ async def test_burst_of_10000_lines_is_fully_delivered_with_defaults(
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="F1-3: EOF dispatcher drain is capped at 2 s and discards the rest",
 )
 @pytest.mark.asyncio
@@ -295,6 +296,7 @@ async def test_all_accepted_entries_are_delivered_after_eof_with_a_slow_callback
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="F4-1: read_timeout is per pipe, so the silent stderr kills the stream",
 )
 @pytest.mark.asyncio
@@ -339,7 +341,7 @@ async def test_read_timeout_ends_a_silent_stream_and_join_raises(
     try:
         await bounded(stream.start())
         outcome = await join_outcome(stream)
-        survivors = await live_adb_pids(fake_adb)
+        survivors = await logcat_survivors(fake_adb)
     finally:
         await shutdown(stream)
 
@@ -351,6 +353,13 @@ async def test_read_timeout_ends_a_silent_stream_and_join_raises(
 
 # -- exit status ------------------------------------------------------------
 
+# A failed adb logcat for the exit-status tests. Not the absent-device case:
+# real ``adb logcat`` blocks waiting for an absent device instead of exiting
+# (.docs/device-probes-2026-11-04.md). 255 is the one non-zero logcat exit
+# status observed on a device (cause unknown); the stderr text is neutral.
+FAILED_LOGCAT_EXIT = 255
+FAILED_LOGCAT_STDERR = "fake adb: logcat failed\n"
+
 
 @pytest.mark.asyncio
 async def test_non_zero_adb_exit_makes_join_raise(fake_adb: FakeAdb) -> None:
@@ -358,7 +367,7 @@ async def test_non_zero_adb_exit_makes_join_raise(fake_adb: FakeAdb) -> None:
 
     The failure is reported as an error, not as a user kill.
     """
-    fake_adb.logcat(run(err("error: no devices/emulators found\n"), exit_code=1))
+    fake_adb.logcat(run(err(FAILED_LOGCAT_STDERR), exit_code=FAILED_LOGCAT_EXIT))
     rec = Recorder()
     stream = _stream(rec)
     try:
@@ -408,7 +417,7 @@ async def test_stop_ends_a_stream_whose_adb_never_exits(fake_adb: FakeAdb) -> No
         await bounded(stream.stop())
         outcome = await join_outcome(stream)
         state = stream.state
-        survivors = await live_adb_pids(fake_adb)
+        survivors = await logcat_survivors(fake_adb)
     finally:
         await shutdown(stream)
 
@@ -432,7 +441,7 @@ async def test_kill_of_a_running_stream_makes_join_raise_killed(
         await bounded(stream.kill())
         outcome = await join_outcome(stream)
         state = stream.state
-        survivors = await live_adb_pids(fake_adb)
+        survivors = await logcat_survivors(fake_adb)
     finally:
         await shutdown(stream)
 
@@ -445,7 +454,14 @@ async def test_kill_of_a_running_stream_makes_join_raise_killed(
 async def test_kill_right_after_start_makes_join_raise_killed(
     fake_adb: FakeAdb,
 ) -> None:
-    """kill() right after start() returns makes join() raise LogStreamKilledError."""
+    """kill() right after start() returns makes join() raise LogStreamKilledError.
+
+    In 2.0.0, start() only schedules the spawn and kill() does not yield, so
+    this kill lands before any adb is spawned and there is no child to check.
+    A kill during the spawn and one after it are pinned, each with an "adb is
+    gone" check, by the next test and by
+    test_kill_of_a_running_stream_makes_join_raise_killed.
+    """
     fake_adb.logcat(run(out(threadtime("alive")), hang=True))
     rec = Recorder()
     stream = _stream(rec)
@@ -453,37 +469,46 @@ async def test_kill_right_after_start_makes_join_raise_killed(
         await bounded(stream.start())
         await bounded(stream.kill())
         outcome = await join_outcome(stream)
-        survivors = await live_adb_pids(fake_adb)
+        state = stream.state
     finally:
         await shutdown(stream)
 
     assert isinstance(outcome, LogStreamKilledError)
-    assert survivors == []
+    assert state is StreamState.KILLED
 
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="F2-1: RUNNING after spawn overwrites a kill() issued during the spawn",
 )
 @pytest.mark.asyncio
 async def test_kill_while_adb_is_being_spawned_makes_join_raise_killed(
     fake_adb: FakeAdb,
 ) -> None:
-    """kill() while adb is being spawned makes join() raise LogStreamKilledError."""
+    """kill() while adb is being spawned makes join() raise LogStreamKilledError.
+
+    The spawn gate holds the spawn after the adb child exists but before the
+    library receives it, so kill() lands inside the spawn every time. The adb
+    spawned meanwhile must not outlive the stream.
+    """
     fake_adb.logcat(run(out(threadtime("alive")), hang=True))
     rec = Recorder()
     stream = _stream(rec)
+    gate = fake_adb.hold_spawn(command="logcat")
     try:
         await bounded(stream.start())
-        # One event-loop turn (not a timed wait): the stream begins spawning
-        # adb and suspends inside the spawn await.
-        await asyncio.sleep(0)
+        await gate.async_wait_entered()
         await bounded(stream.kill())
+        gate.release()
         outcome = await join_outcome(stream)
+        survivors = await logcat_survivors(fake_adb)
     finally:
+        gate.release()
         await shutdown(stream)
 
     assert isinstance(outcome, LogStreamKilledError)
+    assert survivors == []
 
 
 async def _stop_then_join(stream: AsyncLogStream) -> None:
@@ -497,6 +522,7 @@ async def _stop_then_join(stream: AsyncLogStream) -> None:
 )
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="F2-10: async stop() never escalates terminate() to kill()",
 )
 @pytest.mark.asyncio
@@ -515,7 +541,7 @@ async def test_stop_ends_an_adb_that_ignores_sigterm(fake_adb: FakeAdb) -> None:
         outcome = await outcome_of(_stop_then_join(stream), ESCALATION_TIMEOUT)
         # Asserted before shutdown(), whose kill() would end adb anyway.
         assert outcome is not HUNG
-        assert await live_adb_pids(fake_adb) == []
+        assert await logcat_survivors(fake_adb) == []
     finally:
         await shutdown(stream)
 
@@ -525,6 +551,7 @@ async def test_stop_ends_an_adb_that_ignores_sigterm(fake_adb: FakeAdb) -> None:
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="F2-5: a raising on_state(STARTING) leaves the stream stuck in STARTING",
 )
 @pytest.mark.asyncio
@@ -577,6 +604,7 @@ class _ExplodingCondition(Condition):
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="F3-1: a filter_by exception ends the reader but leaves adb running",
 )
 @pytest.mark.asyncio
@@ -594,7 +622,7 @@ async def test_raising_filter_ends_the_stream(fake_adb: FakeAdb) -> None:
         # Asserted before shutdown(), whose kill() would end adb anyway.
         assert outcome is not HUNG
         assert stream.state in TERMINAL_STATES
-        assert await live_adb_pids(fake_adb) == []
+        assert await logcat_survivors(fake_adb) == []
     finally:
         await shutdown(stream)
 
@@ -664,6 +692,7 @@ async def test_auto_reconnect_spawns_a_new_adb_after_a_failed_exit(
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="F2-4: start() never clears the previous run's errors",
 )
 @pytest.mark.asyncio
@@ -672,7 +701,7 @@ async def test_restart_after_a_failed_run_joins_cleanly_when_the_new_run_succeed
 ) -> None:
     """After a failed run, a restarted run whose adb exits 0 lets join() return."""
     fake_adb.logcat(
-        run(err("error: device offline\n"), exit_code=1),
+        run(err(FAILED_LOGCAT_STDERR), exit_code=FAILED_LOGCAT_EXIT),
         run(out(threadtime("second run"))),
     )
     rec = Recorder()
@@ -708,7 +737,7 @@ async def test_leaving_async_with_stops_the_stream(fake_adb: FakeAdb) -> None:
 
     try:
         inside, after = await asyncio.wait_for(use_stream(), JOIN_TIMEOUT)
-        survivors = await live_adb_pids(fake_adb)
+        survivors = await logcat_survivors(fake_adb)
     finally:
         await shutdown(stream)
 

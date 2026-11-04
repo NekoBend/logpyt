@@ -14,9 +14,10 @@ from __future__ import annotations
 import csv
 import json
 import sys
+import threading
 import time
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
 
 import pytest
 
@@ -508,43 +509,60 @@ def test_json_payload_is_none_without_json() -> None:
     assert _entry("no braces or brackets here").json_payload is None
 
 
-def _one_parse_seconds(text: str) -> tuple[float, bool]:
-    """Best-of-5 cost of one stdlib JSON parse of ``text``; did it hit recursion?"""
+# The F8-1 run happens on a thread with this C stack: on 3.14 the decoder's
+# nesting limit follows the stack size, so a fixed size keeps the limit (and the
+# defect's cost) independent of the runner's stack rlimit. 8 MiB matches Linux's
+# default main-thread stack (ulimit -s 8192), which the test used to run on.
+_DEEP_STACK_BYTES = 8 * 1024 * 1024
+_DEEP_MIN_DEPTH = 2**8
+_DEEP_MAX_DEPTH = 2**20
+_DEEP_CANDIDATES = 4096  # candidate starts extract_json tries (finding F8-1)
+_DEEP_RUN_TIMEOUT = 90.0
+
+
+def _parse_recurses(text: str) -> bool:
+    """Does one stdlib JSON parse of ``text`` hit RecursionError?"""
+    try:
+        json.loads(text)
+    except RecursionError:
+        return True
+    except ValueError:
+        return False
+    return False
+
+
+def _one_parse_seconds(text: str) -> float:
+    """Best-of-5 cost of one stdlib JSON parse of ``text``."""
     best = float("inf")
-    recursed = False
     for _ in range(5):
         start = time.perf_counter()
-        try:
-            json.loads(text)
-        except RecursionError:
-            recursed = True
-        except ValueError:
-            pass
+        _parse_recurses(text)
         best = min(best, time.perf_counter() - start)
-    return best, recursed
+    return best
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="F8-1: extract_json re-parses deep nesting up to 4096 times",
-)
-def test_json_payload_on_deep_brackets_returns_quickly() -> None:
-    """json_payload on 65536 '[' returns None quickly, not after seconds of CPU.
+class _DeepBracketsRun(NamedTuple):
+    length: int
+    budget: float
+    elapsed: float
+    payload: object
 
-    The budget is "within 1 s and within ~50 single parse attempts of the same
-    text (+20 ms)". The relative part keeps the check meaningful on every
-    Python version: the C decoder's nesting limit, hence the cost of one
-    attempt, differs a lot between 3.12, 3.13 and 3.14 (on 3.12/3.13 the bug
-    costs well under 1 s but still ~4096 attempts). An interpreter whose stack
-    decodes all 65536 levels without RecursionError never reaches the slow
-    path, so the check is skipped there instead of passing vacuously.
+
+def _deep_brackets_run() -> _DeepBracketsRun | None:
+    """Time json_payload on '[' nested past this thread's decoder limit.
+
+    The depth is the first power of two from ``_DEEP_MIN_DEPTH`` whose parse
+    hits RecursionError, plus ``_DEEP_CANDIDATES`` levels, so every candidate
+    start the scanner tries still has that many levels ahead and recurses too.
+    None when nothing up to ``_DEEP_MAX_DEPTH`` levels recurses.
     """
-    message = "[" * 65536
-    one_parse, recursed = _one_parse_seconds(message)
-    if not recursed:
-        pytest.skip("65536 nested '[' decode without RecursionError here")
-    budget = min(1.0, 50 * one_parse + 0.02)
+    depth = _DEEP_MIN_DEPTH
+    while depth <= _DEEP_MAX_DEPTH and not _parse_recurses("[" * depth):
+        depth *= 2
+    if depth > _DEEP_MAX_DEPTH:
+        return None
+    message = "[" * (depth + _DEEP_CANDIDATES)
+    budget = min(1.0, 50 * _one_parse_seconds(message) + 0.02)
 
     payload: object = "not computed"
     elapsed = float("inf")
@@ -555,9 +573,73 @@ def test_json_payload_on_deep_brackets_returns_quickly() -> None:
         elapsed = time.perf_counter() - start
         if elapsed <= budget or elapsed > 5 * budget:
             break
+    return _DeepBracketsRun(len(message), budget, elapsed, payload)
 
-    assert payload is None
-    assert elapsed <= budget, f"json_payload took {elapsed:.3f}s (budget {budget:.3f}s)"
+
+def _call_with_stack[T](
+    fn: Callable[[], T], *, what: str, stack_bytes: int, timeout: float
+) -> T:
+    """Return ``fn()`` run on a new thread with a ``stack_bytes`` stack.
+
+    The join is bounded by ``timeout``; an exception from ``fn`` is re-raised.
+    """
+    results: list[T] = []
+    errors: list[BaseException] = []
+
+    def target() -> None:
+        try:
+            results.append(fn())
+        except BaseException as exc:  # noqa: BLE001  (re-raised by the caller)
+            errors.append(exc)
+
+    previous = threading.stack_size(stack_bytes)
+    try:
+        worker = threading.Thread(target=target, name=what, daemon=True)
+        worker.start()
+    finally:
+        threading.stack_size(previous)
+    worker.join(timeout)
+    if worker.is_alive():
+        pytest.fail(f"{what} still running after {timeout:.0f}s")
+    if errors:
+        raise errors[0]
+    return results[0]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="F8-1: extract_json re-parses deep nesting up to 4096 times",
+)
+def test_json_payload_on_deep_brackets_returns_quickly() -> None:
+    """json_payload on '[' nested past the decoder's limit returns None quickly.
+
+    The budget is "within 1 s and within ~50 single parse attempts of the same
+    text (+20 ms)". The relative part keeps the check meaningful on every
+    Python version: the C decoder's nesting limit, hence the cost of one
+    attempt, differs a lot between 3.12, 3.13 and 3.14 (on 3.12/3.13 the bug
+    costs well under 1 s but still ~4096 attempts).
+
+    The depth is probed, not fixed. On 3.14 the limit follows the C stack, not
+    sys.getrecursionlimit(): a fixed 65536 decoded without RecursionError on
+    the ubuntu py3.14 CI cell, which never reaches the slow path, and with an
+    unlimited stack no depth recurses at all. So the run uses a thread with a
+    fixed stack (``_DEEP_STACK_BYTES``) and a depth that recurses there.
+    """
+    run = _call_with_stack(
+        _deep_brackets_run,
+        what="deep-brackets json_payload run",
+        stack_bytes=_DEEP_STACK_BYTES,
+        timeout=_DEEP_RUN_TIMEOUT,
+    )
+    if run is None:
+        pytest.skip(f"no RecursionError up to {_DEEP_MAX_DEPTH} nested '[' here")
+
+    assert run.payload is None
+    assert run.elapsed <= run.budget, (
+        f"json_payload on {run.length} nested '[' took {run.elapsed:.3f}s"
+        f" (budget {run.budget:.3f}s)"
+    )
 
 
 @pytest.mark.xfail(
@@ -580,20 +662,44 @@ def test_json_payload_with_huge_integer_does_not_raise() -> None:
 @pytest.mark.parametrize(
     ("message", "expected"),
     [
-        pytest.param('{"outer": {"ok":1}', {"ok": 1}, id="unterminated-outer"),
         pytest.param('{{"a": 1}}', {"a": 1}, id="doubled-brace"),
+        pytest.param('[1, 2 {"k": 1}', {"k": 1}, id="missing-delimiter"),
     ],
 )
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
-    reason="F8-3: the skip after a failed candidate jumps over a valid nested one",
+    reason="F8-3: the scan resumes at exc.pos + 1, past a candidate at exc.pos",
 )
 def test_json_payload_finds_object_inside_failed_candidate(
     message: str, expected: dict[str, int]
 ) -> None:
-    """json_payload finds a complete object nested inside an invalid outer one."""
+    """json_payload finds a complete object where the outer candidate failed.
+
+    The decoder stops the outer candidate at the nested '{' (``exc.pos``) and
+    the scan resumes one character later, skipping it. Resuming at
+    ``max(start + 1, exc.pos)`` (N-utils-io-package-4) recovers both cases.
+    """
     assert _entry(message).json_payload == expected
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param('{"outer": {"ok":1}', id="truncated-object"),
+        pytest.param('[1, {"ok": 1}', id="truncated-array"),
+    ],
+)
+def test_json_payload_is_none_for_truncated_outer_container(message: str) -> None:
+    """A truncated outer container gives None, even around a complete object.
+
+    Pins the top-level-candidate heuristic: the decoder reports a truncated
+    container's error at the end of the message, the scan resumes there, and
+    inner values are never tried. N-utils-io-package-4 keeps this behavior
+    (its F8-3 fix still gives None here) and plans to document it; it is not
+    part of F8-3.
+    """
+    assert _entry(message).json_payload is None
 
 
 # -- export_logs -------------------------------------------------------------------

@@ -3,10 +3,13 @@
 The ``fake_adb`` pytest fixture (``tests/conftest.py``) rewrites any spawn of
 its sentinel adb path into::
 
-    python -I fake_adb.py --fake-state <dir> <adb args...>
+    python -I fake_adb.py --fake-state <dir> --fake-index <n> --fake-seq <s> \\
+        --fake-parent <pid> <adb args...>
 
 so the library's real ``subprocess`` / ``asyncio`` code paths, pipes, exit
-codes, and kill semantics are exercised on every platform CI runs on.
+codes, and kill semantics are exercised on every platform CI runs on. The
+parent side (spawn gate, child registry, hang watchdog) is documented in
+``tests/conftest.py``.
 
 ``<dir>/config.json`` describes the behavior per adb command. Each command
 maps to a list of runs; the n-th invocation of that command uses the n-th run,
@@ -31,8 +34,19 @@ and the last run repeats once the list is exhausted::
 After the steps the process exits with ``exit``, or, when ``hang`` is true,
 sleeps until it is killed. A command with no configured run exits 1 silently.
 
-Every invocation is appended to ``<dir>/calls.jsonl`` as
-``{"command", "key", "index", "args", "pid"}`` before any step runs.
+The parent assigns ``--fake-index`` (the per-command invocation number that
+selects the run; ``pidof`` counts per package) and ``--fake-seq`` (the global
+spawn number) under its own lock, so this process takes no lock and keeps no
+counter that a kill could leave half-written. ``--fake-parent`` is the
+spawning process's pid. Before any step runs it records
+itself as ``<dir>/calls/<seq>.json`` (written to a temporary name, then
+renamed): ``{"command", "key", "index", "args", "pid", "seq"}``.
+
+A child never outlives the test run by much: a ``wait`` step gives up after
+``_WAIT_TIMEOUT`` (exit 98), and a hanging child exits once its parent is gone
+(POSIX: its parent pid is no longer ``--fake-parent``, for example after the
+hang watchdog ended pytest; exit 96) or after ``_HANG_LIMIT`` (exit 97), far
+beyond any per-test limit.
 
 Only the standard library is used: this file runs in ``python -I``.
 """
@@ -40,7 +54,6 @@ Only the standard library is used: this file runs in ``python -I``.
 from __future__ import annotations
 
 import base64
-import contextlib
 import json
 import os
 import signal
@@ -49,19 +62,34 @@ import time
 from pathlib import Path
 from typing import Any, BinaryIO
 
-_LOCK_TIMEOUT = 10.0
 _WAIT_TIMEOUT = 30.0
+_HANG_LIMIT = 600.0
+_ORPHAN_POLL = 0.2
+_RETRY_TIMEOUT = 5.0
 _POLL = 0.005
+
+_EXIT_USAGE = 2
+_EXIT_ORPHANED = 96
+_EXIT_HANG_LIMIT = 97
+_EXIT_WAIT_TIMEOUT = 98
+_EXIT_UNKNOWN_STEP = 99
+
+_OPTIONS = ("--fake-state", "--fake-index", "--fake-seq", "--fake-parent")
+_USAGE = (
+    "usage: fake_adb.py --fake-state DIR --fake-index N --fake-seq N"
+    " --fake-parent PID [adb args...]\n"
+)
 
 # adb global options that take a value and precede the command.
 _GLOBAL_OPTS_WITH_VALUE = frozenset({"-s", "-t", "-H", "-P", "-L"})
 
 
-def _split_command(args: list[str]) -> tuple[str, str, list[str]]:
+def split_command(args: list[str]) -> tuple[str, str, list[str]]:
     """Return (command, key, rest) for an adb argument vector.
 
     ``key`` selects the per-invocation counter: the command name, or
-    ``pidof:<package>`` for ``shell pidof <package>``.
+    ``pidof:<package>`` for ``shell pidof <package>``. The fixture calls this
+    too, so parent and child always agree on the key.
     """
     i = 0
     while i < len(args) and args[i].startswith("-"):
@@ -75,47 +103,56 @@ def _split_command(args: list[str]) -> tuple[str, str, list[str]]:
     return command, command, rest[1:]
 
 
-@contextlib.contextmanager
-def _locked(state: Path):
-    lock = state / "lock"
-    deadline = time.monotonic() + _LOCK_TIMEOUT
+def _parse_argv(argv: list[str]) -> tuple[Path, int, int, int, list[str]] | None:
+    """Split ``argv`` into (state, index, seq, parent, adb args); None if invalid."""
+    options: dict[str, str] = {}
+    i = 1
+    while i + 1 < len(argv) and argv[i] in _OPTIONS:
+        options[argv[i]] = argv[i + 1]
+        i += 2
+    if set(options) != set(_OPTIONS):
+        return None
+    try:
+        index = int(options["--fake-index"])
+        seq = int(options["--fake-seq"])
+        parent = int(options["--fake-parent"])
+    except ValueError:
+        return None
+    return Path(options["--fake-state"]), index, seq, parent, argv[i:]
+
+
+def _read_text_retrying(path: Path) -> str:
+    """Read ``path``, retrying briefly on a Windows sharing violation.
+
+    The test may be replacing the file (``config.json``) at that moment, which
+    Windows reports as PermissionError; POSIX never does.
+    """
+    deadline = time.monotonic() + _RETRY_TIMEOUT
     while True:
         try:
-            lock.mkdir()
-            break
-        except FileExistsError:
+            return path.read_text(encoding="utf-8")
+        except PermissionError:
             if time.monotonic() > deadline:
                 raise
             time.sleep(_POLL)
-    try:
-        yield
-    finally:
-        lock.rmdir()
 
 
-def _next_index(state: Path, key: str) -> int:
-    counters_path = state / "counters.json"
-    with _locked(state):
-        counters: dict[str, int] = {}
-        if counters_path.exists():
-            counters = json.loads(counters_path.read_text(encoding="utf-8"))
-        index = counters.get(key, 0)
-        counters[key] = index + 1
-        counters_path.write_text(json.dumps(counters), encoding="utf-8")
-        with (state / "calls.jsonl").open("a", encoding="utf-8") as fh:
-            fh.write(
-                json.dumps(
-                    {
-                        "command": key.split(":", 1)[0],
-                        "key": key,
-                        "index": index,
-                        "args": sys.argv[3:],
-                        "pid": os.getpid(),
-                    }
-                )
-                + "\n"
-            )
-    return index
+def _record_call(
+    state: Path, seq: int, command: str, key: str, index: int, args: list[str]
+) -> None:
+    """Publish this invocation as ``calls/<seq>.json``, atomically."""
+    record = {
+        "command": command,
+        "key": key,
+        "index": index,
+        "args": args,
+        "pid": os.getpid(),
+        "seq": seq,
+    }
+    calls = state / "calls"
+    tmp = calls / f"{seq:06d}.json.tmp"
+    tmp.write_text(json.dumps(record), encoding="utf-8")
+    tmp.replace(calls / f"{seq:06d}.json")
 
 
 def _select_run(
@@ -130,22 +167,33 @@ def _select_run(
     return runs[min(index, len(runs) - 1)]
 
 
+def _orphaned(parent: int) -> bool:
+    """True once the spawning process ``parent`` is gone.
+
+    POSIX re-parents an orphan, so ``getppid()`` changes. Windows keeps the
+    original value, so there only the time limits end an orphan.
+    """
+    return sys.platform != "win32" and os.getppid() != parent
+
+
 def _write(stream: BinaryIO, data: bytes) -> None:
     stream.write(data)
     stream.flush()
 
 
-def _wait_for_signal(state: Path, name: str) -> None:
+def _wait_for_signal(state: Path, name: str, parent: int) -> None:
     target = state / "signals" / name
     deadline = time.monotonic() + _WAIT_TIMEOUT
     while not target.exists():
+        if _orphaned(parent):
+            sys.exit(_EXIT_ORPHANED)
         if time.monotonic() > deadline:
             sys.stderr.write(f"fake_adb: timed out waiting for signal {name!r}\n")
-            sys.exit(98)
+            sys.exit(_EXIT_WAIT_TIMEOUT)
         time.sleep(_POLL)
 
 
-def _run_steps(state: Path, steps: list[dict[str, Any]]) -> None:
+def _run_steps(state: Path, steps: list[dict[str, Any]], parent: int) -> None:
     out = sys.stdout.buffer
     err = sys.stderr.buffer
     for step in steps:
@@ -170,31 +218,42 @@ def _run_steps(state: Path, steps: list[dict[str, Any]]) -> None:
         elif "sleep" in step:
             time.sleep(step["sleep"])
         elif "wait" in step:
-            _wait_for_signal(state, step["wait"])
+            _wait_for_signal(state, step["wait"], parent)
         elif "touch" in step:
             (state / "signals" / step["touch"]).touch()
         else:
             sys.stderr.write(f"fake_adb: unknown step {step!r}\n")
-            sys.exit(99)
+            sys.exit(_EXIT_UNKNOWN_STEP)
+
+
+def _hang(parent: int) -> int:
+    """Sleep until killed, the parent is gone, or ``_HANG_LIMIT`` passes."""
+    deadline = time.monotonic() + _HANG_LIMIT
+    while time.monotonic() < deadline:
+        if _orphaned(parent):
+            return _EXIT_ORPHANED
+        time.sleep(_ORPHAN_POLL)
+    sys.stderr.write("fake_adb: hang limit reached\n")
+    return _EXIT_HANG_LIMIT
 
 
 def main() -> int:
-    if len(sys.argv) < 3 or sys.argv[1] != "--fake-state":
-        sys.stderr.write("usage: fake_adb.py --fake-state DIR [adb args...]\n")
-        return 2
-    state = Path(sys.argv[2])
-    command, key, _rest = _split_command(sys.argv[3:])
-    index = _next_index(state, key)
-    config = json.loads((state / "config.json").read_text(encoding="utf-8"))
+    parsed = _parse_argv(sys.argv)
+    if parsed is None:
+        sys.stderr.write(_USAGE)
+        return _EXIT_USAGE
+    state, index, seq, parent, adb_args = parsed
+    command, key, _rest = split_command(adb_args)
+    _record_call(state, seq, command, key, index, adb_args)
+    config = json.loads(_read_text_retrying(state / "config.json"))
     run = _select_run(config, command, key, index)
     if run is None:
         return 1
     if run.get("ignore_sigterm") and sys.platform != "win32":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    _run_steps(state, run.get("steps", []))
+    _run_steps(state, run.get("steps", []), parent)
     if run.get("hang"):
-        while True:
-            time.sleep(3600)
+        return _hang(parent)
     return int(run.get("exit", 0))
 
 
