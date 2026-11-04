@@ -18,7 +18,8 @@ from logpyt.exceptions import (
 )
 from logpyt.filters import Filter
 from logpyt.groupers import LogGrouper, WindowedLogGrouper
-from logpyt.parsers import LogParser, ThreadTimeLogParser
+from logpyt.parsers import LogParser, ParseContext, ThreadTimeLogParser
+from logpyt.parsers._fallback import unparsed_entry
 
 from .common import StreamState, build_pidof_command
 
@@ -341,6 +342,8 @@ class AsyncLogStream:
         self.adb_path = adb_path or adb.resolve_adb()
         self.device_id = device_id
         self.parser = parser or ThreadTimeLogParser()
+        # One parse session per adb connection (F6-1); replaced at each spawn.
+        self._parse_context = ParseContext()
         self.filter_by = filter_by
         self.auto_reconnect = auto_reconnect
         self.reconnect_delay = reconnect_delay
@@ -540,6 +543,7 @@ class AsyncLogStream:
     async def _connection_manager(self) -> None:
         """Manage the ADB process lifecycle and reconnection."""
         while not self._stop_event.is_set():
+            self._parse_context = ParseContext()
             await self._run_process_lifecycle()
 
             if self._stop_event.is_set():
@@ -836,11 +840,13 @@ class AsyncLogStream:
         # Note: Parsing is CPU-bound. For extremely high throughput, this could be
         # offloaded to an executor, but for typical logcat usage, the overhead of
         # context switching per line outweighs the benefit.
+        ctx = self._parse_context
         try:
             if source == "stdout":
-                entry = self.parser.parse_stdout(line)
+                parsed = self.parser.parse(line, ctx)
+                entry = unparsed_entry(line, ctx) if parsed is None else parsed
             else:
-                entry = self.parser.parse_stderr(line)
+                entry = unparsed_entry(line, ctx, level="E")
         except Exception as e:  # noqa: BLE001  parser errors must not crash the stream
             logger.debug("Error parsing %s line: %s", source, e)
             self._exceptions.append(e)
@@ -853,7 +859,7 @@ class AsyncLogStream:
         if self._pid_monitor:
             pkg = await self._pid_monitor.get_package(entry.pid)
             if pkg:
-                entry.meta["package"] = pkg
+                entry = entry.model_copy(update={"package": pkg})
 
         # 2. Filter
         if self.filter_by and not self.filter_by(entry):

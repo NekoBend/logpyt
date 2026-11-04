@@ -28,7 +28,7 @@ def sample_entry() -> LogEntry:
         tag="MyApp",
         message="Something happened",
         raw="raw",
-        meta={"package": "com.example.app"},
+        package="com.example.app",
     )
 
 
@@ -191,8 +191,8 @@ def test_filter_non_empty_criterion_still_filters(sample_entry: LogEntry) -> Non
 def test_filter_empty_criterion_does_not_match_missing_field(
     sample_entry: LogEntry,
 ) -> None:
-    """Empty package criterion is no-constraint even when meta lacks a package."""
-    entry = sample_entry.model_copy(update={"meta": {}})
+    """Empty package criterion is no-constraint even when the entry has no package."""
+    entry = sample_entry.model_copy(update={"package": None})
     f = Filter(package=[])
     assert f(entry) is True
 

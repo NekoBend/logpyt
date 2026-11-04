@@ -18,6 +18,7 @@ from logpyt.exceptions import (
 from logpyt.filters import Filter
 from logpyt.groupers import LogGrouper
 from logpyt.models import LogEntry, LogLevel
+from logpyt.parsers import RawLogParser
 from logpyt.streams import LogStream, StreamState
 
 
@@ -182,7 +183,7 @@ def test_stream_parse_error_propagates_to_join(mock_popen, mocker) -> None:
     process_mock.stderr.readline.return_value = ""
 
     parser = Mock()
-    parser.parse_stdout.side_effect = ValueError("parse failed")
+    parser.parse.side_effect = ValueError("parse failed")
 
     stream = LogStream(parser=parser)
     stream.start()
@@ -239,7 +240,7 @@ def test_stream_package_resolution(mock_popen, mocker) -> None:
         message="msg",
         raw="raw",
     )
-    mock_parser.parse_stdout.return_value = mock_entry
+    mock_parser.parse.return_value = mock_entry
     stream.parser = mock_parser
 
     stream.start()
@@ -253,7 +254,7 @@ def test_stream_package_resolution(mock_popen, mocker) -> None:
 
     # Verify entry has package info
     assert len(entries) > 0
-    assert entries[0].meta["package"] == "com.example"
+    assert entries[0].package == "com.example"
 
 
 def test_stream_package_filter_drops_non_matching_entries(mock_popen, mocker) -> None:
@@ -288,7 +289,8 @@ def test_stream_package_filter_drops_non_matching_entries(mock_popen, mocker) ->
     process_mock.stdout.readline.side_effect = ["match\n", "drop\n", ""]
     process_mock.stderr.readline.return_value = ""
 
-    def parse_stdout(line: str) -> LogEntry:
+    def parse(line: str, ctx: object) -> LogEntry:
+        del ctx
         pid = 1234 if line.strip() == "match" else 9999
         return LogEntry(
             timestamp=datetime.now(UTC).replace(tzinfo=None),
@@ -301,7 +303,7 @@ def test_stream_package_filter_drops_non_matching_entries(mock_popen, mocker) ->
         )
 
     mock_parser = Mock()
-    mock_parser.parse_stdout.side_effect = parse_stdout
+    mock_parser.parse.side_effect = parse
     stream.parser = mock_parser
 
     stream.start()
@@ -309,7 +311,7 @@ def test_stream_package_filter_drops_non_matching_entries(mock_popen, mocker) ->
 
     # Only the matching-package entry reaches the callback; the other is dropped.
     assert [e.message for e in entries] == ["match"]
-    assert all(e.meta.get("package") == "com.example" for e in entries)
+    assert all(e.package == "com.example" for e in entries)
 
 
 def test_stream_grouper_flushes_buffered_entries_on_stdout_eof(
@@ -340,7 +342,8 @@ def test_stream_grouper_flushes_buffered_entries_on_stdout_eof(
 
     base_ts = datetime.now(UTC).replace(tzinfo=None)
 
-    def parse_stdout(line: str) -> LogEntry:
+    def parse(line: str, ctx: object) -> LogEntry:
+        del ctx
         return LogEntry(
             timestamp=base_ts,
             pid=1,
@@ -352,7 +355,7 @@ def test_stream_grouper_flushes_buffered_entries_on_stdout_eof(
         )
 
     mock_parser = Mock()
-    mock_parser.parse_stdout.side_effect = parse_stdout
+    mock_parser.parse.side_effect = parse
     stream.parser = mock_parser
 
     stream.start()
@@ -675,7 +678,7 @@ def test_sync_queue_overflow_policy_drop_oldest_is_configurable(mocker) -> None:
     stream._callback_queue.put_nowait(([old_entry], "stdout"))
 
     parser = Mock()
-    parser.parse_stdout.return_value = LogEntry(
+    parser.parse.return_value = LogEntry(
         timestamp=datetime.now(UTC).replace(tzinfo=None),
         pid=1,
         tid=1,
@@ -778,7 +781,7 @@ def test_stream_pause_suspends_dispatch_and_resume_restores_it(
         dispatched_event.set()
 
     parser = Mock()
-    parser.parse_stdout.side_effect = lambda line: LogEntry(
+    parser.parse.side_effect = lambda line, ctx: LogEntry(
         timestamp=datetime.now(UTC).replace(tzinfo=None),
         pid=1,
         tid=1,
@@ -844,6 +847,33 @@ def test_stream_stderr_callback_receives_entry(mock_popen, mocker) -> None:
     assert entry.message == "W/x: err"
 
 
+def test_stream_stderr_bypasses_the_parser(mock_popen, mocker) -> None:
+    """stderr lines never reach the parser: even one that takes any line is skipped.
+
+    RawLogParser would turn the line into a parsed I entry; the stderr entry is
+    the unparsed fallback with level E instead.
+    """
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
+
+    process_mock = mock_popen.return_value
+    process_mock.stdout.readline.return_value = ""
+    process_mock.stderr.readline.side_effect = ["adb: error: closed\n", ""]
+
+    received: list[LogEntry] = []
+
+    def stderr_callback(entry: LogEntry, handle) -> None:
+        del handle
+        received.append(entry)
+
+    stream = LogStream(stderr_callback=stderr_callback, parser=RawLogParser())
+    stream.start()
+    stream.join(timeout=1.0)
+
+    assert [(e.level, e.parsed, e.message) for e in received] == [
+        ("E", False, "adb: error: closed")
+    ]
+
+
 def test_stream_raising_on_start_callback_does_not_break_teardown(
     mock_popen, mocker
 ) -> None:
@@ -891,7 +921,7 @@ def test_stream_join_reraises_same_error_on_second_call(mock_popen, mocker) -> N
     process_mock.stderr.readline.return_value = ""
 
     parser = Mock()
-    parser.parse_stdout.side_effect = ValueError("parse failed")
+    parser.parse.side_effect = ValueError("parse failed")
 
     stream = LogStream(parser=parser)
     stream.start()
@@ -946,8 +976,7 @@ def test_stream_grouper_only_groups_stdout_not_stderr(mock_popen, mocker) -> Non
         )
 
     mock_parser = Mock()
-    mock_parser.parse_stdout.side_effect = lambda line: make(line, "D")
-    mock_parser.parse_stderr.side_effect = lambda line: make(line, "E")
+    mock_parser.parse.side_effect = lambda line, ctx: make(line, "D")
     stream.parser = mock_parser
 
     stream.start()

@@ -201,7 +201,7 @@ if __name__ == "__main__":
 
 ## Components Overview
 
-- **`LogEntry`**: Structured representation of a log line (timestamp, pid, tid, level, tag, message, etc.). Use `.json_payload` to extract JSON content from the message.
+- **`LogEntry`**: Structured representation of a log line (timestamp, pid, tid, level, tag, message, etc.). Use `.json_payload()` to extract JSON content from the message.
 - **`LogParser`**: Parses raw logcat lines into `LogEntry` objects.
 - **`LogStream` / `AsyncLogStream`**: Manages the ADB subprocess and dispatching of logs.
 - **`StreamHandle` / `AsyncStreamHandle`**: Safe handle to control the stream (stop, kill, pause, resume) from callbacks.

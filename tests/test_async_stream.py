@@ -7,6 +7,7 @@ import pytest
 
 from logpyt.exceptions import LogStreamInternalError, LogStreamTimeoutError
 from logpyt.models import LogEntry
+from logpyt.parsers import RawLogParser
 from logpyt.streams.async_stream import AsyncLogStream, AsyncPidMonitor, StreamState
 from tests.conftest import async_wait_until
 
@@ -118,6 +119,36 @@ async def test_callbacks(mock_resolve_adb, mock_create_subprocess, mock_process)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "parser",
+    [pytest.param(None, id="default-parser"), pytest.param(RawLogParser(), id="raw")],
+)
+async def test_stderr_callback_receives_an_unparsed_error_entry(
+    mock_resolve_adb, mock_create_subprocess, mock_process, parser
+):
+    """A stderr line becomes the unparsed fallback with level E, as in 2.x.
+
+    It never reaches the parser: RawLogParser, which takes any line, would make
+    it a parsed I entry.
+    """
+    mock_process.stdout.readline.return_value = b""
+    mock_process.stderr.readline.side_effect = [b"W/x: err\n", b""]
+    received: list[LogEntry] = []
+
+    async def stderr_callback(entry, handle):
+        del handle
+        received.append(entry)
+
+    stream = AsyncLogStream(stderr_callback=stderr_callback, parser=parser)
+    await stream.start()
+    await stream.join(timeout=1.0)
+
+    assert [(e.level, e.parsed, e.message) for e in received] == [
+        ("E", False, "W/x: err")
+    ]
+
+
+@pytest.mark.asyncio
 async def test_context_manager(mock_resolve_adb, mock_create_subprocess, mock_process):
     """Verify async with AsyncLogStream(...) works."""
     mock_process.stdout.readline.return_value = b""
@@ -167,7 +198,7 @@ async def test_async_stream_parse_error_propagates_to_join(
     mock_process.stderr.readline.return_value = b""
 
     parser = MagicMock()
-    parser.parse_stdout.side_effect = ValueError("parse failed")
+    parser.parse.side_effect = ValueError("parse failed")
 
     stream = AsyncLogStream(parser=parser)
     await stream.start()
@@ -597,7 +628,7 @@ async def test_stream_with_pid_monitor(
 
     # Mock parser to return a LogEntry with PID 1234
     mock_parser = MagicMock()
-    mock_parser.parse_stdout.return_value = LogEntry(
+    mock_parser.parse.return_value = LogEntry(
         timestamp=datetime.now(UTC).replace(tzinfo=None),
         pid=1234,
         tid=1,
@@ -623,8 +654,8 @@ async def test_stream_with_pid_monitor(
     assert callback.call_count == 1
     entry = callback.call_args[0][0]
 
-    # Verify package was added to meta (AsyncPidMonitor should have found it)
-    assert entry.meta.get("package") == "com.example.app"
+    # Verify the package was set (AsyncPidMonitor should have found it)
+    assert entry.package == "com.example.app"
 
 
 @pytest.mark.asyncio
@@ -708,7 +739,7 @@ async def test_ingestion_not_blocked_by_slow_callback(
             await release_callback.wait()
 
     mock_parser = MagicMock()
-    mock_parser.parse_stdout.side_effect = [
+    mock_parser.parse.side_effect = [
         LogEntry(
             timestamp=datetime.now(UTC).replace(tzinfo=None),
             pid=1,
@@ -742,7 +773,7 @@ async def test_ingestion_not_blocked_by_slow_callback(
 
     # Ingestion should have parsed line-2 already, despite callback waiting.
     await asyncio.sleep(0.05)
-    assert mock_parser.parse_stdout.call_count == 2
+    assert mock_parser.parse.call_count == 2
 
     release_callback.set()
     await stream.join(timeout=1.0)
@@ -815,7 +846,7 @@ async def test_pause_stops_dispatch_and_resume_continues(
     mock_process.terminate.side_effect = lambda: process_done.set()
 
     mock_parser = MagicMock()
-    mock_parser.parse_stdout.side_effect = lambda line: _make_entry(line.strip())
+    mock_parser.parse.side_effect = lambda line, ctx: _make_entry(line.strip())
 
     dispatched: list[str] = []
 
@@ -870,7 +901,7 @@ async def test_async_stream_groups_stdout_and_flushes_on_eof(
     mock_process.wait = AsyncMock(return_value=0)
 
     parser = MagicMock()
-    parser.parse_stdout.side_effect = lambda line: _make_entry(line.strip())
+    parser.parse.side_effect = lambda line, ctx: _make_entry(line.strip())
 
     dispatched: list = []
 

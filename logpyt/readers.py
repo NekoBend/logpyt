@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .parsers import LogParser, ThreadTimeLogParser
+from .parsers import LogParser, ParseContext, ThreadTimeLogParser
+from .parsers._fallback import is_divider, unparsed_entry
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -32,21 +35,30 @@ class LogFileReader:
         parser: LogParser | None = None,
         filter_by: Filter | None = None,
         parse_error_log_interval: float = 5.0,
+        *,
+        year: int | None = None,
     ) -> None:
         """Initialize the reader.
 
         Args:
             file_path: Path to the log file.
-            parser: Parser to use. If None, defaults to ThreadTimeLogParser
-                (which falls back to a raw message for non-threadtime lines).
+            parser: Parser to use. If None, defaults to ThreadTimeLogParser.
+                A line the parser does not recognise is yielded as an entry
+                with ``parsed=False`` whose message is the whole line.
             filter_by: Optional filter to apply to entries. Only entries
                 passing the filter will be yielded.
             parse_error_log_interval: Minimum interval in seconds between
                 repeated parse error logs. Defaults to 5.0.
+            year: The year of the first line that carries no year (yearless
+                ``-v threadtime``). None places it before the file's
+                modification time (see ``ParseContext``), or before the host
+                clock when the modification time is no valid local datetime.
         """
         self.file_path = Path(file_path)
         self.parser = parser or ThreadTimeLogParser()
         self.filter_by = filter_by
+        ParseContext(year=year)  # a bad year fails here, not at the first line
+        self.year = year
         self._parse_error_log_interval = max(0.0, parse_error_log_interval)
         self._last_parse_error_log_ts = 0.0
         self._suppressed_parse_errors = 0
@@ -92,8 +104,13 @@ class LogFileReader:
         """Iterate over log entries in the file.
 
         Opens the file and reads it line by line. Each line is parsed
-        using the configured parser. If a filter is set, only matching
-        entries are yielded.
+        using the configured parser, in a parse session of its own: every
+        iteration starts afresh, so iterating twice gives the same entries.
+        If a filter is set, only matching entries are yielded.
+
+        Lines the parser does not recognise (logcat's ``--------- beginning
+        of`` dividers excepted) are counted, and one WARNING per iteration
+        reports how many there were (F6-5).
 
         Yields:
             Parsed LogEntry objects that match the filter.
@@ -102,22 +119,42 @@ class LogFileReader:
             FileNotFoundError: If the file does not exist.
             PermissionError: If the file cannot be read.
         """
-        with self.file_path.open("r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                try:
-                    # Parse the line
-                    # We use parse_stdout as the default for file lines
-                    entry = self.parser.parse_stdout(line)
-                except Exception as e:  # noqa: BLE001
-                    # Log parse errors with throttling to avoid log storms
-                    self._log_parse_error(line, e)
-                    continue
+        unparsed = 0
+        lines = 0
+        try:
+            with self.file_path.open("r", encoding="utf-8", errors="replace") as f:
+                # The mtime anchors the first yearless line only without year=.
+                anchor = None if self.year is not None else _mtime(f.fileno())
+                ctx = ParseContext(year=self.year, anchor=anchor)
+                for line in f:
+                    lines += 1
+                    try:
+                        entry = self.parser.parse(line, ctx)
+                    except Exception as e:  # noqa: BLE001
+                        # Log parse errors with throttling to avoid log storms
+                        self._log_parse_error(line, e)
+                        continue
+                    if entry is None:
+                        entry = unparsed_entry(line, ctx)
+                        if not is_divider(entry.raw):
+                            unparsed += 1
 
-                # Apply filter if present
-                if self.filter_by and not self.filter_by(entry):
-                    continue
+                    # Apply filter if present
+                    if self.filter_by and not self.filter_by(entry):
+                        continue
 
-                yield entry
+                    yield entry
+        finally:
+            if unparsed:
+                logger.warning(
+                    "%d of %d lines in %s are not in the %r format of %s; "
+                    "they were read as unparsed entries (parsed=False).",
+                    unparsed,
+                    lines,
+                    self.file_path,
+                    getattr(self.parser, "logcat_format", "?"),
+                    type(self.parser).__name__,
+                )
 
         if self._suppressed_parse_errors:
             logger.warning(
@@ -128,10 +165,26 @@ class LogFileReader:
             self._suppressed_parse_errors = 0
 
 
+def _mtime(fd: int) -> datetime | None:
+    """The modification time of the open file ``fd``, as naive host-local time.
+
+    None when it cannot be read or is no datetime in host-local time (an mtime
+    far outside the years 1..9999, or one the platform's time functions
+    refuse); the first yearless line is then placed before the host clock.
+    """
+    try:
+        moment = datetime.fromtimestamp(os.fstat(fd).st_mtime, tz=UTC)
+        return moment.astimezone().replace(tzinfo=None)
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
 def read_file(
     file_path: str | Path,
     parser: LogParser | None = None,
     filter_by: Filter | None = None,
+    *,
+    year: int | None = None,
 ) -> Iterator[LogEntry]:
     """Read all log entries from a file.
 
@@ -141,8 +194,10 @@ def read_file(
         file_path: Path to the log file.
         parser: Parser to use.
         filter_by: Optional filter.
+        year: The year of the first line that carries no year; None places it
+            before the file's modification time.
 
     Returns:
         Iterator of LogEntry objects.
     """
-    yield from LogFileReader(file_path, parser, filter_by)
+    yield from LogFileReader(file_path, parser, filter_by, year=year)

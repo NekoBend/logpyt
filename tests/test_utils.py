@@ -209,26 +209,27 @@ def test_extract_json_incomplete() -> None:
 
 def test_extract_json_scan_guard_caps_decode_attempts(mocker) -> None:
     """Ensure pathological candidates are bounded by internal attempt guard."""
-    from logpyt import utils
+    from logpyt import _json
 
-    bad_text = "{" * (utils._EXTRACT_JSON_MAX_CANDIDATES + 100)
+    # Shallow candidates, so each one reaches the (failing) decoder.
+    bad_text = "{}" * (_json._MAX_CANDIDATES + 100)
 
     def _always_fail_decode(doc: str, idx: int = 0):
         raise json.JSONDecodeError("invalid", doc, idx)
 
     mock_decode = mocker.patch(
-        "logpyt.utils.json.JSONDecoder.raw_decode",
+        "json.JSONDecoder.raw_decode",
         side_effect=_always_fail_decode,
     )
 
     assert extract_json(bad_text) is None
-    assert mock_decode.call_count == utils._EXTRACT_JSON_MAX_CANDIDATES
+    assert mock_decode.call_count == _json._MAX_CANDIDATES
 
 
 def test_extract_json_scan_guard_limits_search_range() -> None:
     """Ensure JSON beyond scan limit is not searched to avoid worst-case scans."""
-    from logpyt import utils
+    from logpyt import _json
 
-    text = "x" * utils._EXTRACT_JSON_MAX_SCAN_CHARS + '{"after_limit": true}'
+    text = "x" * _json._MAX_SCAN_CHARS + '{"after_limit": true}'
 
     assert extract_json(text) is None

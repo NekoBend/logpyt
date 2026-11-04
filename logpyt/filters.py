@@ -163,12 +163,12 @@ class _FieldMatchCondition(Condition):
 
 
 class Package(_FieldMatchCondition):
-    """Matches the package name (requires metadata)."""
+    """Matches the package name (``LogEntry.package``, set by attribution)."""
 
     def _get_value(self, entry: LogEntry) -> str | None:  # noqa: PLR6301
         # Polymorphic override of _FieldMatchCondition._get_value; called via
         # self._get_value() in the base check(). Must stay an instance method.
-        return entry.meta.get("package")
+        return entry.package
 
 
 class Tag(_FieldMatchCondition):
@@ -341,7 +341,7 @@ class Filter:
         entry.
 
         Args:
-            package: Package name(s) to match. Requires 'package' in LogEntry.meta.
+            package: Package name(s) to match against ``LogEntry.package``.
             tag: Tag(s) to match.
             level: Log level(s) to match (e.g., "E", "W").
             message_contains: Substring(s) to look for in the message.
@@ -388,7 +388,7 @@ class Filter:
 
         """
         if self.packages is not None:
-            pkg = entry.meta.get("package")
+            pkg = entry.package
             if pkg is None or pkg not in self.packages:
                 return False
 
