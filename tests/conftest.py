@@ -548,6 +548,14 @@ class FakeAdb:
         )
         with self._lock:
             self._children.append(child)
+            late = self._closed
+        if late:
+            # The spawn passed _prepare before close() and registered after
+            # close() had finished: nobody else will reap this child.
+            with contextlib.suppress(OSError):
+                popen.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                popen.wait(timeout=_REAP_TIMEOUT)
         return child
 
     def _hold(self, child: SpawnedChild) -> None:
@@ -567,6 +575,12 @@ class FakeAdb:
         ``fake.path`` fail with FileNotFoundError, as a missing adb would.
         Raises AssertionError for harness problems (a gate that timed out, a
         child that survived kill()), not for children the library leaked.
+
+        Known limit: a live asyncio child the library leaked is reaped here
+        with ``Popen.wait()``, which takes the exit status away from asyncio's
+        child watcher (its ``Process.wait()`` then reports 255). This only
+        happens on the leak path, where the test has already failed or the
+        library is about to be fixed.
         """
         with self._lock:
             if self._closed:
