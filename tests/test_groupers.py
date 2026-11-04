@@ -232,6 +232,66 @@ def test_windowed_groups_expire_on_the_utc_timeline_after_the_switch(
     assert [(group.key, group.reason) for group in closed] == [((1,), "gap")]
 
 
+def _local_naive(moment: datetime) -> datetime:
+    """``moment`` as a naive host-local time that reads back as ``moment``.
+
+    `datetime.astimezone` leaves ``fold`` at 0, which names the first of two
+    repeated wall-clock times; the second one needs ``fold=1``.
+    """
+    wall = moment.astimezone().replace(tzinfo=None)
+    return wall if wall.astimezone() == moment else wall.replace(fold=1)
+
+
+_FALL_BACK = "EST5EDT,M3.2.0,M11.1.0"  # 2026-11-01 01:00-02:00 comes twice
+
+
+@pytest.mark.parametrize("mode", _MODES)
+@pytest.mark.parametrize("first", ["naive", "aware"])
+def test_switch_keeps_the_fold(mode: Mode, first: str) -> None:
+    """A naive time in a repeated hour and its aware twin are one instant.
+
+    01:30 EST (``fold=1``) is 06:30 UTC. Converted from its wall-clock value
+    the naive entry would be 01:30 EDT, an hour earlier, and split from the
+    aware one. The outcome does not depend on the host zone.
+    """
+    with _host_zone(_FALL_BACK):
+        aware = datetime(2026, 11, 1, 6, 30, tzinfo=UTC)
+        naive = _local_naive(aware)
+        if sys.platform != "win32":
+            assert (naive.hour, naive.fold) == (1, 1)
+        pair = [_mixed_entry(naive), _mixed_entry(aware)]
+        entries = pair if first == "naive" else pair[::-1]
+        spec = GroupBy(keys=("pid",), gap_ms=100, mode=mode)
+
+        emitted = list(spec.groups(entries))
+
+    assert [list(group) for group in emitted] == [entries]
+
+
+@pytest.mark.parametrize("mode", _MODES)
+def test_switch_finds_the_newest_member_in_utc(mode: Mode) -> None:
+    """The newest naive member by wall clock is not the newest in UTC.
+
+    01:59 EDT (05:59 UTC) is later by wall clock than 01:10 EST (06:10 UTC),
+    the true newest member. An aware entry at 06:55 UTC is 45 minutes after
+    it, within the 50-minute gap, but 56 minutes after 05:59. The outcome
+    does not depend on the host zone.
+    """
+    with _host_zone(_FALL_BACK):
+        moments = [datetime(2026, 11, 1, 5, 59, tzinfo=UTC)]
+        moments.append(moments[0] + timedelta(minutes=11))
+        naive = [_local_naive(moment) for moment in moments]
+        if sys.platform != "win32":
+            assert naive[0] > naive[1]  # the order flips on the wall clock
+        late = moments[1] + timedelta(minutes=45)
+        entries = [*(_mixed_entry(ts) for ts in naive), _mixed_entry(late)]
+        spec = GroupBy(keys=("pid",), gap_ms=50 * 60_000, mode=mode)
+
+        emitted = list(spec.groups(entries))
+
+    assert [list(group) for group in emitted] == [entries]
+
+
 def _mixed_entry(timestamp: datetime, pid: int = 1) -> LogEntry:
     return LogEntry(
         timestamp=timestamp, pid=pid, tid=pid, level="I", tag="T", message="m", raw="m"

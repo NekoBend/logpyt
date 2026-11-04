@@ -7,10 +7,13 @@ stream core drives that idle flush from its timer (PR-10); the 2.x streams
 flush only at the end of the input.
 
 Timestamps sit on one timeline per run. It counts naive times by wall clock
-until the first aware timestamp, then switches once to a UTC epoch, converting
-the open groups; after that a naive time is read as host-local. So aware
-entries are compared exactly, and the host zone's DST changes move only the
-naive ones (unparsed lines: a buffer divider, a malformed line).
+until the first aware timestamp, then switches once to a UTC epoch: each open
+group's newest value is recomputed from its members read as host-local times,
+``fold`` included, since in a repeated hour the newest member by wall clock
+need not be the newest one in UTC. After the switch a naive time is read as
+host-local. So aware entries are compared exactly, and the host zone's DST
+changes move only the naive ones (unparsed lines: a buffer divider, a
+malformed line).
 
 A group stays open while entries keep arriving within ``gap_ms`` of its newest
 member, in either direction; the boundary is inclusive. Its expiry is
@@ -20,9 +23,11 @@ entry never moves it back. In windowed mode the open groups wait in a heap of
 never compare their keys, which may not be orderable (F7-1: ``None`` vs a str).
 A group's heap entry is replaced only when it reaches the top of the heap
 after the group was extended, so the groups one entry expires close in the
-order of their expiry. Entries of closed groups are dropped when they
-outnumber the open groups, so the heap stays within twice the open groups plus
-a constant.
+order of their expiry. The entries of closed groups stay behind until the end
+of each `Grouper.add` or `Grouper.flush_idle` call, which drops them all when
+the heap holds more than twice the open groups plus a constant, and empties
+the heap when no group is open. So between calls the heap holds at most
+``2 * open_groups + 64`` entries, and none when no group is open.
 """
 
 from __future__ import annotations
@@ -33,7 +38,7 @@ import math
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from fractions import Fraction
 from operator import attrgetter
 from typing import TYPE_CHECKING
 
@@ -54,7 +59,7 @@ _MICROSECOND = timedelta(microseconds=1)
 _AWARE_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _NAIVE_EPOCH = _AWARE_EPOCH.replace(tzinfo=None)
 # Heap entries of closed groups are dropped once the heap holds more than
-# twice the open groups plus this many.
+# twice the open groups plus this many (checked at the end of each call).
 _HEAP_SLACK = 64
 
 
@@ -77,9 +82,15 @@ def gap_micros(gap_ms: float) -> int:
     is at most ``gap_ms`` exactly when it is at most this value. The decimal
     digits of a float are used (``0.57`` is 570, not its binary value
     0.56999...), so no float rounding moves the boundary (F7-3).
+
+    The value is ``floor(Decimal(repr(gap_ms)) * 1000)`` (design A.18),
+    computed with exact rational arithmetic instead of `decimal`, whose
+    multiplication follows the caller's context: a low ``prec`` or another
+    rounding mode would move the boundary, and an enabled trap would raise.
     """
-    exact = Decimal(gap_ms) if isinstance(gap_ms, int) else Decimal(repr(float(gap_ms)))
-    return math.floor(exact * 1000)
+    if isinstance(gap_ms, int):
+        return int(gap_ms) * 1000
+    return math.floor(Fraction(repr(float(gap_ms))) * 1000)
 
 
 def _aware_micros(ts: datetime) -> int:
@@ -216,6 +227,7 @@ class Grouper:
                 self._close(group, "evicted", closed)
             reason: GroupReason = "size" if spec.max_group_size == 1 else "evicted"
             closed.append(LogGroup(key=key, entries=(entry,), reason=reason))
+            self._compact()
             return closed
         while groups and (
             self._entries >= spec.max_total_entries
@@ -239,6 +251,7 @@ class Grouper:
         self._bytes += size
         if len(group.entries) >= spec.max_group_size:
             self._close(group, "size", closed)
+        self._compact()
         return closed
 
     def flush_idle(self, now: float) -> list[LogGroup]:
@@ -258,6 +271,7 @@ class Grouper:
         closed: list[LogGroup] = []
         while (deadline := self.idle_deadline()) is not None and deadline <= now:
             self._close(next(iter(self._open.values())), "idle", closed)
+        self._compact()
         return closed
 
     def idle_deadline(self) -> float | None:
@@ -307,10 +321,18 @@ class Grouper:
         return (ts - _NAIVE_EPOCH) // _MICROSECOND
 
     def _switch_to_aware(self) -> None:
-        """Move the open groups from the wall-clock timeline to the UTC one."""
+        """Move the open groups from the wall-clock timeline to the UTC one.
+
+        Every member of an open group is naive here. Each group's newest value
+        is recomputed from its members, not from the wall-clock maximum: that
+        value lost the members' ``fold``, and in a repeated hour the newest
+        member by wall clock need not be the newest one in UTC. This reads
+        the open entries once per run, at most ``max_total_entries``.
+        """
         for group in self._open.values():
-            wall = _NAIVE_EPOCH + group.newest * _MICROSECOND
-            group.newest = _aware_micros(wall)
+            group.newest = max(
+                _aware_micros(entry.timestamp) for entry in group.entries
+            )
         if self._windowed:
             self._rebuild_heap()
 
@@ -334,9 +356,21 @@ class Grouper:
     def _push(self, group: _Open) -> None:
         """Give ``group`` a heap entry for its current expiry."""
         group.seq = next(self._seq)
+        heapq.heappush(self._heap, (group.newest + self._gap, group.seq, group.key))
+
+    def _compact(self) -> None:
+        """Drop the heap entries that closed groups left behind.
+
+        Called at the end of every `add` and `flush_idle`, after all of its
+        closures, so between calls the heap holds at most twice the open
+        groups plus ``_HEAP_SLACK`` entries, and none when no group is open.
+        A rebuild reads every open group, but only once more stale entries
+        than open groups piled up, so it costs O(1) amortized per push.
+        """
         heap = self._heap
-        heapq.heappush(heap, (group.newest + self._gap, group.seq, group.key))
-        if len(heap) > 2 * len(self._open) + _HEAP_SLACK:
+        if not self._open:
+            heap.clear()
+        elif len(heap) > 2 * len(self._open) + _HEAP_SLACK:
             self._rebuild_heap()
 
     def _rebuild_heap(self) -> None:
