@@ -912,6 +912,65 @@ async def test_async_advanced_filter_package_condition_delivers_that_packages_li
     assert collector.delivered() == [("mine 1", PACKAGE), ("mine 2", PACKAGE)]
 
 
+@pytest.mark.asyncio
+async def test_async_advanced_filter_package_combination_delivers_the_matching_lines(
+    fake_adb: FakeAdb,
+) -> None:
+    """AsyncLogStream with (Package(...) & Level("E")) | MessageContains(...), the
+    README's shape, looks the package up and delivers the package's error lines,
+    attributed, and anyone's matching message, nothing else (F5-1).
+    """
+    _resolve_steadily(fake_adb)
+    _logcat_until_parsed(
+        fake_adb,
+        wait("resolved"),
+        _line("mine info", level="I"),
+        _line("mine error", level="E"),
+        _line("theirs error", pid=OTHER_PID, level="E"),
+        _line("theirs CRITICAL", pid=OTHER_PID, level="I"),
+    )
+    watcher = _ParseWatcher(FILLER)
+    collector = _AsyncCollector()
+    condition = (Package(PACKAGE) & Level("E")) | MessageContains("CRITICAL")
+    stream = await _start_async(condition, collector, parser=watcher)
+    try:
+        await _unblock_if_never_looked_up_async(fake_adb)
+        await _end_logcat_once_parsed_async(fake_adb, watcher)
+        await _join_async(stream)
+    finally:
+        await _shutdown_async(fake_adb, stream)
+
+    assert {child.args[-1] for child in fake_adb.children("pidof")} == {PACKAGE}
+    assert collector.delivered() == [("mine error", PACKAGE), ("theirs CRITICAL", None)]
+
+
+@pytest.mark.asyncio
+async def test_async_package_under_not_in_an_or_is_looked_up(fake_adb: FakeAdb) -> None:
+    """AsyncLogStream looks up a Package anywhere in the condition, here under Not
+    inside an Or, so the package's lines are attributed and left out (F5-1).
+    """
+    _resolve_steadily(fake_adb)
+    _logcat_until_parsed(
+        fake_adb,
+        wait("resolved"),
+        _line("mine"),
+        _line("theirs", pid=OTHER_PID),
+    )
+    watcher = _ParseWatcher(FILLER)
+    collector = _AsyncCollector()
+    condition = Tag("nothing") | ~Package(PACKAGE)
+    stream = await _start_async(condition, collector, parser=watcher)
+    try:
+        await _unblock_if_never_looked_up_async(fake_adb)
+        await _end_logcat_once_parsed_async(fake_adb, watcher)
+        await _join_async(stream)
+    finally:
+        await _shutdown_async(fake_adb, stream)
+
+    assert {child.args[-1] for child in fake_adb.children("pidof")} == {PACKAGE}
+    assert collector.delivered() == [("theirs", None), (FILLER, None)]
+
+
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
