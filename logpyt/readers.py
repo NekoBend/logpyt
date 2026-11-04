@@ -1,172 +1,220 @@
-"""Log file readers."""
+"""Offline reading: `read_file` (design 2.8).
+
+A log file is read as bytes and goes through the same stages as a live stream's
+output: the byte framer (``logpyt._core.framing``: LF-only lines, a line cap, a
+BOM stripped at offset 0), then the line pipeline (``logpyt._core.pipeline``:
+decode, parse, attribution from ``uid_packages``, ``where``, ``group_by``).
+"""
 
 from __future__ import annotations
 
 import logging
 import os
-import time
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, overload
 
+from ._core.framing import DEFAULT_MAX_LINE_BYTES, MIN_MAX_LINE_BYTES, Framer
+from ._core.pipeline import Pipeline
+from .adb import _check_package_name
 from .filters import _require_condition
-from .parsers import LogParser, ParseContext, ThreadTimeLogParser
-from .parsers._fallback import is_divider, unparsed_entry
+from .groupers import GroupBy
+from .parsers import ParseContext, ThreadTimeLogParser
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from .filters import Condition
-    from .models import LogEntry
+    from .models import LogEntry, LogGroup
+    from .parsers import LogParser
+
+__all__ = ["read_file"]
 
 logger = logging.getLogger(__name__)
-_PARSE_ERROR_PREVIEW_LIMIT = 160
+
+# The size of one read from the file. The framer bounds what it keeps of a
+# line, so the chunk size bounds nothing and only sets the syscall rate.
+_CHUNK_BYTES = 64 * 1024
 
 
-class LogFileReader:
-    """Reads and parses log entries from a file.
+@overload
+def read_file(
+    path: str | os.PathLike[str],
+    *,
+    parser: LogParser | None = None,
+    where: Condition | None = None,
+    group_by: None = None,
+    year: int | None = None,
+    uid_packages: Mapping[int, str] | None = None,
+    max_line_bytes: int = DEFAULT_MAX_LINE_BYTES,
+) -> Iterator[LogEntry]: ...
+@overload
+def read_file(
+    path: str | os.PathLike[str],
+    *,
+    parser: LogParser | None = None,
+    where: Condition | None = None,
+    group_by: GroupBy,
+    year: int | None = None,
+    uid_packages: Mapping[int, str] | None = None,
+    max_line_bytes: int = DEFAULT_MAX_LINE_BYTES,
+) -> Iterator[LogGroup]: ...
+def read_file(
+    path: str | os.PathLike[str],
+    *,
+    parser: LogParser | None = None,
+    where: Condition | None = None,
+    group_by: GroupBy | None = None,
+    year: int | None = None,
+    uid_packages: Mapping[int, str] | None = None,
+    max_line_bytes: int = DEFAULT_MAX_LINE_BYTES,
+) -> Iterator[LogEntry | LogGroup]:
+    """Read a log file lazily: its entries, or its groups with ``group_by``.
 
-    This class allows iterating over log entries from a file, applying
-    parsing and filtering on the fly.
+    The arguments are checked when ``read_file`` is called; the file is opened
+    at the first ``next()`` and read in one pass. Every call is a parse session
+    of its own, so reading a file twice gives the same entries.
+
+    How lines are read:
+
+    - A line ends at LF only. The CRs before the LF are stripped (CR LF and CR
+      CR LF files read like LF files); a CR inside a line stays in its message.
+    - A UTF-8 BOM at the start of the file is skipped. Each line is decoded as
+      UTF-8; an undecodable byte becomes U+FFFD.
+    - A line longer than ``max_line_bytes`` keeps its first ``max_line_bytes``
+      bytes and gives an entry with ``truncated=True``; the next line is read
+      as usual.
+    - logcat's ``--------- beginning of <buffer>`` dividers are skipped.
+    - A line the parser does not recognise is yielded as an entry with
+      ``parsed=False`` whose message is the whole line.
+    - With ``uid_packages``, an entry whose ``uid`` the map names gets that
+      ``package``. A secondary user's uid (>= 100000) that the map does not
+      name matches by its app id, uid modulo 100000, as live streams match
+      (design 5.8): ``{10065: pkg}`` also attributes ``1010065`` (user 10),
+      while a key for ``1010065`` itself wins over it. A file carries no
+      other attribution.
+
+    At the end of a read, or when the iterator is closed early, one WARNING on
+    logger ``logpyt.readers`` reports the lines the parser did not recognise
+    (a format mismatch, F6-5), and another the cut lines, each only if there
+    were any. At the call, one WARNING names each package of ``where`` that no
+    ``uid_packages`` value names: no line can carry that package.
+
+    Args:
+        path: The log file.
+        parser: Splits a line into an entry; None means `ThreadTimeLogParser`.
+        where: Only entries that meet this condition are yielded (or grouped).
+        group_by: Yield `LogGroup` objects, as `GroupBy.groups` would; the
+            groups still open at the end of the file close with reason
+            ``"end"``. None yields the entries.
+        year: The year of the first line that carries no year (yearless
+            ``-v threadtime``). None places it no later than two days after
+            the file's modification time (or the host clock when the
+            modification time is not a valid local datetime).
+        uid_packages: uid -> package name, for lines with a ``-v uid`` column;
+            a key is a full uid or an app id (uid modulo 100000). Required
+            when ``where`` names packages (`Condition.packages`): without it
+            no line could carry a package.
+        max_line_bytes: The longest line kept whole, in bytes; >= 4096.
+
+    Returns:
+        An iterator over the entries, or over the groups with ``group_by``.
+
+    Raises:
+        TypeError: An argument has the wrong type: ``where`` is not a
+            `Condition` (wrap a function in `Where`), ``group_by`` not a
+            `GroupBy`, ``parser`` is a class or has no ``parse`` method, a
+            ``uid_packages`` key is not an int.
+        ValueError: ``where`` names packages and ``uid_packages`` is None
+            (F5-4); ``year`` is outside 1..9999; a ``uid_packages`` key is
+            negative or a value is not a package name; ``max_line_bytes`` is
+            below 4096.
+        OSError: From the first ``next()``: the file cannot be opened or read.
+
+    Exceptions raised by a custom parser or condition propagate unchanged and
+    end the read.
+
     """
+    file_path = Path(path)
+    checked_parser = _check_parser(parser)
+    checked_where = None if where is None else _require_condition(where, "where")
+    if group_by is not None and not isinstance(group_by, GroupBy):
+        msg = f"group_by must be a GroupBy, not {type(group_by).__name__}"
+        raise TypeError(msg)
+    ParseContext(year=year)  # a bad year fails here, not at the first line
+    uids = _check_uid_packages(uid_packages)
+    _check_max_line_bytes(max_line_bytes)
+    if checked_where is not None:
+        _check_package_condition(checked_where, uids)
+    return _read(
+        file_path,
+        checked_parser,
+        where=checked_where,
+        group_by=group_by,
+        year=year,
+        uid_packages=uids,
+        max_line_bytes=max_line_bytes,
+    )
 
-    def __init__(
-        self,
-        file_path: str | Path,
-        parser: LogParser | None = None,
-        filter_by: Condition | None = None,
-        parse_error_log_interval: float = 5.0,
-        *,
-        year: int | None = None,
-    ) -> None:
-        """Initialize the reader.
 
-        Args:
-            file_path: Path to the log file.
-            parser: Parser to use. If None, defaults to ThreadTimeLogParser.
-                A line the parser does not recognise is yielded as an entry
-                with ``parsed=False`` whose message is the whole line.
-            filter_by: Optional condition; only the entries that meet it are
-                yielded. A file carries no package attribution, so a
-                `Package` condition matches none of its entries.
-            parse_error_log_interval: Minimum interval in seconds between
-                repeated parse error logs. Defaults to 5.0.
-            year: The year of the first line that carries no year (yearless
-                ``-v threadtime``). None places it before the file's
-                modification time (see ``ParseContext``), or before the host
-                clock when the modification time is no valid local datetime.
-        """
-        self.file_path = Path(file_path)
-        self.parser = parser or ThreadTimeLogParser()
-        self.filter_by = (
-            None if filter_by is None else _require_condition(filter_by, "filter_by")
+def _read(
+    path: Path,
+    parser: LogParser,
+    *,
+    where: Condition | None,
+    group_by: GroupBy | None,
+    year: int | None,
+    uid_packages: Mapping[int, str] | None,
+    max_line_bytes: int,
+) -> Iterator[LogEntry | LogGroup]:
+    """The generator behind `read_file`, for checked arguments."""
+    framer = Framer(max_line_bytes, strip_bom=True)
+    with path.open("rb", buffering=0) as file:
+        # The mtime anchors the first yearless line only without year=.
+        anchor = None if year is not None else _mtime(file.fileno())
+        pipeline = Pipeline(
+            parser,
+            ParseContext(year=year, anchor=anchor),
+            where=where,
+            group_by=group_by,
+            uid_packages=uid_packages,
         )
-        ParseContext(year=year)  # a bad year fails here, not at the first line
-        self.year = year
-        self._parse_error_log_interval = max(0.0, parse_error_log_interval)
-        self._last_parse_error_log_ts = 0.0
-        self._suppressed_parse_errors = 0
-
-    @staticmethod
-    def _sanitize_line_preview(
-        line: str, max_len: int = _PARSE_ERROR_PREVIEW_LIMIT
-    ) -> str:
-        """Sanitize untrusted log line content for diagnostics."""
-        stripped = line.rstrip("\r\n")
-        sanitized = "".join(
-            ch if (ch.isprintable() and ch != "\x1b") else "?" for ch in stripped
-        )
-        if len(sanitized) > max_len:
-            return f"{sanitized[: max_len - 3]}..."
-        return sanitized
-
-    def _log_parse_error(self, line: str, error: Exception) -> None:
-        """Log parse errors with optional rate limiting."""
-        preview = self._sanitize_line_preview(line)
-        interval = self._parse_error_log_interval
-        if interval <= 0.0:
-            logger.error("Failed to parse line: %s - Error: %s", preview, error)
-            return
-
-        now = time.monotonic()
-        if (now - self._last_parse_error_log_ts) >= interval:
-            if self._suppressed_parse_errors:
-                logger.warning(
-                    "Suppressed %d parse errors while reading %s.",
-                    self._suppressed_parse_errors,
-                    self.file_path,
-                )
-                self._suppressed_parse_errors = 0
-
-            logger.error("Failed to parse line: %s - Error: %s", preview, error)
-            self._last_parse_error_log_ts = now
-            return
-
-        self._suppressed_parse_errors += 1
-
-    def __iter__(self) -> Iterator[LogEntry]:
-        """Iterate over log entries in the file.
-
-        Opens the file and reads it line by line. Each line is parsed
-        using the configured parser, in a parse session of its own: every
-        iteration starts afresh, so iterating twice gives the same entries.
-        If a filter is set, only matching entries are yielded.
-
-        Lines the parser does not recognise (logcat's ``--------- beginning
-        of`` dividers excepted) are counted, and one WARNING per iteration
-        reports how many there were (F6-5).
-
-        Yields:
-            Parsed LogEntry objects that match the filter.
-
-        Raises:
-            FileNotFoundError: If the file does not exist.
-            PermissionError: If the file cannot be read.
-        """
-        unparsed = 0
-        lines = 0
         try:
-            with self.file_path.open("r", encoding="utf-8", errors="replace") as f:
-                # The mtime anchors the first yearless line only without year=.
-                anchor = None if self.year is not None else _mtime(f.fileno())
-                ctx = ParseContext(year=self.year, anchor=anchor)
-                for line in f:
-                    lines += 1
-                    try:
-                        entry = self.parser.parse(line, ctx)
-                    except Exception as e:  # noqa: BLE001
-                        # Log parse errors with throttling to avoid log storms
-                        self._log_parse_error(line, e)
-                        continue
-                    if entry is None:
-                        entry = unparsed_entry(line, ctx)
-                        if not is_divider(entry.raw):
-                            unparsed += 1
-
-                    # Apply filter if present
-                    if self.filter_by is not None and not self.filter_by(entry):
-                        continue
-
-                    yield entry
+            while chunk := file.read(_CHUNK_BYTES):
+                for line in framer.feed(chunk):
+                    yield from pipeline.push(line)
+            for line in framer.finish():
+                yield from pipeline.push(line)
+            yield from pipeline.finish()
         finally:
-            if unparsed:
-                logger.warning(
-                    "%d of %d lines in %s are not in the %r format of %s; "
-                    "they were read as unparsed entries (parsed=False).",
-                    unparsed,
-                    lines,
-                    self.file_path,
-                    getattr(self.parser, "logcat_format", "?"),
-                    type(self.parser).__name__,
-                )
+            _report(path, parser, pipeline, max_line_bytes)
 
-        if self._suppressed_parse_errors:
-            logger.warning(
-                "Suppressed %d parse errors while reading %s.",
-                self._suppressed_parse_errors,
-                self.file_path,
-            )
-            self._suppressed_parse_errors = 0
+
+def _report(
+    path: Path, parser: LogParser, pipeline: Pipeline, max_line_bytes: int
+) -> None:
+    """Log one WARNING each for unrecognised and for cut lines, if any."""
+    if pipeline.unparsed:
+        logger.warning(
+            "%d of %d lines in %s are not in the %r format of %s; "
+            "they were read as unparsed entries (parsed=False).",
+            pipeline.unparsed,
+            pipeline.lines,
+            path,
+            getattr(parser, "logcat_format", "?"),
+            type(parser).__name__,
+        )
+    if pipeline.truncated:
+        logger.warning(
+            "%d of %d lines in %s are longer than max_line_bytes=%d; "
+            "their entries hold the first %d bytes (truncated=True).",
+            pipeline.truncated,
+            pipeline.lines,
+            path,
+            max_line_bytes,
+            max_line_bytes,
+        )
 
 
 def _mtime(fd: int) -> datetime | None:
@@ -183,25 +231,112 @@ def _mtime(fd: int) -> datetime | None:
         return None
 
 
-def read_file(
-    file_path: str | Path,
-    parser: LogParser | None = None,
-    filter_by: Condition | None = None,
-    *,
-    year: int | None = None,
-) -> Iterator[LogEntry]:
-    """Read all log entries from a file.
+# -- argument checks --------------------------------------------------------------
 
-    This is a convenience function wrapping LogFileReader.
 
-    Args:
-        file_path: Path to the log file.
-        parser: Parser to use.
-        filter_by: Optional condition (see `LogFileReader`).
-        year: The year of the first line that carries no year; None places it
-            before the file's modification time.
+def _check_parser(parser: LogParser | None) -> LogParser:
+    """``parser``, or a `ThreadTimeLogParser` for None.
 
-    Returns:
-        Iterator of LogEntry objects.
+    Raises:
+        TypeError: ``parser`` is a class, not an instance, or has no callable
+            ``parse`` (a 2.x parser has ``parse_stdout`` instead).
+
     """
-    yield from LogFileReader(file_path, parser, filter_by, year=year)
+    if parser is None:
+        return ThreadTimeLogParser()
+    if isinstance(parser, type):
+        # A class has a callable parse too; it would fail at the first line.
+        msg = (
+            f"parser must be a parser instance, not the class {parser.__name__}: "
+            f"pass {parser.__name__}()"
+        )
+        raise TypeError(msg)
+    if not callable(getattr(parser, "parse", None)):
+        msg = (
+            "parser must have a parse(line, ctx) method (the LogParser "
+            f"protocol); {type(parser).__name__} has none"
+        )
+        raise TypeError(msg)
+    return parser
+
+
+def _check_uid_packages(value: Mapping[int, str] | None) -> dict[int, str] | None:
+    """A copy of ``value``, checked: int uids >= 0 to package names.
+
+    The copy keeps a read from seeing later changes to the caller's mapping.
+
+    Raises:
+        TypeError: ``value`` is not a mapping, a key is not an int (a bool is
+            not), or a value is not a str.
+        ValueError: A key is negative, or a value is not a package name.
+
+    """
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        msg = (
+            "uid_packages must be a mapping of uid to package name, "
+            f"not {type(value).__name__}"
+        )
+        raise TypeError(msg)
+    checked: dict[int, str] = {}
+    for uid, package in value.items():
+        if isinstance(uid, bool) or not isinstance(uid, int):
+            msg = f"uid_packages keys must be int uids, not {type(uid).__name__}"
+            raise TypeError(msg)
+        if uid < 0:
+            msg = f"uid_packages keys must be uids >= 0, not {uid}"
+            raise ValueError(msg)
+        checked[uid] = _check_package_name(package)
+    return checked
+
+
+def _check_max_line_bytes(value: object) -> None:
+    """Check that ``value`` is an int of at least 4096.
+
+    Raises:
+        TypeError: ``value`` is not an int (a bool is not).
+        ValueError: ``value`` is below 4096.
+
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        msg = f"max_line_bytes must be an int, not {type(value).__name__}"
+        raise TypeError(msg)
+    if value < MIN_MAX_LINE_BYTES:
+        msg = f"max_line_bytes must be at least {MIN_MAX_LINE_BYTES}, not {value}"
+        raise ValueError(msg)
+
+
+def _check_package_condition(where: Condition, uids: Mapping[int, str] | None) -> None:
+    """Check the packages ``where`` names against the uid map.
+
+    Without a map a file attributes no line, so a condition that names packages
+    is refused (F5-4). With one, a WARNING names each package that no map value
+    names: its `Package` leaves can never match. That is a warning, not an
+    error, because ``~Package(name)`` or an `Or` still selects lines.
+
+    Raises:
+        ValueError: ``uids`` is None and ``where.packages()`` is not empty.
+
+    """
+    names = where.packages()
+    if not names:
+        return
+    if uids is not None:
+        mapped = set(uids.values())
+        for name in sorted(names - mapped):
+            logger.warning(
+                "where names package %r, but no uid in uid_packages maps to it: "
+                "no line can carry that package.",
+                name,
+            )
+        return
+    listed = ", ".join(repr(name) for name in sorted(names))
+    msg = (
+        f"where depends on the package of each line ({listed}), but a log "
+        "file carries no package attribution: pass uid_packages={uid: "
+        "package} to attribute lines by their -v uid column, or use "
+        "CrashCondition(package=)/AnrCondition(package=), which read the "
+        "message text"
+    )
+    raise ValueError(msg)

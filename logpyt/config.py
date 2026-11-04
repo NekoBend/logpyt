@@ -30,6 +30,7 @@ from pydantic import (
     model_validator,
 )
 
+from logpyt._core.framing import DEFAULT_MAX_LINE_BYTES, MIN_MAX_LINE_BYTES
 from logpyt.adb import _MARKER_TAG
 
 __all__ = ["Reconnect", "StreamConfig"]
@@ -400,7 +401,7 @@ class StreamConfig(
     resume_window_bytes: PositiveInt = 4 * 1024 * 1024
     buffer_entries: PositiveInt = 10_000
     buffer_bytes: PositiveInt = 16 * 1024 * 1024
-    max_line_bytes: int = Field(64 * 1024, ge=4096)
+    max_line_bytes: int = Field(DEFAULT_MAX_LINE_BYTES, ge=MIN_MAX_LINE_BYTES)
     stop_grace: PositiveFloat = 2.0
     exit_drain: PositiveFloat = 2.0
     close_timeout: PositiveFloat = 5.0

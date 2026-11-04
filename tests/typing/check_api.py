@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Hashable, Iterator
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, assert_never, assert_type, overload
 
 from logpyt import (
@@ -30,7 +31,6 @@ from logpyt import (
     IncompleteCaptureError,
     Level,
     LogEntry,
-    LogFileReader,
     LogGroup,
     LogpytError,
     LogStream,
@@ -47,6 +47,7 @@ from logpyt import (
     StreamEvent,
     StreamStats,
     Tag,
+    ThreadTimeLogParser,
     UsageError,
     Where,
     read_file,
@@ -210,10 +211,36 @@ def check_filter_by_takes_any_condition() -> None:
     where = (Package("com.example") & Level("E")) | MessageContains("CRITICAL")
     LogStream(filter_by=where)
     AsyncLogStream(filter_by=CrashCondition(package="com.example"))
-    LogFileReader("app.log", filter_by=~Tag("noise"))
-    read_file("app.log", filter_by=Where(_is_error))
+    read_file("app.log", where=~Tag("noise"))
+    read_file("app.log", where=Where(_is_error))
     LogStream(filter_by=_is_error)  # ty: ignore[invalid-argument-type]
-    read_file("app.log", filter_by=_is_error)  # ty: ignore[invalid-argument-type]
+    read_file("app.log", where=_is_error)  # ty: ignore[invalid-argument-type]
+
+
+def check_read_file(spec: GroupBy, maybe: GroupBy | None) -> None:
+    # Design 2.8: entries without group_by, groups with it.
+    assert_type(read_file("app.log"), Iterator[LogEntry])
+    assert_type(
+        read_file(
+            Path("app.log"),
+            parser=ThreadTimeLogParser(),
+            where=Package("com.example"),
+            year=2026,
+            uid_packages={10065: "com.example"},
+            max_line_bytes=8192,
+        ),
+        Iterator[LogEntry],
+    )
+    assert_type(read_file("app.log", group_by=spec), Iterator[LogGroup])
+    assert_type(
+        read_file("app.log", group_by=maybe), Iterator[LogEntry] | Iterator[LogGroup]
+    )
+    for entry in read_file("app.log"):
+        assert_type(entry, LogEntry)
+    read_file("app.log", ThreadTimeLogParser())  # ty: ignore[no-matching-overload]
+    read_file("app.log", filter_by=Tag("x"))  # ty: ignore[no-matching-overload]
+    read_file("app.log", uid_packages={"com.example": 10065})  # ty: ignore[invalid-argument-type]
+    read_file("app.log", group_by=("pid",))  # ty: ignore[no-matching-overload]
 
 
 def check_group_by(entries: list[LogEntry]) -> None:

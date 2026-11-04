@@ -149,10 +149,13 @@ class ParseContext:
         return self._anchor
 
     def now(self) -> datetime:  # noqa: PLR6301  (per-session interface; no state yet)
-        """The timestamp of a line that carries none: host-local time, naive.
+        """The session's wall-clock time: host-local time, naive.
 
         Brief, process, tag and raw lines and the fallback entries of
-        unrecognised lines get it. It is computed on every call (F6-4).
+        unrecognised lines get it as their timestamp, and the first yearless
+        line is placed before it when there is neither ``year`` nor ``anchor``.
+        It is computed on every call (F6-4), and it is the session's only
+        clock read.
         """
         return host_now()
 
@@ -190,7 +193,7 @@ class ParseContext:
                 self._year, month, day, hour, minute, second, microsecond
             )
         else:
-            anchor = self._anchor if self._anchor is not None else host_now()
+            anchor = self._anchor if self._anchor is not None else self.now()
             chosen = self._before(anchor, month, day, hour, minute, second, microsecond)
         if chosen is not None:
             self._previous = chosen

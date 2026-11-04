@@ -1,6 +1,6 @@
 """Behavior of the offline components through the public API.
 
-Covers ``LogFileReader`` / ``read_file``, the format parsers, ``LogEntry``'s
+Covers ``read_file``, the format parsers, ``LogEntry``'s
 JSON payload, ``export_logs`` and ``GroupBy``. No adb is involved; inputs are
 real files under ``tmp_path`` or ``LogEntry`` objects built by the test.
 
@@ -23,7 +23,6 @@ from logpyt import (
     Filter,
     GroupBy,
     LogEntry,
-    LogFileReader,
     LogGroup,
     ThreadTimeLogParser,
     export_logs,
@@ -122,7 +121,7 @@ def _sample_entries(tmp_path: Path) -> list[LogEntry]:
     return list(read_file(path, year=2026))
 
 
-# -- LogFileReader / read_file -------------------------------------------------
+# -- read_file -----------------------------------------------------------------
 
 
 def test_reader_yields_threadtime_fields(tmp_path: Path) -> None:
@@ -153,8 +152,8 @@ def test_reader_yields_threadtime_fields(tmp_path: Path) -> None:
     assert ts.microsecond == 678000
 
 
-def test_reader_filter_by_yields_only_matching_entries(tmp_path: Path) -> None:
-    """A reader with filter_by yields only the entries the filter accepts."""
+def test_reader_where_yields_only_matching_entries(tmp_path: Path) -> None:
+    """read_file with where= yields only the entries the condition accepts."""
     path = _write(
         tmp_path,
         (
@@ -164,21 +163,27 @@ def test_reader_filter_by_yields_only_matching_entries(tmp_path: Path) -> None:
         ).encode("utf-8"),
     )
 
-    entries = list(LogFileReader(path, filter_by=Filter(level="E")))
+    entries = list(read_file(path, where=Filter(level="E")))
 
     assert [e.message for e in entries] == ["error"]
 
 
 def test_reader_keeps_non_threadtime_line_as_message(tmp_path: Path) -> None:
-    """A line that is not in threadtime format is still yielded, its text as message."""
+    """A line that is not in threadtime format is still yielded, its text as message.
+
+    logcat's own ``--------- beginning of <buffer>`` dividers are no log lines
+    and are skipped (design 5.5).
+    """
     path = _write(
         tmp_path,
-        b"--------- beginning of main\n" + threadtime("real").encode("utf-8"),
+        b"--------- beginning of main\n"
+        + b"not a threadtime line\n"
+        + threadtime("real").encode("utf-8"),
     )
 
     entries = list(read_file(path))
 
-    assert [e.message for e in entries] == ["--------- beginning of main", "real"]
+    assert [e.message for e in entries] == ["not a threadtime line", "real"]
 
 
 def test_reader_invalid_utf8_does_not_abort_reading(tmp_path: Path) -> None:
@@ -203,11 +208,6 @@ def test_reader_missing_file_raises_file_not_found(tmp_path: Path) -> None:
         list(read_file(tmp_path / "missing.log"))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="F1-2: universal newlines split a line at a bare CR inside a message",
-)
 def test_reader_bare_cr_cannot_forge_a_second_entry(tmp_path: Path) -> None:
     """A bare CR inside a message stays part of that one entry (no forged entry)."""
     forged = "01-15 00:00:00.000  1000  1000 E AndroidRuntime: FATAL EXCEPTION: main"
@@ -249,11 +249,6 @@ def test_reader_crlf_raw_is_not_rewritten(tmp_path: Path) -> None:
     assert entry.raw in {f"{line}\r\n", line}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="F1-2: universal newlines turn each CR CR LF into an extra empty entry",
-)
 def test_reader_cr_cr_lf_file_has_no_phantom_entries(tmp_path: Path) -> None:
     """A file with CR CR LF line ends yields one entry per line, no empty extras."""
     first = threadtime("hello", pid=11).rstrip("\n")
@@ -265,11 +260,6 @@ def test_reader_cr_cr_lf_file_has_no_phantom_entries(tmp_path: Path) -> None:
     assert [(e.pid, e.message) for e in entries] == [(11, "hello"), (22, "world")]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="F1-7: a UTF-8 BOM is kept, so the first line falls back to a raw entry",
-)
 def test_reader_utf8_bom_keeps_first_entry(tmp_path: Path) -> None:
     """A UTF-8 BOM at the start of a file does not lose or corrupt the first entry."""
     path = _write(
@@ -321,11 +311,12 @@ def test_threadtime_interleaved_new_year_does_not_drift(tmp_path: Path) -> None:
 
 
 def test_reader_iterated_twice_gives_same_timestamps(tmp_path: Path) -> None:
-    """Iterating the same LogFileReader twice yields the same timestamps both times.
+    """Reading the same file twice yields the same timestamps both times.
 
-    The second file spans eight months in steps under half a year. A session
-    carried over from the first pass would place the second pass's Jan 1 next
-    to the Sep 1 it ended on, in 2025; a fresh session per iteration and per
+    Every read_file call is a parse session of its own, also when the calls
+    share one parser. The second file spans eight months in steps under half a
+    year. A session carried over from the first pass would place the second
+    pass's Jan 1 next to the Sep 1 it ended on, in 2025; a fresh session per
     read_file call keeps every pass in 2024 (F6-1).
     """
     path = _write(
@@ -335,10 +326,10 @@ def test_reader_iterated_twice_gives_same_timestamps(tmp_path: Path) -> None:
             + threadtime("new", date="01-01", time_="00:00:00.010")
         ).encode("utf-8"),
     )
-    reader = LogFileReader(path, year=2024)
+    parser = ThreadTimeLogParser()
 
-    first = [e.timestamp for e in reader]
-    second = [e.timestamp for e in reader]
+    first = [e.timestamp for e in read_file(path, parser=parser, year=2024)]
+    second = [e.timestamp for e in read_file(path, parser=parser, year=2024)]
 
     assert len(first) == 2
     assert second == first
@@ -351,9 +342,10 @@ def test_reader_iterated_twice_gives_same_timestamps(tmp_path: Path) -> None:
         ).encode("utf-8"),
         name="span.log",
     )
-    span_reader = LogFileReader(span, year=2024)
-    passes = [[e.timestamp.year for e in span_reader] for _ in range(2)]
-    passes += [[e.timestamp.year for e in read_file(span, year=2024)] for _ in range(2)]
+    passes = [
+        [e.timestamp.year for e in read_file(span, parser=parser, year=2024)]
+        for _ in range(4)
+    ]
 
     assert passes == [[2024, 2024, 2024]] * 4
 

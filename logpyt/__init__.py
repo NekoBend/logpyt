@@ -64,7 +64,7 @@ from .filters import (
 from .groupers import GroupBy
 from .models import LogEntry, LogGroup
 from .parsers import LogParser, ThreadTimeLogParser
-from .readers import LogFileReader, read_file
+from .readers import read_file
 from .streams import AsyncLogStream, AsyncStreamHandle, LogStream, StreamHandle
 
 # 3.0 stream events. StreamState stays in logpyt.streams._events until the driver
@@ -89,7 +89,6 @@ __all__ = [
     "IncompleteCaptureError",
     "Level",
     "LogEntry",
-    "LogFileReader",
     "LogGroup",
     "LogParser",
     "LogStream",

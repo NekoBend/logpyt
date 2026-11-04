@@ -144,25 +144,37 @@ with LogStream(
     stream.join()
 
 # The same grouping offline
-for group in group_by.groups(read_file("app.log")):
+for group in read_file("app.log", group_by=group_by):
     print(group.key, len(group))
 ```
 
 ### Offline Analysis
 
-Read and process log files offline.
+Read and process log files offline. `read_file` yields the entries lazily, in
+one pass per call; every argument after the path is keyword-only. A line ends
+at LF only (CR LF and CR CR LF files read like LF files, and a CR inside a
+message stays in it), a UTF-8 BOM at the start is skipped, and a line longer
+than `max_line_bytes` (64 KiB) becomes one entry with `truncated=True`.
 
 ```python
-from logpyt import read_file, LogFileReader
-from logpyt.parsers import ThreadTimeLogParser
+from logpyt import MinLevel, Package, read_file
+from logpyt.parsers import BriefLogParser
 
-# Read all logs into a list (read_file yields lazily; wrap in list() to materialize)
-entries = list(read_file("app.log", parser=ThreadTimeLogParser()))
-
-# Iterate over logs (memory efficient)
-reader = LogFileReader("app.log", parser=ThreadTimeLogParser())
-for entry in reader:
+# Iterate over the entries (memory efficient); list() keeps them
+for entry in read_file("app.log", where=MinLevel("W")):
     print(f"{entry.timestamp}: {entry.message}")
+
+# Another logcat format: pass its parser
+entries = list(read_file("brief.log", parser=BriefLogParser()))
+
+# A file carries no package names: a Package condition needs the uid of each
+# package, for lines captured with `-v uid` (it raises ValueError without them).
+# Another user's lines (uid 1010065 for user 10) match the app id 10065 too.
+app_lines = read_file(
+    "capture.log",
+    where=Package("com.example.app"),
+    uid_packages={10065: "com.example.app"},
+)
 ```
 
 ### Exporters
@@ -218,7 +230,7 @@ if __name__ == "__main__":
   - `resolve_adb()`: Finds the ADB executable.
   - `list_devices()`, `wait_for_device()`, `adb_connect()`: Device helpers (async twins included).
 - **Offline and export**:
-  - `read_file()` / `LogFileReader`: Tools for offline log analysis.
+  - `read_file()`: Reads a log file offline, as entries or, with `group_by=`, groups.
   - `export_logs()`: Exports logs to JSON/CSV.
 
 ## License
