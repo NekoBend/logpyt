@@ -402,7 +402,7 @@ def stimulus(harness: Harness, kind: str) -> tuple[Event, bool, float | None]:
         "stop_flush": (StopRequest(flush=5.0), True),
         "kill": (KillRequest(), True),
         "consumer_progress": (ConsumerProgress(harness.outbox.counts()), True),
-        "consumer_detached": (ConsumerDetached(), True),
+        "consumer_detached": (ConsumerDetached(harness.outbox.counts()), True),
         "callback_failed": (CallbackFailed("on_event", ValueError("x")), True),
         "spawned": (Spawned(connection, 77), spawn_pending),
         "spawn_failed": (SpawnFailed(connection, OSError("x")), spawn_pending),
@@ -514,7 +514,10 @@ class RandomDriver:
         harness = self.harness
         before = harness.core.state
         live_before = harness.core.connection
+        issued = len(harness.commands)
         out = harness.send(event, at=at)
+        # With the harness's own reports of the outbox counts after ``out``.
+        out = harness.commands[issued:]
         self.steps += 1
         if before in TERMINAL:
             assert out == [], "a terminal core returned commands (G2)"
@@ -576,6 +579,7 @@ class RandomDriver:
         for _ in range(self.rng.randint(0, 4)):
             if outbox.pop() is None:
                 break
+        self.harness.reported = outbox.counts()
         self.send(ConsumerProgress(outbox.counts()))
 
     def answer(self) -> None:
@@ -669,17 +673,20 @@ class RandomDriver:
 
     def control(self) -> None:
         rng = self.rng
+        outbox = self.harness.outbox
         event = rng.choice(
             [
                 StopRequest(),
                 StopRequest(flush=rng.choice([0.2, 2.0])),
                 KillRequest(),
-                ConsumerDetached(),
+                None,  # the consumer detaches
                 CallbackFailed("on_item", ValueError("callback")),
             ]
         )
-        if isinstance(event, ConsumerDetached):
-            self.harness.outbox.detach()
+        if event is None:
+            outbox.detach()
+            self.harness.reported = outbox.counts()
+            event = ConsumerDetached(outbox.counts())
         self.send(event)
 
     # -- the end -----------------------------------------------------------------
@@ -710,4 +717,3 @@ class RandomDriver:
         assert core.state in TERMINAL, f"the run did not end: {state_key(harness)}"
         while not harness.outbox.ended and not harness.outbox.detached:
             self.consume()
-        self.send(ConsumerProgress(harness.outbox.counts()))

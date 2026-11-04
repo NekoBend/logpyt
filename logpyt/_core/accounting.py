@@ -22,7 +22,8 @@ class Tally:
     """The counters the core keeps itself; `snapshot` adds the rest.
 
     ``dropped`` counts the lines the core discarded (kill, a failed run, a
-    detached consumer); the outbox's own discards come in its `OutboxCounts`.
+    detached consumer, the line ``where`` or grouping raised on); the outbox's
+    own discards come in its `OutboxCounts`.
     """
 
     reconnects: int = 0
@@ -92,8 +93,9 @@ class StderrLog:
     """adb stderr lines as WARNING diagnostics, at most 10 per second (design 5.9).
 
     A window opens at the first line logged; lines beyond the limit inside it
-    are counted, and the count is reported when the next window opens or at
-    the end of the run (`pending`).
+    are counted, and the count is reported when the window ends (`due`: the
+    core arms a deadline for it), when the next window opens, or at the end of
+    the run (`pending`), whichever comes first.
     """
 
     __slots__ = ("_logged", "_suppressed", "_window")
@@ -117,6 +119,12 @@ class StderrLog:
         else:
             self._suppressed += 1
         return out
+
+    def due(self) -> float | None:
+        """When the window with unreported lines ends; None if none waits."""
+        if not self._suppressed or self._window is None:
+            return None
+        return self._window + 1.0
 
     def pending(self) -> list[Diagnostic]:
         """The report of the lines not logged since the last one, if any."""

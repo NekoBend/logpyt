@@ -81,10 +81,11 @@ type Record = LogEntry | LogGroup | StateChange | Gap
 
 @dataclass(frozen=True, slots=True)
 class OutboxCounts:
-    """Cumulative counters of an `Outbox`, as the consumer side reports them.
+    """Cumulative counters of an `Outbox`, as the driver reports them.
 
-    Every field only grows, so the latest report replaces any earlier one and a
-    control inbox keeps one of them at most.
+    Every field only grows, so of two reports of one outbox the field-wise
+    maximum (`newest`) is the newer state, whatever order they were posted
+    in; a control inbox keeps one of them at most.
 
     Attributes:
         taken_entries: Entries handed to the consumer; a group counts its
@@ -112,6 +113,16 @@ class OutboxCounts:
     def removed_bytes(self) -> int:
         """Bytes that left the outbox, taken or discarded."""
         return self.taken_bytes + self.discarded_bytes
+
+    def newest(self, other: OutboxCounts) -> OutboxCounts:
+        """The field-wise maximum of two reports of the same outbox."""
+        return OutboxCounts(
+            taken_entries=max(self.taken_entries, other.taken_entries),
+            taken_bytes=max(self.taken_bytes, other.taken_bytes),
+            discarded_entries=max(self.discarded_entries, other.discarded_entries),
+            discarded_bytes=max(self.discarded_bytes, other.discarded_bytes),
+            events_coalesced=max(self.events_coalesced, other.events_coalesced),
+        )
 
 
 # -- events ----------------------------------------------------------------------
@@ -205,14 +216,40 @@ class CommandDone:
 
 @dataclass(frozen=True, slots=True)
 class ConsumerProgress:
-    """The outbox changed on the consumer side; ``counts`` is its latest state."""
+    """The outbox's counters changed; ``counts`` is its latest state.
+
+    They change on both sides, and the core learns them only from this event
+    (and from `ConsumerDetached`), so the driver reports
+    ``ConsumerProgress(outbox.counts())``:
+
+    - on the consumer side, in the same critical section (lock or task step)
+      as the `Outbox.pop` that took the items, so a request posted after it
+      (``kill()``, a `CallbackFailed`, a `ConsumerDetached`) never comes
+      first;
+    - on the engine side, after carrying out the commands of a
+      `StreamCore.handle` call whenever they changed the counters: a
+      `DiscardUndelivered`, a `Deliver` into a detached outbox (counted as
+      discarded), a coalesced state change;
+    - on the engine side, always, before carrying out a `Finished` (see
+      there), handed straight to `StreamCore.handle`.
+
+    Otherwise ``stats.undelivered``, ``delivered`` and ``events_coalesced``
+    miss what the outbox did.
+    """
 
     counts: OutboxCounts
 
 
 @dataclass(frozen=True, slots=True)
 class ConsumerDetached:
-    """No consumer is attached any more: a ``break``, a closed iterator."""
+    """No consumer is attached any more: a ``break``, a closed iterator.
+
+    The consumer side calls `Outbox.detach` first; ``counts`` is the outbox's
+    state after it, the entries the detach discarded included. A
+    `ControlInbox` hands these counts over before any waiting request.
+    """
+
+    counts: OutboxCounts
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,7 +320,18 @@ class RunCommand:
     """Run one short adb command through the one-shot runner.
 
     The driver answers with ``CommandDone(request, ...)``. A result the core no
-    longer waits for is ignored (G5), so the driver never needs to cancel one.
+    longer waits for is ignored (G5), so the driver never needs to cancel one;
+    an abandoned command still runs until it ends, at most ``timeout`` plus the
+    runner's reap. Two kinds are abandoned while the run goes on: a state
+    check (the first output, the end of its connection, or a stop, kill,
+    failure or detach came first) and a flush marker whose flush ended
+    another way first (the marker read, the flush timer, a stall, a detach,
+    a kill or a failure). STOPPING starts no other one-shot command, so
+    besides the lookup, one clock, marker or state command of the current
+    state (or the abandoned flush marker) runs, plus the abandoned state
+    checks still within their timeout and reap. State checks start at least
+    ``connect_timeout`` apart, so with the defaults (10 s against 5 s plus a
+    5 s reap) that is one at most.
 
     Attributes:
         request: The id the result must carry.
@@ -308,7 +356,12 @@ class Deliver:
 
 @dataclass(frozen=True, slots=True)
 class DiscardUndelivered:
-    """Discard the items waiting in the outbox (`Outbox.discard`); keep the events."""
+    """Discard the items waiting in the outbox (`Outbox.discard`); keep the events.
+
+    The driver then reports the outbox's counts (`ConsumerProgress`), so the
+    discarded entries reach ``stats.undelivered``: after the commands of the
+    batch, or before the `Finished` that ends it.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,7 +378,21 @@ class Finished:
     """The run ended; ``outcome`` is the latched error, None unless FAILED.
 
     Always the last command of the run, after the `Deliver` that carries the
-    terminal `StateChange`.
+    terminal `StateChange`. The driver carries out the commands before it in
+    order, then hands ``ConsumerProgress(outbox.counts())`` to
+    `StreamCore.handle` (always: the counts also cover consumer-side changes
+    whose own reports still wait), and only then carries out ``Finished``. In
+    a terminal state ``handle`` returns no commands and updates only the
+    accounting and ``outcome.stats``, so this is safe, and a discard in the
+    last batch reaches ``stats`` and ``outcome.stats`` before anyone can see
+    the end.
+
+    The consumer side keeps reporting after it (G2: accounting only).
+    ``join()`` returns, and the final ``stats`` are published, only once the
+    core has handled the consumer side's last report: the `ConsumerDetached`,
+    or the `ConsumerProgress` posted after the consumer took the terminal
+    `StateChange` (design 3.2: the consumer took the last item or is
+    detached).
     """
 
     outcome: StreamError | None
