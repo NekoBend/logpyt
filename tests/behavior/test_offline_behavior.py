@@ -14,10 +14,8 @@ from __future__ import annotations
 import csv
 import json
 import sys
-import threading
-import time
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import pytest
 
@@ -131,7 +129,7 @@ def _sample_entries(tmp_path: Path) -> list[LogEntry]:
         )
     ).encode("utf-8")
     path = _write(tmp_path, data, name="sample.log")
-    return list(read_file(path, parser=ThreadTimeLogParser(default_year=2026)))
+    return list(read_file(path, year=2026))
 
 
 # -- LogFileReader / read_file -------------------------------------------------
@@ -147,7 +145,7 @@ def test_reader_yields_threadtime_fields(tmp_path: Path) -> None:
         ).encode("utf-8"),
     )
 
-    entries = list(read_file(path, parser=ThreadTimeLogParser(default_year=2025)))
+    entries = list(read_file(path, year=2025))
 
     assert [(e.pid, e.tid, e.level, e.tag, e.message) for e in entries] == [
         (111, 222, "W", "MyTag", "hello world"),
@@ -247,17 +245,11 @@ def test_reader_crlf_file_has_clean_message_and_raw(tmp_path: Path) -> None:
     assert [e.raw.rstrip("\r\n") for e in entries] == [first, second]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="F1-2: universal newlines rewrite a CRLF line's raw to LF",
-)
 def test_reader_crlf_raw_is_not_rewritten(tmp_path: Path) -> None:
     """raw of a CRLF line is the original line, not rewritten to end in LF.
 
-    Whether raw keeps the CRLF or drops the terminator is an open design point;
-    rewriting CRLF to LF is wrong either way (LogEntry.raw is documented as the
-    unmodified line).
+    raw is the line without its terminator (design 2.6), so a CRLF line and an
+    LF line give the same raw; keeping a rewritten LF would be wrong.
     """
     line = threadtime("hello").rstrip("\n")
     path = _write(tmp_path, f"{line}\r\n".encode())
@@ -316,8 +308,7 @@ def _years(tmp_path: Path, stamps: list[tuple[str, str]], year: int) -> list[int
         for i, (date, time_) in enumerate(stamps)
     ).encode("utf-8")
     path = _write(tmp_path, data, name="years.log")
-    parser = ThreadTimeLogParser(default_year=year)
-    return [e.timestamp.year for e in read_file(path, parser=parser)]
+    return [e.timestamp.year for e in read_file(path, year=year)]
 
 
 def test_threadtime_new_year_rolls_the_year_forward(tmp_path: Path) -> None:
@@ -327,11 +318,6 @@ def test_threadtime_new_year_rolls_the_year_forward(tmp_path: Path) -> None:
     assert _years(tmp_path, stamps, 2024) == [2024, 2025]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="F6-1: every Dec->Jan flip adds a year; late Dec lines drift forward",
-)
 def test_threadtime_interleaved_new_year_does_not_drift(tmp_path: Path) -> None:
     """Interleaved 12-31 / 01-01 lines around New Year do not gain a year per flip."""
     stamps = [
@@ -344,13 +330,14 @@ def test_threadtime_interleaved_new_year_does_not_drift(tmp_path: Path) -> None:
     assert _years(tmp_path, stamps, 2024) == [2024, 2025, 2024, 2025]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="F6-1: year-rollover state persists on the parser across iterations",
-)
 def test_reader_iterated_twice_gives_same_timestamps(tmp_path: Path) -> None:
-    """Iterating the same LogFileReader twice yields the same timestamps both times."""
+    """Iterating the same LogFileReader twice yields the same timestamps both times.
+
+    The second file spans eight months in steps under half a year. A session
+    carried over from the first pass would place the second pass's Jan 1 next
+    to the Sep 1 it ended on, in 2025; a fresh session per iteration and per
+    read_file call keeps every pass in 2024 (F6-1).
+    """
     path = _write(
         tmp_path,
         (
@@ -358,7 +345,7 @@ def test_reader_iterated_twice_gives_same_timestamps(tmp_path: Path) -> None:
             + threadtime("new", date="01-01", time_="00:00:00.010")
         ).encode("utf-8"),
     )
-    reader = LogFileReader(path, parser=ThreadTimeLogParser(default_year=2024))
+    reader = LogFileReader(path, year=2024)
 
     first = [e.timestamp for e in reader]
     second = [e.timestamp for e in reader]
@@ -366,18 +353,26 @@ def test_reader_iterated_twice_gives_same_timestamps(tmp_path: Path) -> None:
     assert len(first) == 2
     assert second == first
 
+    span = _write(
+        tmp_path,
+        "".join(
+            threadtime(f"line {i}", date=date, time_="12:00:00.000")
+            for i, date in enumerate(("01-01", "05-01", "09-01"))
+        ).encode("utf-8"),
+        name="span.log",
+    )
+    span_reader = LogFileReader(span, year=2024)
+    passes = [[e.timestamp.year for e in span_reader] for _ in range(2)]
+    passes += [[e.timestamp.year for e in read_file(span, year=2024)] for _ in range(2)]
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="F6-2: Feb 29 in a non-leap default year falls back to a raw entry",
-)
+    assert passes == [[2024, 2024, 2024]] * 4
+
+
 def test_threadtime_feb29_in_non_leap_year_keeps_fields(tmp_path: Path) -> None:
-    """A 02-29 line with a non-leap default_year still yields its pid/level/tag.
+    """A 02-29 line read with a non-leap year= still yields its pid/level/tag.
 
-    The timestamp policy is an open decision (MASTER-e / S-parsers-models-3:
-    nearest leap year, or a flagged Feb 28 / Mar 1), so only a date taken from
-    the line itself is pinned, not the exact day or year.
+    Only a date taken from the line itself is pinned, not the exact day or
+    year (the resolver picks the nearest leap year: D-12).
     """
     path = _write(
         tmp_path,
@@ -386,7 +381,7 @@ def test_threadtime_feb29_in_non_leap_year_keeps_fields(tmp_path: Path) -> None:
         ).encode("utf-8"),
     )
 
-    (entry,) = read_file(path, parser=ThreadTimeLogParser(default_year=2025))
+    (entry,) = read_file(path, year=2025)
 
     assert (entry.pid, entry.tid, entry.level, entry.tag, entry.message) == (
         77,
@@ -422,12 +417,6 @@ _FORMAT_CASES = [
     ),
 ]
 
-_F6_3 = pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="F6-3: Brief/Process/Tag drop every field for an empty-message line",
-)
-
 _EMPTY_MESSAGE_CASES = [
     pytest.param(
         ThreadTimeLogParser,
@@ -440,21 +429,18 @@ _EMPTY_MESSAGE_CASES = [
         "E/MyTag   ( 1234): ",
         {"level": "E", "tag": "MyTag", "pid": 1234, "message": ""},
         id="brief",
-        marks=_F6_3,
     ),
     pytest.param(
         ProcessLogParser,
         "E( 1234) ",
         {"level": "E", "pid": 1234, "message": ""},
         id="process",
-        marks=_F6_3,
     ),
     pytest.param(
         TagLogParser,
         "E/MyTag   : ",
         {"level": "E", "tag": "MyTag", "message": ""},
         id="tag",
-        marks=_F6_3,
     ),
 ]
 
@@ -485,174 +471,71 @@ def test_format_parser_empty_message_keeps_fields(
     line: str,
     expected: dict[str, object],
 ) -> None:
-    """A line with an empty message still yields its level, tag and pid.
-
-    threadtime already does (finding A4); brief / process / tag do not (F6-3).
-    """
+    """A line with an empty message still yields its level, tag and pid (F6-3)."""
     entry = _parse_one(tmp_path, parser_cls(), line)
 
     assert {name: getattr(entry, name) for name in expected} == expected
 
 
-# -- LogEntry.json_payload ---------------------------------------------------------
+# -- LogEntry.json_payload() -------------------------------------------------------
 
 
 def test_json_payload_finds_embedded_object() -> None:
     """json_payload parses the JSON object embedded in a log message."""
     entry = _entry('state changed {"a": 1, "b": [true, null]} (done)')
 
-    assert entry.json_payload == {"a": 1, "b": [True, None]}
+    assert entry.json_payload() == {"a": 1, "b": [True, None]}
 
 
 def test_json_payload_is_none_without_json() -> None:
     """json_payload is None for a message that contains no JSON."""
-    assert _entry("no braces or brackets here").json_payload is None
+    assert _entry("no braces or brackets here").json_payload() is None
 
 
-# The F8-1 run happens on a thread with this C stack: on 3.14 the decoder's
-# nesting limit follows the stack size, so a fixed size keeps the limit (and the
-# defect's cost) independent of the runner's stack rlimit. 8 MiB matches Linux's
-# default main-thread stack (ulimit -s 8192), which the test used to run on.
-_DEEP_STACK_BYTES = 8 * 1024 * 1024
-_DEEP_MIN_DEPTH = 2**8
-_DEEP_MAX_DEPTH = 2**20
-_DEEP_CANDIDATES = 4096  # candidate starts extract_json tries (finding F8-1)
-_DEEP_RUN_TIMEOUT = 90.0
+# json_payload() on deep brackets (F8-1): the cost of one stdlib decode attempt
+# grows with the nesting depth it descends (on 3.14 also with the C stack), so
+# the work counter is the depth each attempt faces, not wall time.
+_DEEP_BRACKETS = 100_000
+_MAX_DEPTH_PER_ATTEMPT = 1024
 
 
-def _parse_recurses(text: str) -> bool:
-    """Does one stdlib JSON parse of ``text`` hit RecursionError?"""
-    try:
-        json.loads(text)
-    except RecursionError:
-        return True
-    except ValueError:
-        return False
-    return False
+def test_json_payload_on_deep_brackets_returns_quickly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """json_payload() on 100 000 nested '[' gives None without deep decoding.
 
-
-def _one_parse_seconds(text: str) -> float:
-    """Best-of-5 cost of one stdlib JSON parse of ``text``."""
-    best = float("inf")
-    for _ in range(5):
-        start = time.perf_counter()
-        _parse_recurses(text)
-        best = min(best, time.perf_counter() - start)
-    return best
-
-
-class _DeepBracketsRun(NamedTuple):
-    length: int
-    budget: float
-    elapsed: float
-    payload: object
-
-
-def _deep_brackets_run() -> _DeepBracketsRun | None:
-    """Time json_payload on '[' nested past this thread's decoder limit.
-
-    The depth is the first power of two from ``_DEEP_MIN_DEPTH`` whose parse
-    hits RecursionError, plus ``_DEEP_CANDIDATES`` levels, so every candidate
-    start the scanner tries still has that many levels ahead and recurses too.
-    None when nothing up to ``_DEEP_MAX_DEPTH`` levels recurses.
+    The message is all '[', so a decode attempt at offset ``i`` of a text
+    made of it descends at most ``len(text) - i`` levels, the text being the
+    message or the part of it the scanner hands the decoder. The 2.0.0 scanner
+    started up to 4096 attempts at nearly full depth; a bounded scan hands the
+    decoder no attempt deeper than ``_MAX_DEPTH_PER_ATTEMPT``. Counting depth
+    instead of time keeps the check exact on every Python version and stack
+    size.
     """
-    depth = _DEEP_MIN_DEPTH
-    while depth <= _DEEP_MAX_DEPTH and not _parse_recurses("[" * depth):
-        depth *= 2
-    if depth > _DEEP_MAX_DEPTH:
-        return None
-    message = "[" * (depth + _DEEP_CANDIDATES)
-    budget = min(1.0, 50 * _one_parse_seconds(message) + 0.02)
+    message = "[" * _DEEP_BRACKETS
+    depths: list[int] = []
+    decode = json.JSONDecoder.raw_decode
 
-    payload: object = "not computed"
-    elapsed = float("inf")
-    for _ in range(3):  # re-measure only a near miss (scheduler noise)
-        entry = _entry(message)
-        start = time.perf_counter()
-        payload = entry.json_payload
-        elapsed = time.perf_counter() - start
-        if elapsed <= budget or elapsed > 5 * budget:
-            break
-    return _DeepBracketsRun(len(message), budget, elapsed, payload)
+    def counted(self: json.JSONDecoder, s: str, idx: int = 0) -> tuple[Any, int]:
+        depths.append(len(s) - idx)
+        return decode(self, s, idx)
 
+    monkeypatch.setattr(json.JSONDecoder, "raw_decode", counted)
 
-def _call_with_stack[T](
-    fn: Callable[[], T], *, what: str, stack_bytes: int, timeout: float
-) -> T:
-    """Return ``fn()`` run on a new thread with a ``stack_bytes`` stack.
+    payload = _entry(message).json_payload()
 
-    The join is bounded by ``timeout``; an exception from ``fn`` is re-raised.
-    """
-    results: list[T] = []
-    errors: list[BaseException] = []
-
-    def target() -> None:
-        try:
-            results.append(fn())
-        except BaseException as exc:  # noqa: BLE001  (re-raised by the caller)
-            errors.append(exc)
-
-    previous = threading.stack_size(stack_bytes)
-    try:
-        worker = threading.Thread(target=target, name=what, daemon=True)
-        worker.start()
-    finally:
-        threading.stack_size(previous)
-    worker.join(timeout)
-    if worker.is_alive():
-        pytest.fail(f"{what} still running after {timeout:.0f}s")
-    if errors:
-        raise errors[0]
-    return results[0]
-
-
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="F8-1: extract_json re-parses deep nesting up to 4096 times",
-)
-def test_json_payload_on_deep_brackets_returns_quickly() -> None:
-    """json_payload on '[' nested past the decoder's limit returns None quickly.
-
-    The budget is "within 1 s and within ~50 single parse attempts of the same
-    text (+20 ms)". The relative part keeps the check meaningful on every
-    Python version: the C decoder's nesting limit, hence the cost of one
-    attempt, differs a lot between 3.12, 3.13 and 3.14 (on 3.12/3.13 the bug
-    costs well under 1 s but still ~4096 attempts).
-
-    The depth is probed, not fixed. On 3.14 the limit follows the C stack, not
-    sys.getrecursionlimit(): a fixed 65536 decoded without RecursionError on
-    the ubuntu py3.14 CI cell, which never reaches the slow path, and with an
-    unlimited stack no depth recurses at all. So the run uses a thread with a
-    fixed stack (``_DEEP_STACK_BYTES``) and a depth that recurses there.
-    """
-    run = _call_with_stack(
-        _deep_brackets_run,
-        what="deep-brackets json_payload run",
-        stack_bytes=_DEEP_STACK_BYTES,
-        timeout=_DEEP_RUN_TIMEOUT,
-    )
-    if run is None:
-        pytest.skip(f"no RecursionError up to {_DEEP_MAX_DEPTH} nested '[' here")
-
-    assert run.payload is None
-    assert run.elapsed <= run.budget, (
-        f"json_payload on {run.length} nested '[' took {run.elapsed:.3f}s"
-        f" (budget {run.budget:.3f}s)"
+    assert payload is None
+    assert max(depths, default=0) <= _MAX_DEPTH_PER_ATTEMPT, (
+        f"{len(depths)} decode attempts, the deepest {max(depths)} levels"
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ValueError,
-    reason="F8-2: a >4300-digit integer raises ValueError out of json_payload",
-)
 def test_json_payload_with_huge_integer_does_not_raise() -> None:
-    """A message holding a 5000-digit integer does not make json_payload raise."""
+    """A message with a 5000-digit integer does not make json_payload() raise (F8-2)."""
     previous = sys.get_int_max_str_digits()
     sys.set_int_max_str_digits(4300)  # CPython's default limit, made explicit
     try:
-        payload = _entry("count=[" + "1" * 5000 + "]").json_payload
+        payload = _entry("count=[" + "1" * 5000 + "]").json_payload()
     finally:
         sys.set_int_max_str_digits(previous)
 
@@ -666,21 +549,15 @@ def test_json_payload_with_huge_integer_does_not_raise() -> None:
         pytest.param('[1, 2 {"k": 1}', {"k": 1}, id="missing-delimiter"),
     ],
 )
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="F8-3: the scan resumes at exc.pos + 1, past a candidate at exc.pos",
-)
 def test_json_payload_finds_object_inside_failed_candidate(
     message: str, expected: dict[str, int]
 ) -> None:
-    """json_payload finds a complete object where the outer candidate failed.
+    """json_payload() finds a complete object where the outer candidate failed.
 
-    The decoder stops the outer candidate at the nested '{' (``exc.pos``) and
-    the scan resumes one character later, skipping it. Resuming at
-    ``max(start + 1, exc.pos)`` (N-utils-io-package-4) recovers both cases.
+    The decoder stops the outer candidate at the nested '{' (``exc.pos``); the
+    scan resumes there, at ``max(start + 1, exc.pos)`` (F8-3), not one past it.
     """
-    assert _entry(message).json_payload == expected
+    assert _entry(message).json_payload() == expected
 
 
 @pytest.mark.parametrize(
@@ -699,7 +576,7 @@ def test_json_payload_is_none_for_truncated_outer_container(message: str) -> Non
     (its F8-3 fix still gives None here) and plans to document it; it is not
     part of F8-3.
     """
-    assert _entry(message).json_payload is None
+    assert _entry(message).json_payload() is None
 
 
 # -- export_logs -------------------------------------------------------------------

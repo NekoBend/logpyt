@@ -1,8 +1,11 @@
 """Tests for LogFileReader and read_file."""
 
 import logging
-from datetime import UTC, datetime
+import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -11,6 +14,9 @@ from logpyt.filters import Filter
 from logpyt.models import LogEntry
 from logpyt.parsers.logcat import ThreadTimeLogParser
 from logpyt.readers import LogFileReader, read_file
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
 
 
 @pytest.fixture
@@ -41,8 +47,8 @@ def test_log_file_reader_basic_reading(sample_log_file: Path) -> None:
     entries = list(reader)
 
     # Assert
-    # We expect 3 entries because ThreadTimeLogParser falls back to basic parsing
-    # for lines that don't match the regex.
+    # We expect 3 entries: a line the parser does not recognise is yielded as
+    # an unparsed entry holding the whole line.
     assert len(entries) == 3
 
     # Verify first entry (Valid ThreadTime)
@@ -54,6 +60,9 @@ def test_log_file_reader_basic_reading(sample_log_file: Path) -> None:
     assert entries[1].message == "Invalid Line That Does Not Match Regex"
     assert entries[1].level == "I"  # Default for stdout
     assert entries[1].tag == ""
+    assert not entries[1].parsed
+    assert entries[0].parsed
+    assert entries[2].parsed
 
     # Verify third entry (Valid ThreadTime)
     assert entries[2].tag == "TagB"
@@ -87,7 +96,8 @@ def test_log_file_reader_error_handling(tmp_path: Path) -> None:
     # Create a mock parser that raises an exception for the second line
     mock_parser = MagicMock()
 
-    def side_effect(line: str) -> LogEntry:
+    def side_effect(line: str, ctx: object) -> LogEntry:
+        del ctx
         if "Line 2" in line:
             raise ValueError("Parsing failed")
         # Return a dummy entry for other lines
@@ -101,7 +111,7 @@ def test_log_file_reader_error_handling(tmp_path: Path) -> None:
             raw=line,
         )
 
-    mock_parser.parse_stdout.side_effect = side_effect
+    mock_parser.parse.side_effect = side_effect
 
     reader = LogFileReader(log_file, parser=mock_parser)
 
@@ -146,7 +156,7 @@ def test_log_file_reader_parse_error_logging_throttled(
     log_file.write_text("bad1\nbad2\nbad3\nbad4\nbad5\n", encoding="utf-8")
 
     mock_parser = MagicMock()
-    mock_parser.parse_stdout.side_effect = ValueError("Parsing failed")
+    mock_parser.parse.side_effect = ValueError("Parsing failed")
 
     # Keep monotonic time fixed so all errors fall into the same interval.
     monkeypatch.setattr("logpyt.readers.time.monotonic", lambda: 123.0)
@@ -180,7 +190,7 @@ def test_log_file_reader_parse_error_logging_sanitizes_and_caps_preview(
     log_file.write_text(long_line, encoding="utf-8")
 
     mock_parser = MagicMock()
-    mock_parser.parse_stdout.side_effect = ValueError("boom")
+    mock_parser.parse.side_effect = ValueError("boom")
 
     reader = LogFileReader(
         log_file,
@@ -200,3 +210,155 @@ def test_log_file_reader_parse_error_logging_sanitizes_and_caps_preview(
     assert "\x00" not in message
     assert "\x1b" not in message
     assert len(message) <= 240
+
+
+def _write_lines(path: Path, *lines: str) -> Path:
+    path.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
+    return path
+
+
+def test_format_mismatch_warns_once(tmp_path: Path, caplog) -> None:
+    """Lines in another format give one WARNING per read, with their count (F6-5).
+
+    logcat's buffer dividers are not counted; the lines are still yielded, as
+    unparsed entries.
+    """
+    log_file = _write_lines(
+        tmp_path / "brief.log",
+        "--------- beginning of main",
+        "D/Tag( 1234): one",
+        "D/Tag( 1234): two",
+        "11-19 12:34:56.789  1000  2000 D TagA   : threadtime",
+        "D/Tag( 1234): three",
+    )
+    reader = LogFileReader(log_file, year=2026)
+
+    with caplog.at_level(logging.WARNING, logger="logpyt.readers"):
+        entries = list(reader)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    assert [e.parsed for e in entries] == [False, False, False, True, False]
+    assert [e.message for e in entries][:2] == [
+        "--------- beginning of main",
+        "D/Tag( 1234): one",
+    ]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert message.startswith("3 of 5 lines in ")
+    assert "'threadtime'" in message
+    assert "ThreadTimeLogParser" in message
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="logpyt.readers"):
+        list(reader)
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+
+def test_matching_file_and_dividers_do_not_warn(tmp_path: Path, caplog) -> None:
+    """A file in the parser's format, dividers included, logs no warning."""
+    log_file = _write_lines(
+        tmp_path / "ok.log",
+        "--------- beginning of main",
+        "11-19 12:34:56.789  1000  2000 D TagA   : a",
+        "--------- switch to crash",
+        "11-19 12:34:57.000  1000  2000 E TagB   : b",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="logpyt.readers"):
+        entries = list(read_file(log_file, year=2026))
+
+    assert [e.parsed for e in entries] == [False, True, False, True]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_mismatch_warning_is_logged_when_the_read_stops_early(
+    tmp_path: Path, caplog
+) -> None:
+    """Closing the reader early still reports the lines read so far."""
+    log_file = _write_lines(tmp_path / "raw.log", "not a log line", "neither")
+
+    with caplog.at_level(logging.WARNING, logger="logpyt.readers"):
+        entries = cast("Generator[LogEntry]", read_file(log_file))
+        next(entries)
+        entries.close()
+
+    (warning,) = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warning.getMessage().startswith("1 of 1 lines in ")
+
+
+def _set_mtime(path: Path, moment: datetime) -> None:
+    os.utime(path, (moment.timestamp(), moment.timestamp()))
+
+
+def test_yearless_lines_are_dated_before_the_file_mtime(tmp_path: Path) -> None:
+    """Without year=, the first yearless line is placed before the file's mtime.
+
+    A capture across New Year saved on Jan 2 starts in the old year; a March
+    capture copied in November (a later mtime) stays in that year's March,
+    although the next March would be nearer to the mtime.
+    """
+    new_year = _write_lines(
+        tmp_path / "new_year.log",
+        "12-30 08:00:00.000  1000  2000 D T: a",
+        "12-31 23:59:59.000  1000  2000 D T: b",
+        "01-01 00:00:01.000  1000  2000 D T: c",
+    )
+    _set_mtime(new_year, datetime(2027, 1, 2, 12, 0, tzinfo=UTC))
+    spring = _write_lines(
+        tmp_path / "spring.log",
+        "03-15 10:00:00.000  1000  2000 D T: a",
+        "03-15 10:00:01.000  1000  2000 D T: b",
+    )
+    _set_mtime(spring, datetime(2026, 11, 4, 12, 0, tzinfo=UTC))
+
+    assert [e.timestamp.year for e in read_file(new_year)] == [2026, 2026, 2027]
+    assert [e.timestamp.year for e in read_file(spring)] == [2026, 2026]
+
+
+def test_year_argument_dates_the_first_yearless_line(tmp_path: Path) -> None:
+    """year= gives the first yearless line its year, whatever the mtime."""
+    log_file = _write_lines(
+        tmp_path / "y.log",
+        "12-31 23:59:59.000  1000  2000 D T: a",
+        "01-01 00:00:01.000  1000  2000 D T: b",
+    )
+
+    assert [e.timestamp.year for e in read_file(log_file, year=2019)] == [2019, 2020]
+
+
+@pytest.mark.parametrize("year", [0, 10_000])
+def test_year_out_of_range_is_rejected(tmp_path: Path, year: int) -> None:
+    """A year outside 1..9999 raises ValueError when the reader is created."""
+    with pytest.raises(ValueError, match="year"):
+        LogFileReader(tmp_path / "x.log", year=year)
+
+
+@pytest.mark.parametrize(
+    "mtime",
+    [
+        pytest.param(253_402_300_800.0, id="year-10000"),
+        pytest.param(1e20, id="past-time_t"),
+        pytest.param(-1e20, id="before-time_t"),
+    ],
+)
+def test_mtime_without_a_datetime_does_not_fail_the_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mtime: float
+) -> None:
+    """An mtime outside what datetime holds is no error, with or without year=.
+
+    With year= the mtime is not used at all; without it the first yearless
+    line is placed before the host clock instead. The mtime is patched in,
+    because a file system may refuse to store such a value.
+    """
+    log_file = _write_lines(tmp_path / "far.log", "12-31 23:59:59.000  1  1 D T: a")
+    monkeypatch.setattr(os, "fstat", lambda fd: SimpleNamespace(st_mtime=mtime))
+
+    with_year = list(read_file(log_file, year=2024))
+    without = list(read_file(log_file))
+
+    assert [e.timestamp.year for e in with_year] == [2024]
+    assert len(without) == 1
+    assert without[0].parsed
+    assert without[0].timestamp <= datetime.now(UTC).astimezone().replace(
+        tzinfo=None
+    ) + timedelta(days=2)

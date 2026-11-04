@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from logpyt.models import LogEntry
+    from logpyt.parsers import ParseContext
     from logpyt.streams import StreamHandle
 
 # Upper bound for every wait, join and lifecycle call. A healthy run finishes
@@ -85,9 +86,9 @@ class _Collector:
 class _SlowParser(ThreadTimeLogParser):
     """A user parser that spends ~2 ms per stdout line, like a heavy custom one."""
 
-    def parse_stdout(self, line: str) -> LogEntry:
+    def parse(self, line: str, ctx: ParseContext, /) -> LogEntry | None:
         time.sleep(0.002)
-        return super().parse_stdout(line)
+        return super().parse(line, ctx)
 
 
 class _Call[T]:

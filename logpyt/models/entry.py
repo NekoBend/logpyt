@@ -1,97 +1,115 @@
-"""Data models for log entries."""
+"""The log record."""
 
 from __future__ import annotations
 
 import json
 from datetime import datetime
-from functools import cached_property
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..utils import extract_json
+from .._json import extract_json
 
-# Type definitions
+__all__ = ["LogEntry", "LogLevel"]
+
 LogLevel = Literal["V", "D", "I", "W", "E", "F"]
 
 
 class LogEntry(BaseModel):
-    """A structured log entry representing a single line of log output.
+    """One log line, split into its fields.
 
-    This class encapsulates all standard fields found in common log
-    formats (like Android's logcat), along with the raw log line and
-    any additional metadata.
+    Entries are immutable, and the constructor validates strictly: a field
+    must be given as its own type (an ``int`` pid, a ``datetime`` timestamp);
+    nothing is coerced. Entries are not hashable (``meta`` is a dict), as in
+    2.x: ``hash()`` raises TypeError.
+
+    The API of an entry is its fields plus :meth:`json_payload`,
+    :meth:`to_dict` and :meth:`to_json`. That it is a pydantic model, and the
+    ``model_*`` methods, are not guaranteed within 3.x (design 2.6). In
+    particular pydantic's ``model_copy(update=...)`` and ``copy.replace()`` do
+    not validate the fields they change.
 
     Attributes:
-        timestamp: The datetime object representing when the log entry was created.
-        pid: Process ID (integer) that generated the log.
-        tid: Thread ID (integer) that generated the log.
-        level: Log severity level. Must be one of:
-            - "V": Verbose
-            - "D": Debug
-            - "I": Info
-            - "W": Warning
-            - "E": Error
-            - "F": Fatal
-        tag: A short string tag identifying the component or
-            category (e.g., "ActivityManager").
-        message: The main content of the log message.
-        raw: The original, unmodified raw string of the log line.
-        meta: A dictionary for additional metadata (e.g., source stream, package name).
-            Defaults to an empty dict. A dict passed in is stored by reference
-            (not deep-copied); pass a fresh dict per entry if you mutate it later.
+        timestamp: When the line was logged. Timezone-aware when the line
+            carries its UTC offset (``-v zone``) or epoch seconds (``-v epoch``,
+            in UTC); naive device-local time otherwise, such as yearless
+            ``-v threadtime`` files. Lines without any timestamp (brief,
+            process, tag, raw, and unrecognised lines) carry the naive host
+            time at parsing. ``-v monotonic`` prints seconds since boot in the
+            epoch column, so such a line gets that many seconds after the
+            epoch: a 1970 timestamp that is not the moment it was logged.
+        pid: Process id; 0 when the format has none.
+        tid: Thread id; 0 when the format has none.
+        uid: The uid from the ``-v uid`` column, a name mapped to its number
+            (design 5.8); None when the column is absent, blank or a name that
+            logpyt does not know.
+        uid_raw: The ``-v uid`` column as printed (a number or a name); None
+            when absent or blank.
+        level: Priority: V, D, I, W, E or F.
+        tag: The tag, without logcat's padding; empty when the format has none.
+        message: The message. Only the separator after the tag is removed;
+            leading whitespace (``"\\tat ..."``) and trailing spaces stay.
+        raw: The line as read, without its terminator.
+        package: The app package the line belongs to, set by package
+            attribution; None when not attributed.
+        parsed: False for the fallback entry of a line the parser did not
+            recognise: its message and raw are the whole line.
+        truncated: True when the line exceeded the reader's line cap and was cut.
+        meta: Free-form data for the caller; empty unless the caller sets it.
+            A dict passed in is stored as is, not copied.
 
     """
 
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    # frozen=True would make pydantic hash every field, and meta (a dict)
+    # cannot be hashed; say so to type checkers too.
+    __hash__: None = None
 
     timestamp: datetime
     pid: int
     tid: int
+    uid: int | None = None
+    uid_raw: str | None = None
     level: LogLevel
     tag: str
     message: str
     raw: str
+    package: str | None = None
+    parsed: bool = True
+    truncated: bool = False
     meta: dict[str, Any] = Field(default_factory=dict)
 
-    def to_dict(self) -> dict[str, Any]:
-        """Convert the log entry to a dictionary.
-
-        Returns:
-            A dictionary representation of the log entry.
-
-        """
-        return self.model_dump()
-
-    def to_json(
-        self,
-        ensure_ascii: bool = False,  # noqa: FBT001, FBT002  (existing public signature)
-        indent: int | None = None,
-    ) -> str:
-        """Convert the log entry to a JSON string.
-
-        Args:
-            ensure_ascii: If True, non-ASCII characters are escaped as ``\\uXXXX``
-                sequences. If False (default), they are kept literally.
-            indent: If specified, formats the JSON with the given indentation.
-
-        Returns:
-            A JSON string representation of the log entry.
-
-        """
-        return json.dumps(
-            self.model_dump(mode="json"),
-            ensure_ascii=ensure_ascii,
-            indent=indent,
-        )
-
-    @cached_property
     def json_payload(self) -> Any | None:  # noqa: ANN401  (arbitrary parsed JSON)
-        """Extract JSON payload from the log message.
+        """Return the first JSON object or array in the message.
+
+        The search is bounded (see ``logpyt.utils.extract_json``) and is not
+        cached: every call reads the current message.
 
         Returns:
-            The parsed JSON object/array if found in the message,
-            otherwise None.
+            The parsed object or array, or None when the message holds none.
 
         """
         return extract_json(self.message)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the fields as a dict of Python values."""
+        return self.model_dump()
+
+    def to_json(self, *, indent: int | None = None, ensure_ascii: bool = False) -> str:
+        """Return the fields as a JSON object.
+
+        Args:
+            indent: Indentation of the JSON text; None for one line.
+            ensure_ascii: Escape non-ASCII characters as ``\\uXXXX`` when True.
+
+        Returns:
+            The JSON text. A ``meta`` value JSON cannot represent is written as
+            its ``repr()``.
+
+        """
+        return json.dumps(
+            self.model_dump(mode="json", fallback=repr),
+            ensure_ascii=ensure_ascii,
+            indent=indent,
+        )

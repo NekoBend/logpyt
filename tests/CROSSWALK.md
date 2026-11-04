@@ -38,6 +38,9 @@ Rules:
 
 | old test id | replacement test id or reason |
 |---|---|
+| tests/test_parsers.py::test_log_parser_parse_common_override | tests/test_parsers.py::test_custom_parser_implements_the_protocol |
+| tests/test_parsers.py::test_log_parser_parse_stderr | API removed by decision D-9 |
+| tests/test_parsers.py::test_log_parser_parse_stdout | tests/test_parsers.py::test_unrecognised_line_becomes_unparsed_entry |
 | tests/test_utils.py::test_adb_connect_already_connected | tests/test_adb.py::test_adb_connect_succeeds |
 | tests/test_utils.py::test_adb_connect_failure | tests/test_adb.py::test_adb_connect_failure_raises_adb_error |
 | tests/test_utils.py::test_adb_connect_success | tests/test_adb.py::test_adb_connect_succeeds |

@@ -18,7 +18,7 @@ answer has been applied (the library polls one lookup at a time), so a
 effect; the fake logcat waits on it before logging lines that must already
 resolve. To know what the stream has read, a test watches a
 ``ThreadTimeLogParser`` subclass passed through the public ``parser`` argument
-(``LogParser`` documents overriding ``parse_stdout``). Lines are parsed,
+(the ``LogParser`` protocol's ``parse``). Lines are parsed,
 filtered and queued in order, so once a sentinel line is parsed every earlier
 line has been through the package filter. That sentinel gates the next step:
 a held pidof answer is released only after the stream parsed the startup
@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from logpyt.models import LogEntry
+    from logpyt.parsers import ParseContext
     from logpyt.streams import AsyncStreamHandle, StreamHandle
     from tests.conftest import Step
 
@@ -189,9 +190,9 @@ class _ParseWatcher(ThreadTimeLogParser):
         self.message = message
         self.parsed = threading.Event()
 
-    def parse_stdout(self, line: str) -> LogEntry:
-        entry = super().parse_stdout(line)
-        if entry.message == self.message:
+    def parse(self, line: str, ctx: ParseContext, /) -> LogEntry | None:
+        entry = super().parse(line, ctx)
+        if entry is not None and entry.message == self.message:
             self.parsed.set()
         return entry
 
@@ -204,8 +205,8 @@ class _Recorded:
         return [entry.message for entry in list(self.entries)]
 
     def delivered(self) -> list[tuple[str, object]]:
-        """``(message, meta["package"])`` of every entry received so far."""
-        return [(e.message, e.meta.get("package")) for e in list(self.entries)]
+        """``(message, package)`` of every entry received so far."""
+        return [(e.message, e.package) for e in list(self.entries)]
 
 
 class _Collector(_Recorded):
@@ -597,7 +598,7 @@ def _runs_one_plain_command(words: list[str], package: str) -> bool:
 
 def test_filter_package_delivers_only_that_packages_lines(fake_adb: FakeAdb) -> None:
     """Filter(package=...) delivers exactly the lines whose pid belongs to the package,
-    each with meta["package"] set to it.
+    each with its package set to it.
     """
     _resolve_steadily(fake_adb)
     fake_adb.logcat(
@@ -629,7 +630,7 @@ def test_advanced_filter_package_condition_delivers_that_packages_lines(
     fake_adb: FakeAdb,
 ) -> None:
     """AdvancedFilter(Package(...)) delivers exactly the package's lines, each with
-    meta["package"] set, like Filter(package=...) does (F5-1).
+    package set, like Filter(package=...) does (F5-1).
     """
     _resolve_steadily(fake_adb)
     _logcat_until_parsed(
@@ -856,7 +857,7 @@ async def test_async_filter_package_delivers_only_that_packages_lines(
     fake_adb: FakeAdb,
 ) -> None:
     """AsyncLogStream with Filter(package=...) delivers exactly the lines whose pid
-    belongs to the package, each with meta["package"] set to it.
+    belongs to the package, each with its package set to it.
     """
     _resolve_steadily(fake_adb)
     fake_adb.logcat(
@@ -889,7 +890,7 @@ async def test_async_advanced_filter_package_condition_delivers_that_packages_li
     fake_adb: FakeAdb,
 ) -> None:
     """AsyncLogStream with AdvancedFilter(Package(...)) delivers exactly the package's
-    lines, each with meta["package"] set, like Filter(package=...) does (F5-1).
+    lines, each with its package set, like Filter(package=...) does (F5-1).
     """
     _resolve_steadily(fake_adb)
     _logcat_until_parsed(

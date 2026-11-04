@@ -7,10 +7,11 @@ configured no logging sees none of logpyt's records; `enable_debug` shows them.
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
-from typing import Any
+
+# Public as logpyt.utils.extract_json; bounded work (F8-1..F8-3).
+from ._json import extract_json as extract_json
 
 __all__ = ["enable_debug", "extract_json"]
 
@@ -26,10 +27,6 @@ _debug_lock = threading.Lock()
 _logpyt_logger = logging.getLogger(_LOGGER_NAME)
 if not any(isinstance(h, logging.NullHandler) for h in _logpyt_logger.handlers):
     _logpyt_logger.addHandler(logging.NullHandler())
-
-# Safeguards for pathological extract_json inputs.
-_EXTRACT_JSON_MAX_SCAN_CHARS = 1_000_000
-_EXTRACT_JSON_MAX_CANDIDATES = 4_096
 
 
 def enable_debug(level: str | int = "DEBUG") -> None:
@@ -87,60 +84,3 @@ def _level_number(level: str | int) -> int:
         )
         raise ValueError(msg)
     return number
-
-
-def extract_json(text: str) -> Any | None:  # noqa: ANN401
-    """Extract and parse the first valid JSON object or array found in the text.
-
-    Args:
-        text: The text to search.
-
-    Returns:
-        The parsed JSON object (dict or list) if found, otherwise None.
-
-    Notes:
-        Scanning is bounded to protect against worst-case inputs with huge numbers
-        of JSON-like delimiters that repeatedly fail to parse.
-
-    """
-    if not text:
-        return None
-
-    decoder = json.JSONDecoder()
-    idx = 0
-    attempts = 0
-    scan_limit = min(len(text), _EXTRACT_JSON_MAX_SCAN_CHARS)
-
-    while idx < scan_limit and attempts < _EXTRACT_JSON_MAX_CANDIDATES:
-        # Find next potential start
-        next_brace = text.find("{", idx, scan_limit)
-        next_bracket = text.find("[", idx, scan_limit)
-
-        if next_brace == -1 and next_bracket == -1:
-            return None
-
-        if next_brace == -1:
-            start = next_bracket
-        elif next_bracket == -1:
-            start = next_brace
-        else:
-            start = min(next_brace, next_bracket)
-
-        try:
-            obj, _ = decoder.raw_decode(text, idx=start)
-            return obj
-        except json.JSONDecodeError as exc:
-            # Failed to parse from this position.
-            # Heuristic: if decoder reports a later error position, skip there
-            # to reduce repeated scans over known-invalid spans.
-            attempts += 1
-            next_idx = max(start + 1, exc.pos + 1)
-            idx = min(next_idx, scan_limit)
-        except RecursionError:
-            # Pathologically nested brackets (untrusted device output) exceed the
-            # decoder's recursion limit; skip this candidate rather than letting
-            # the error escape into a caller of LogEntry.json_payload.
-            attempts += 1
-            idx = min(start + 1, scan_limit)
-
-    return None
