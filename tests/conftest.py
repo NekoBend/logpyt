@@ -83,15 +83,12 @@ _FAKE_PYTHON = getattr(sys, "_base_executable", "") or sys.executable
 # a subclass of the real Popen, not of the fixture's rewriting subclass.
 _REAL_POPEN = subprocess.Popen
 
-# The tests construct streams without ``adb_path`` on purpose, so the default
-# resolution path stays covered; every module that binds ``resolve_adb`` by
-# name is patched. The 3.0.0 rewrite moves resolve_adb to logpyt.adb as the
-# single target (.docs/design-3.0.0.md, PR-08): update this list then.
-RESOLVE_ADB_TARGETS = (
-    "logpyt.utils.resolve_adb",
-    "logpyt.streams.sync.resolve_adb",
-    "logpyt.streams.async_stream.resolve_adb",
-)
+# The tests construct streams and call the adb helpers without ``adb_path`` on
+# purpose, so the default resolution path stays covered. Library code calls
+# ``logpyt.adb.resolve_adb`` through the module, never by a name bound at import,
+# so this is the single patch target (.docs/design-3.0.0.md, PR-08);
+# tests/test_adb.py proves it with an empty PATH.
+RESOLVE_ADB_TARGETS = ("logpyt.adb.resolve_adb",)
 
 WATCHDOG_DEFAULT_LIMIT = 120.0
 WATCHDOG_ENV = "LOGPYT_TEST_WATCHDOG"

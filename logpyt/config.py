@@ -30,10 +30,9 @@ from pydantic import (
     model_validator,
 )
 
-__all__ = ["Reconnect", "StreamConfig"]
+from logpyt.adb import _MARKER_TAG
 
-# Tag of the start and flush markers logpyt writes to the device log (section 5.6).
-_MARKER_TAG = "logpyt"
+__all__ = ["Reconnect", "StreamConfig"]
 
 # Buffer names Android 7.0 logcat accepts for one -b (n-logcat.cpp:316-319,
 # 767-860): one name per -b, no comma lists; "default" and "all" expand.

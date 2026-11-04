@@ -20,7 +20,7 @@ async def wait_for_state(stream, state):
 
 @pytest.fixture
 def mock_resolve_adb():
-    with patch("logpyt.streams.async_stream.resolve_adb", return_value="adb") as mock:
+    with patch("logpyt.adb.resolve_adb", return_value="adb") as mock:
         yield mock
 
 

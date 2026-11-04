@@ -1,403 +1,92 @@
-"""Utility functions for logpyt.
+"""Helpers outside the streams: debug logging and JSON extraction.
 
-This module provides utilities for ADB interaction and logging configuration.
+The adb helpers live in `logpyt.adb` since 3.0.0. Importing logpyt installs a
+`logging.NullHandler` on the ``logpyt`` logger, so an application that
+configured no logging sees none of logpyt's records; `enable_debug` shows them.
 """
 
 from __future__ import annotations
 
-import asyncio
-import functools
 import json
 import logging
-import os
-import re
-import shutil
-import subprocess
-import sys
-from pathlib import Path
-from typing import Any, Literal, TypedDict
+import threading
+from typing import Any
 
-# On Windows, spawning a child from a GUI / pythonw / frozen app pops a transient
-# console window; CREATE_NO_WINDOW suppresses it. The flag does not exist on
-# POSIX, where 0 is the Popen default (a harmless no-op).
-_CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+__all__ = ["enable_debug", "extract_json"]
 
+_LOGGER_NAME = "logpyt"
+# The name enable_debug gives its handler, so a second call finds it.
+_DEBUG_HANDLER_NAME = "logpyt.enable_debug"
+_DEBUG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+_debug_lock = threading.Lock()
 
-# Type definitions
-class DeviceInfo(TypedDict, total=False):
-    """Device information structure."""
-
-    id: str
-    state: str
-    type: str  # 'emulator' or 'usb'
-    product: str
-    model: str
-    device: str
-    transport_id: str
-
-
-DeviceType = Literal["usb", "emulator", "device"]
+# A library leaves logging configuration to the application: without a handler
+# of its own, logpyt's WARNING records would reach logging.lastResort and print
+# to stderr in an application that configured nothing.
+_logpyt_logger = logging.getLogger(_LOGGER_NAME)
+if not any(isinstance(h, logging.NullHandler) for h in _logpyt_logger.handlers):
+    _logpyt_logger.addHandler(logging.NullHandler())
 
 # Safeguards for pathological extract_json inputs.
 _EXTRACT_JSON_MAX_SCAN_CHARS = 1_000_000
 _EXTRACT_JSON_MAX_CANDIDATES = 4_096
 
 
-@functools.lru_cache(maxsize=1)
-def resolve_adb() -> str:
-    """Resolve the path to the ADB executable.
+def enable_debug(level: str | int = "DEBUG") -> None:
+    """Show logpyt's log records on stderr, from ``level`` up.
 
-    Searches for 'adb' or 'adb.exe' in the following order:
-    1. PATH environment variable
-    2. ANDROID_HOME/platform-tools
-    3. ANDROID_SDK_ROOT/platform-tools
-
-    On WSL, 'adb.exe' is also searched to support Windows ADB server connection.
-
-    Returns:
-        Path to the ADB executable.
-
-    Raises:
-        FileNotFoundError: If ADB executable cannot be found.
-
-    """
-    # Candidates to search for
-    candidates = ["adb"]
-
-    is_wsl = False
-    if sys.platform == "linux":
-        try:
-            if "microsoft" in Path("/proc/version").read_text(encoding="utf-8").lower():
-                is_wsl = True
-        except OSError:
-            pass
-
-    if sys.platform == "win32" or is_wsl:
-        # Windows or WSL
-        candidates.append("adb.exe")
-
-    # 1. Search in PATH
-    for candidate in candidates:
-        path = shutil.which(candidate)
-        if path and Path(path).is_file() and os.access(path, os.X_OK):
-            return path
-
-    # 2. Search in Environment Variables
-    env_vars = ["ANDROID_HOME", "ANDROID_SDK_ROOT"]
-    for var in env_vars:
-        root = os.environ.get(var)
-        if root:
-            for candidate in candidates:
-                candidate_path = Path(root) / "platform-tools" / candidate
-                if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
-                    return str(candidate_path)
-
-    msg = "Could not find 'adb' or 'adb.exe' in PATH or Android SDK directories."
-    raise FileNotFoundError(msg)
-
-
-def list_devices(  # noqa: PLR0912
-    device_type: DeviceType | None = None,
-    timeout: float = 10.0,
-) -> list[DeviceInfo]:
-    """List connected ADB devices.
+    Sets the level of the ``logpyt`` logger and adds one stderr handler the
+    first time; a later call only changes the level. The root logger is left
+    alone, and records still propagate to it, so a handler the application put
+    there shows them as well.
 
     Args:
-        device_type: Optional filter for device type.
-            - 'usb': Physical devices (not starting with 'emulator-')
-            - 'emulator': Emulators (starting with 'emulator-')
-            - 'device': Devices in 'device' state (ready)
-        timeout: Timeout in seconds for the ADB command. Defaults to 10.0.
-
-    Returns:
-        List of device information dictionaries.
+        level: A level name in any case (``"debug"``, ``"Warning"``) or a level
+            number (``logging.DEBUG``). The default shows logpyt's DEBUG
+            diagnostics too (F9-5).
 
     Raises:
-        RuntimeError: If ADB command fails.
-        TimeoutError: If ADB command times out.
-
+        ValueError: ``level`` is no level name, or a negative number.
+        TypeError: ``level`` is neither a str nor an int.
     """
-    adb_path = resolve_adb()
+    number = _level_number(level)
+    logger = logging.getLogger(_LOGGER_NAME)
+    with _debug_lock:
+        logger.setLevel(number)
+        if not any(h.get_name() == _DEBUG_HANDLER_NAME for h in logger.handlers):
+            handler = logging.StreamHandler()
+            handler.set_name(_DEBUG_HANDLER_NAME)
+            handler.setFormatter(logging.Formatter(_DEBUG_FORMAT))
+            logger.addHandler(handler)
 
-    try:
-        # Run adb devices -l
-        result = subprocess.run(
-            [adb_path, "devices", "-l"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=timeout,
-            creationflags=_CREATE_NO_WINDOW,
+
+def _level_number(level: str | int) -> int:
+    """The level number of a case-insensitive level name or a level number.
+
+    A name is looked up as written first, then in any case, so a custom level
+    registered in mixed case (``logging.addLevelName(5, "Trace")``) is found too.
+    """
+    if isinstance(level, bool) or not isinstance(level, str | int):
+        msg = f"level must be a level name or number, not {type(level).__name__}"
+        raise TypeError(msg)
+    if isinstance(level, int):
+        if level < 0:
+            msg = f"level must not be negative, got {level}"
+            raise ValueError(msg)
+        return level
+    names = logging.getLevelNamesMapping()
+    name = level.strip()
+    number = names.get(name)
+    if number is None:
+        folded = {key.upper(): value for key, value in names.items()}
+        number = folded.get(name.upper())
+    if number is None:
+        msg = (
+            f"unknown logging level {level!r}; use one of "
+            f"{', '.join(sorted(names, key=names.__getitem__))} (any case) or a number"
         )
-    except subprocess.CalledProcessError as e:
-        msg = f"Failed to run adb devices: {e.stderr}"
-        raise RuntimeError(msg) from e
-    except subprocess.TimeoutExpired as e:
-        msg = f"Timed out running adb devices after {timeout}s"
-        raise TimeoutError(msg) from e
-
-    devices: list[DeviceInfo] = []
-
-    # Parse output
-    # Example: "emulator-5554 device product:sdk_gphone_x86_64 ..."
-    lines = result.stdout.strip().splitlines()
-
-    # Skip the first line "List of devices attached"
-    if not lines:
-        return []
-
-    if lines[0].startswith("List of devices attached"):
-        lines = lines[1:]
-
-    # Regex to parse the line: serial state [properties]
-    # properties are key:value pairs, potentially with spaces in value
-    line_pattern = re.compile(r"^(\S+)\s+(\S+)(?:\s+(.*))?$")
-    # Regex to parse properties: key:value where value can contain spaces
-    # It matches a key, a colon, and then characters that are NOT followed by " key:"
-    prop_pattern = re.compile(r"(\w+):((?:(?!\s\w+:).)*)")
-
-    for line in lines:
-        if not line.strip():
-            continue
-
-        match = line_pattern.match(line)
-        if not match:
-            continue
-
-        serial, state, props_str = match.groups()
-
-        info: DeviceInfo = {
-            "id": serial,
-            "state": state,
-            "type": "emulator" if serial.startswith("emulator-") else "usb",
-        }
-
-        # Parse key:value pairs if present
-        if props_str:
-            for key, value in prop_pattern.findall(props_str):
-                if key in {"product", "model", "device", "transport_id"}:
-                    info[key] = value.strip()
-
-        # Apply filter
-        if device_type:
-            if device_type == "emulator" and info["type"] != "emulator":
-                continue
-            if device_type == "usb" and info["type"] != "usb":
-                continue
-            if device_type == "device" and info["state"] != "device":
-                continue
-
-        devices.append(info)
-
-    return devices
-
-
-def enable_debug(level: str | int = "INFO") -> None:
-    """Enable debug logging for logpyt.
-
-    Note: This configures the 'logpyt' logger. It does not modify the root logger,
-    but if the root logger is not configured, this will add a StreamHandler to
-    the 'logpyt' logger which might result in duplicate logs if the root logger
-    is later configured with a handler.
-
-    Args:
-        level: Logging level (e.g., "DEBUG", "INFO", logging.DEBUG).
-
-    """
-    logger = logging.getLogger("logpyt")
-    logger.setLevel(level)
-
-    # Add handler if not present
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-
-
-def wait_for_device(serial: str | None = None, timeout: float | None = None) -> None:
-    """Wait for device to be ready.
-
-    Args:
-        serial: Optional device serial number.
-        timeout: Timeout in seconds.
-
-    Raises:
-        TimeoutError: If timeout expires.
-        RuntimeError: If ADB command fails.
-
-    """
-    adb_path = resolve_adb()
-    cmd = [adb_path]
-    if serial:
-        cmd.extend(["-s", serial])
-    cmd.append("wait-for-device")
-
-    try:
-        subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=timeout,
-            creationflags=_CREATE_NO_WINDOW,
-        )
-    except subprocess.TimeoutExpired as e:
-        msg = f"Timed out waiting for device after {timeout}s"
-        raise TimeoutError(msg) from e
-    except subprocess.CalledProcessError as e:
-        msg = f"Failed to wait for device: {e.stderr}"
-        raise RuntimeError(msg) from e
-
-
-async def async_wait_for_device(
-    serial: str | None = None,
-    timeout: float | None = None,
-) -> None:
-    """Wait for device to be ready (async).
-
-    Args:
-        serial: Optional device serial number.
-        timeout: Timeout in seconds.
-
-    Raises:
-        TimeoutError: If timeout expires.
-        RuntimeError: If ADB command fails.
-
-    """
-    adb_path = resolve_adb()
-    args = []
-    if serial:
-        args.extend(["-s", serial])
-    args.append("wait-for-device")
-
-    process = await asyncio.create_subprocess_exec(
-        adb_path,
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        creationflags=_CREATE_NO_WINDOW,
-    )
-
-    try:
-        if timeout is not None:
-            await asyncio.wait_for(process.wait(), timeout=timeout)
-        else:
-            await process.wait()
-    except TimeoutError as e:
-        try:
-            process.kill()
-            await process.wait()
-        except ProcessLookupError:
-            pass
-        msg = f"Timed out waiting for device after {timeout}s"
-        raise TimeoutError(msg) from e
-
-    if process.returncode != 0:
-        stderr_data = await process.stderr.read() if process.stderr else b""
-        detail = stderr_data.decode(errors="replace").strip()
-        msg = f"Failed to wait for device: {detail}"
-        raise RuntimeError(msg)
-
-
-def adb_connect(address: str, timeout: float | None = None) -> None:
-    """Connect to a device via TCP/IP.
-
-    Args:
-        address: Device address (host:port).
-        timeout: Connection timeout in seconds.
-
-    Raises:
-        RuntimeError: If connection fails.
-        TimeoutError: If operation times out.
-
-    """
-    adb_path = resolve_adb()
-    cmd = [adb_path, "connect", address]
-
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-            creationflags=_CREATE_NO_WINDOW,
-        )
-    except subprocess.TimeoutExpired as e:
-        msg = f"Timed out connecting to {address} after {timeout}s"
-        raise TimeoutError(msg) from e
-
-    output = result.stdout.strip()
-    error = result.stderr.strip()
-
-    # Check for failure patterns in stdout (adb connect often prints errors to stdout)
-    # "unable to connect to 192.168.1.5:5555: Connection refused"
-    # "failed to connect to '192.168.1.5:5555': Connection refused"
-    if (
-        result.returncode != 0
-        or "unable" in output.lower()
-        or "failed" in output.lower()
-    ):
-        detail = error or output
-        msg = f"Failed to connect to {address}: {detail}"
-        raise RuntimeError(msg)
-
-    # "already connected to 192.168.1.5:5555" -> Success
-    # "connected to 192.168.1.5:5555" -> Success
-
-
-async def async_adb_connect(address: str, timeout: float | None = None) -> None:
-    """Connect to a device via TCP/IP (async).
-
-    Args:
-        address: Device address (host:port).
-        timeout: Connection timeout in seconds.
-
-    Raises:
-        RuntimeError: If connection fails.
-        TimeoutError: If operation times out.
-
-    """
-    adb_path = resolve_adb()
-
-    process = await asyncio.create_subprocess_exec(
-        adb_path,
-        "connect",
-        address,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        creationflags=_CREATE_NO_WINDOW,
-    )
-
-    try:
-        if timeout is not None:
-            await asyncio.wait_for(process.wait(), timeout=timeout)
-        else:
-            await process.wait()
-    except TimeoutError as e:
-        try:
-            process.kill()
-            await process.wait()
-        except ProcessLookupError:
-            pass
-        msg = f"Timed out connecting to {address} after {timeout}s"
-        raise TimeoutError(msg) from e
-
-    stdout_data, stderr_data = await process.communicate()
-    output = stdout_data.decode(errors="replace").strip()
-    error = stderr_data.decode(errors="replace").strip()
-
-    if (
-        process.returncode != 0
-        or "unable" in output.lower()
-        or "failed" in output.lower()
-    ):
-        detail = error or output
-        msg = f"Failed to connect to {address}: {detail}"
-        raise RuntimeError(msg)
+        raise ValueError(msg)
+    return number
 
 
 def extract_json(text: str) -> Any | None:  # noqa: ANN401

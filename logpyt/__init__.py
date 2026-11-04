@@ -57,7 +57,7 @@ from .streams import AsyncLogStream, AsyncStreamHandle, LogStream, StreamHandle
 # rewrites switch over: logpyt.streams.StreamState is still the 2.x enum that the
 # current streams report (design section 8.1).
 from .streams._events import Gap, StateChange, StreamEvent, StreamStats
-from .utils import enable_debug, list_devices, resolve_adb
+from .utils import enable_debug
 
 __all__ = [
     "AdbError",
@@ -94,7 +94,5 @@ __all__ = [
     "WindowedLogGrouper",
     "enable_debug",
     "export_logs",
-    "list_devices",
     "read_file",
-    "resolve_adb",
 ]

@@ -55,7 +55,7 @@ def mock_stream_start_running(stream: LogStream, timeout: float = 1.0):
 
 def test_stream_lifecycle(mock_popen, mocker) -> None:
     """Test start, stop, and join of LogStream."""
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     stream = LogStream()
     assert stream.state == StreamState.IDLE
@@ -85,7 +85,7 @@ def test_stream_lifecycle(mock_popen, mocker) -> None:
 
 def test_stream_callbacks(mock_popen, mocker) -> None:
     """Test that callbacks are invoked."""
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     stdout_cb = Mock()
     stream = LogStream(stdout_callback=stdout_cb)
@@ -103,7 +103,7 @@ def test_stream_callbacks(mock_popen, mocker) -> None:
 
 def test_stream_context_manager(mock_popen, mocker) -> None:
     """Test using LogStream as a context manager."""
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     # Make the process wait block so we can catch the RUNNING state. Set it
     # before the stream starts: set inside the block, the reader can reach
@@ -125,7 +125,7 @@ def test_stream_context_manager(mock_popen, mocker) -> None:
 
 def test_stream_error_callback(mocker) -> None:
     """Test error callback when Popen fails."""
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
     mocker.patch("subprocess.Popen", side_effect=OSError("Failed"))
 
     error_cb = Mock()
@@ -145,7 +145,7 @@ def test_stream_error_callback(mocker) -> None:
 
 def test_stream_startup_failure_is_raised_from_join(mocker) -> None:
     """Startup failures should be surfaced by join()."""
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
     mocker.patch("subprocess.Popen", side_effect=OSError("adb start failed"))
 
     stream = LogStream()
@@ -157,7 +157,7 @@ def test_stream_startup_failure_is_raised_from_join(mocker) -> None:
 
 def test_stream_join_raises_exception(mock_popen, mocker) -> None:
     """Test that exceptions in threads are propagated to join()."""
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     # Mock stdout readline to raise an exception
     process_mock = mock_popen.return_value
@@ -175,7 +175,7 @@ def test_stream_join_raises_exception(mock_popen, mocker) -> None:
 
 def test_stream_parse_error_propagates_to_join(mock_popen, mocker) -> None:
     """Parser exceptions should be visible to join() callers."""
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     process_mock = mock_popen.return_value
     process_mock.stdout.readline.side_effect = ["bad line\n", ""]
@@ -193,7 +193,7 @@ def test_stream_parse_error_propagates_to_join(mock_popen, mocker) -> None:
 
 def test_stream_non_zero_exit_is_raised_from_join(mock_popen, mocker) -> None:
     """Non-zero ADB process exit should be surfaced by join()."""
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     process_mock = mock_popen.return_value
     process_mock.stdout.readline.return_value = ""
@@ -210,7 +210,7 @@ def test_stream_non_zero_exit_is_raised_from_join(mock_popen, mocker) -> None:
 
 def test_stream_package_resolution(mock_popen, mocker) -> None:
     """Test that package name is resolved and added to LogEntry."""
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     # Mock PidMonitor
     mock_pid_monitor_cls = mocker.patch("logpyt.streams.sync.PidMonitor")
@@ -263,7 +263,7 @@ def test_stream_package_filter_drops_non_matching_entries(mock_popen, mocker) ->
     entries resolving to a different package never reach the callback, while
     matching ones do.
     """
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     # PidMonitor resolves PID 1234 -> matching package, PID 9999 -> other package.
     mock_pid_monitor_cls = mocker.patch("logpyt.streams.sync.PidMonitor")
@@ -321,7 +321,7 @@ def test_stream_grouper_flushes_buffered_entries_on_stdout_eof(
     entries without emitting; when stdout reaches EOF the read loop's finally
     block flushes the buffer so the grouped entries are still delivered.
     """
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     # Large threshold + same key => both entries buffer, nothing emitted early.
     grouper = LogGrouper(by=["tag"], threshold_ms=10_000.0, emit_mode="group")
@@ -367,7 +367,7 @@ def test_stream_grouper_flushes_buffered_entries_on_stdout_eof(
 
 def test_auto_reconnect(mocker) -> None:
     """Test that the stream automatically reconnects when the process exits."""
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     # Mock Popen to return a process that finishes immediately
     mock_popen = mocker.patch("subprocess.Popen")
@@ -431,7 +431,7 @@ def test_auto_reconnect(mocker) -> None:
 
 def test_read_timeout(mock_popen, mocker) -> None:
     """Test that the read-timeout watchdog kills the hung process."""
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     # Mock Popen
     process_mock = mock_popen.return_value
@@ -470,7 +470,7 @@ def test_read_loop_caps_readline_size(mocker) -> None:
     """The sync reader caps each readline() so a newline-less flood cannot OOM."""
     from logpyt.streams.sync import _READ_LIMIT
 
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
     stream = LogStream()
 
     calls: list[tuple] = []
@@ -490,7 +490,7 @@ def test_read_loop_caps_readline_size(mocker) -> None:
 
 def test_queue_full_warning_rate_limited(caplog, mocker) -> None:
     """Test queue-full warnings are rate-limited in sync stream."""
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     stream = LogStream(max_queue_size=1, queue_full_warning_interval=60.0)
 
@@ -519,7 +519,7 @@ def test_queue_full_warning_rate_limited(caplog, mocker) -> None:
 
 def test_stop_does_not_hang_when_callback_queue_is_full(mock_popen, mocker) -> None:
     """Stopping should complete even if callback queue is saturated."""
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     process_mock = mock_popen.return_value
     process_mock.stdout.readline.side_effect = [
@@ -568,7 +568,7 @@ def test_stop_does_not_hang_when_callback_queue_is_full(mock_popen, mocker) -> N
 
 def test_join_waits_for_callback_thread_completion(mock_popen, mocker) -> None:
     """join() (no timeout) should not return until the callback worker finishes."""
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     process_mock = mock_popen.return_value
     process_mock.stdout.readline.side_effect = ["line-1\n", ""]
@@ -608,7 +608,7 @@ def test_join_waits_for_callback_thread_completion(mock_popen, mocker) -> None:
 
 def test_join_timeout_honored_when_callback_thread_blocked(mock_popen, mocker) -> None:
     """join(timeout=...) should time out even if callback thread is blocked."""
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     process_mock = mock_popen.return_value
     process_mock.stdout.readline.side_effect = ["line-1\n", ""]
@@ -656,7 +656,7 @@ def test_join_timeout_honored_when_callback_thread_blocked(mock_popen, mocker) -
 
 def test_sync_queue_overflow_policy_drop_oldest_is_configurable(mocker) -> None:
     """Queue overflow policy should allow replacing stale queued items."""
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     stream = LogStream(
         max_queue_size=1,
@@ -700,7 +700,7 @@ def test_sync_queue_overflow_policy_drop_oldest_is_configurable(mocker) -> None:
 
 def test_stream_kill_transitions_to_killed_and_join_raises(mock_popen, mocker) -> None:
     """kill() must set KILLED, kill the process, and make join() raise Killed."""
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     process_mock = mock_popen.return_value
     # Keep stdout blocked so the stream sits RUNNING until we kill it, letting
@@ -747,7 +747,7 @@ def test_stream_pause_suspends_dispatch_and_resume_restores_it(
     Each stdout line is released one at a time via an Event so we can assert the
     dispatch state deterministically at each step, with no bare sleeps.
     """
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     process_mock = mock_popen.return_value
     # One Event per line release; readline blocks until the current one is set.
@@ -819,7 +819,7 @@ def test_stream_pause_suspends_dispatch_and_resume_restores_it(
 
 def test_stream_stderr_callback_receives_entry(mock_popen, mocker) -> None:
     """stderr_callback must receive a LogEntry; default parser maps stderr -> 'E'."""
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     process_mock = mock_popen.return_value
     # Keep stdout empty so only the stderr path produces a dispatch.
@@ -853,7 +853,7 @@ def test_stream_raising_on_start_callback_does_not_break_teardown(
     so it must never escape stop()/join() as an unhandled error, and the stream
     must still reach a terminal state.
     """
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     process_mock = mock_popen.return_value
     process_mock.stdout.readline.side_effect = ["line-1\n", ""]
@@ -884,7 +884,7 @@ def test_stream_raising_on_start_callback_does_not_break_teardown(
 
 def test_stream_join_reraises_same_error_on_second_call(mock_popen, mocker) -> None:
     """join() must be non-destructive: a second call re-raises the same error."""
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     process_mock = mock_popen.return_value
     process_mock.stdout.readline.side_effect = ["bad line\n", ""]
@@ -909,7 +909,7 @@ def test_stream_join_reraises_same_error_on_second_call(mock_popen, mocker) -> N
 
 def test_stream_grouper_only_groups_stdout_not_stderr(mock_popen, mocker) -> None:
     """A stderr line must not be grouped or misrouted through the shared grouper."""
-    mocker.patch("logpyt.streams.sync.resolve_adb", return_value="adb")
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     grouper = LogGrouper(by=["tag"], threshold_ms=10_000.0, emit_mode="group")
 

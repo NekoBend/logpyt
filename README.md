@@ -19,7 +19,7 @@ Structured logging toolkit around Android logcat streams.
 ## Installation
 
 Requires **Python 3.12+** and the Android `adb` executable (auto-discovered by
-`resolve_adb()`, or pass `adb_path=` explicitly).
+`logpyt.adb.resolve_adb()`, or pass `adb_path=` explicitly).
 
 ```bash
 uv pip install git+https://github.com/NekoBend/logpyt.git
@@ -33,7 +33,7 @@ Capture logcat output using `LogStream`.
 
 ```python
 from logpyt import LogStream, LogEntry, StreamHandle
-from logpyt.utils import resolve_adb
+from logpyt.adb import resolve_adb
 
 def stdout_callback(entry: LogEntry, handle: StreamHandle):
     print(f"[{entry.timestamp}] {entry.level}/{entry.tag}: {entry.message}")
@@ -207,9 +207,10 @@ if __name__ == "__main__":
 - **`StreamHandle` / `AsyncStreamHandle`**: Safe handle to control the stream (stop, kill, pause, resume) from callbacks.
 - **`Filter` / `AdvancedFilter`**: Predicates to filter log entries.
 - **`LogGrouper`**: Groups consecutive logs based on keys and time thresholds.
-- **`utils`**:
+- **`logpyt.adb`**:
   - `resolve_adb()`: Finds the ADB executable.
-  - `list_devices()`: Lists connected devices.
+  - `list_devices()`, `wait_for_device()`, `adb_connect()`: Device helpers (async twins included).
+- **Offline and export**:
   - `read_file()` / `LogFileReader`: Tools for offline log analysis.
   - `export_logs()`: Exports logs to JSON/CSV.
 

@@ -11,6 +11,8 @@ import time
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, Literal, TextIO
 
+from logpyt import adb
+from logpyt.adb import _CREATE_NO_WINDOW
 from logpyt.exceptions import (
     LogStreamError,
     LogStreamInternalError,
@@ -20,7 +22,6 @@ from logpyt.exceptions import (
 from logpyt.filters import Filter
 from logpyt.groupers import LogGrouper, WindowedLogGrouper
 from logpyt.parsers import LogParser, ThreadTimeLogParser
-from logpyt.utils import _CREATE_NO_WINDOW, resolve_adb
 
 from .common import StreamState, build_pidof_command
 
@@ -348,7 +349,7 @@ class LogStream:
             pid_poll_backoff_factor: Backoff factor for unchanged PID snapshots.
             pid_max_resolves_per_cycle: Maximum packages to resolve per PID poll cycle.
         """
-        self.adb_path = adb_path or resolve_adb()
+        self.adb_path = adb_path or adb.resolve_adb()
         self.device_id = device_id
         self.parser = parser or ThreadTimeLogParser()
         self.filter_by = filter_by
