@@ -132,7 +132,15 @@ def test_core_imports_no_io_modules() -> None:
     modules = _core_modules()
     names = {path.name for path in modules}
     # An empty or misplaced scan must not pass vacuously.
-    assert {"__init__.py", "framing.py", "grouping.py", "pipeline.py"} <= names
+    assert {
+        "__init__.py",
+        "framing.py",
+        "grouping.py",
+        "pipeline.py",
+        "machine.py",
+        "mailbox.py",
+        "protocol.py",
+    } <= names
 
     offences = [
         f"{path.relative_to(CORE.parent)}:{line}: imports {module}"

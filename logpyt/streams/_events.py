@@ -50,6 +50,13 @@ class StateChange:
         error: The cause of a change to ``RECONNECTING`` (None for a stall
             resume), or the terminal outcome on a change to ``FAILED``; None
             otherwise. It has no default, so every producer states it.
+
+    When more than 256 events wait for a slow consumer, consecutive changes
+    coalesce into one (``StreamStats.events_coalesced`` counts the merges):
+    it has the ``old`` of the first and the ``new``, ``connection`` and
+    ``error`` of the last, so ``old`` can equal ``new``. For example,
+    RUNNING -> RECONNECTING -> CONNECTING -> RUNNING arrives as
+    RUNNING -> RUNNING with the new connection number and no error.
     """
 
     old: StreamState
@@ -109,14 +116,16 @@ class StreamStats:
         backpressure_seconds: Total time intake was closed for a full outbox.
         lines: Framed stdout lines.
         stderr_lines: Framed stderr lines.
-        delivered: Items handed to the consumer.
-        filtered: Lines the ``where`` condition rejected, the flush marker included.
+        delivered: Entries handed to the consumer; a group counts its members.
+        filtered: Lines the ``where`` condition rejected, plus the flush marker
+            and logcat's own buffer divider lines.
         deduplicated: Resume replays recognised in the resume window.
         below_cursor: Resume lines older than the ``-T`` request (section 5.6).
         before_start: With ``since="now"``: lines up to and including the start
-            marker.
-        undelivered: Items discarded by ``kill()``, a detached consumer or a
-            failed consumer.
+            marker; no other counter but ``lines`` includes them.
+        undelivered: Entries discarded by ``kill()``, a detached consumer or a
+            failed run (a group counts its members), and the line ``where`` or
+            grouping raised on.
         unparsed: Lines the parser could not split into fields.
         truncated: Lines cut at ``max_line_bytes``.
         unattributed: Lines evaluated with an unknown package.
