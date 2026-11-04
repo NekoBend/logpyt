@@ -110,7 +110,9 @@ class StreamStats:
     are counters of the same type.
 
     Attributes:
-        connections: adb logcat connections started.
+        connections: Connection attempts, counted from 1 (the
+            ``StateChange.connection`` numbers); an attempt may end before
+            adb logcat starts.
         reconnects: Reconnects after a connection ended (section 5.6).
         stall_resumes: Deliberate disconnects of a stalled reader (section 5.6).
         backpressure_seconds: Total time intake was closed for a full outbox.
@@ -137,7 +139,9 @@ class StreamStats:
             because too many events waited (section 5.10).
         flush_timeout: ``stop(flush=...)`` did not read its marker in time.
         flush_failed: ``stop(flush=...)`` could not finish: the marker command
-            failed, the connection ended before the marker, or the reader stalled.
+            failed, the connection ended before the marker, the reader stalled,
+            or it came while no connection was reading (``CONNECTING`` or
+            ``RECONNECTING``).
         killed: The run ended ``KILLED``.
         failed: The run ended ``FAILED``.
     """

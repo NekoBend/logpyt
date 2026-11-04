@@ -3,6 +3,11 @@
 `Harness` carries out the commands the core returns the way a driver would:
 `Deliver`, `DiscardUndelivered` and `Finished` go to an `Outbox`, every other
 command is recorded so a test can answer it (`answer`, `spawned`) or check it.
+Like a driver (`logpyt._core.protocol.ConsumerProgress`), it reports the
+outbox's counts after carrying out commands that changed them and always
+before it carries out `Finished`, and the consumer side reports when it takes
+(`consume`) or detaches (`detach`). ``at_finished`` keeps what a ``join()``
+returning at `Finished` would see.
 Time only moves when a test moves it (`advance`, ``at=``).
 """
 
@@ -16,6 +21,7 @@ from logpyt._core.machine import StreamCore
 from logpyt._core.mailbox import Outbox
 from logpyt._core.protocol import (
     CommandDone,
+    ConsumerDetached,
     ConsumerProgress,
     Data,
     Deliver,
@@ -25,6 +31,7 @@ from logpyt._core.protocol import (
     Exited,
     Finished,
     Kill,
+    OutboxCounts,
     RunCommand,
     Spawn,
     Spawned,
@@ -45,6 +52,7 @@ if TYPE_CHECKING:
     from logpyt._core.protocol import Command, CommandKind, Event, Pipe, Record
     from logpyt.filters import Condition
     from logpyt.groupers import GroupBy
+    from logpyt.streams._events import StreamStats
 
 ADB = "/fake/adb"
 APP = "com.example.app"
@@ -118,6 +126,10 @@ class Harness:
     spawns: dict[int, Spawn] = field(default_factory=dict)
     signals: list[Terminate | Kill] = field(default_factory=list)
     markers: int = 0
+    # The outbox counts the core was last told about.
+    reported: OutboxCounts = field(default_factory=OutboxCounts)
+    # When Finished was carried out: the core's stats and the outcome's.
+    at_finished: tuple[StreamStats, StreamStats | None] | None = None
 
     @classmethod
     def make(
@@ -169,16 +181,22 @@ class Harness:
 
     def run(self, commands: Iterable[Command]) -> None:
         for command in commands:
+            assert not self.finished, f"{command} after Finished"
             self.commands.append(command)
             match command:
                 case Deliver(records=records):
                     self.outbox.put(records)
                 case DiscardUndelivered():
                     self.outbox.discard()
-                case Finished():
-                    assert not self.finished, "a second Finished"
+                case Finished(outcome=outcome):
+                    # The engine side's last report comes before the end.
+                    self.report()
                     self.finished.append(command)
                     self.outbox.close()
+                    self.at_finished = (
+                        self.core.stats(),
+                        None if outcome is None else outcome.stats,
+                    )
                 case RunCommand(request=request):
                     self.pending[request] = command
                 case Spawn(connection=connection):
@@ -189,6 +207,15 @@ class Harness:
                     self.diagnostics.append(command)
                 case _:
                     assert_never(command)
+        # The engine side's report: a discard, a put into a detached outbox
+        # or a coalesced event changed the counts.
+        if self.outbox.counts() != self.reported:
+            self.report()
+
+    def report(self) -> list[Command]:
+        """Send ``ConsumerProgress`` with the outbox's counts."""
+        self.reported = self.outbox.counts()
+        return self.send(ConsumerProgress(self.reported))
 
     # -- answering -----------------------------------------------------------------
 
@@ -294,8 +321,14 @@ class Harness:
             if isinstance(record, LogEntry | LogGroup):
                 items += 1
         self.taken += taken
-        self.send(ConsumerProgress(self.outbox.counts()))
+        self.report()
         return taken
+
+    def detach(self) -> list[Command]:
+        """The consumer goes away: `Outbox.detach`, then ``ConsumerDetached``."""
+        self.outbox.detach()
+        self.reported = self.outbox.counts()
+        return self.send(ConsumerDetached(self.reported))
 
     # -- reading results ----------------------------------------------------------
 

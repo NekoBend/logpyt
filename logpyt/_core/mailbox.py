@@ -9,7 +9,12 @@ the wake-ups.
   refuses a record, so the end of a run always fits (X-2): the bound comes from
   `Admission`, which closes the engine's intake when the items reach the
   capacity, so the outbox holds at most the capacity plus the lines of one
-  chunk (and the groups a stop flushes). Events live outside the data capacity;
+  chunk, plus the members of the groups that close at once: an idle flush
+  (also while intake is closed), the expiries and evictions that one entry
+  causes, a connection end or a stop. Open groups are bounded by
+  ``GroupBy.max_total_entries`` and ``max_total_bytes``, so they move from the
+  grouper to the outbox without growing the total. Events live outside the
+  data capacity;
   when more than ``max_pending_events`` wait, consecutive state changes merge
   into the latest one. A `Gap` and a terminal state change never merge. A
   merged change keeps the ``old`` of the first change it replaces and the
@@ -170,7 +175,9 @@ class Outbox:
 
     Engine side: `put` (the `Deliver` command), `discard`
     (`DiscardUndelivered`), `close` (`Finished`). Consumer side: `pop`,
-    `detach`. `counts` is what the consumer side reports to the engine.
+    `detach`. `counts` changes on both sides (a put into a detached outbox
+    and a coalesced event count too), and the driver reports it to the core
+    after each change (`ConsumerProgress`, `ConsumerDetached`).
 
     Args:
         max_pending_events: Events that may wait before consecutive state
@@ -351,23 +358,32 @@ class ControlInbox:
     and the clock are the driver's). Each request kind keeps one record:
 
     - `Start` once; the first `StopRequest` (later ones change nothing in
-      the core); `KillRequest` and `ConsumerDetached` as flags; the first
-      `CallbackFailed` (the first error is the one latched, G4); the latest
-      `ConsumerProgress` (its counts are cumulative).
+      the core); `KillRequest` as a flag; the first `CallbackFailed` (the
+      first error is the one latched, G4); the latest `ConsumerDetached` and
+      one `ConsumerProgress` with the newest counts of every report posted
+      (`OutboxCounts.newest`: the consumer side and the engine side both
+      report, so the last one posted need not be the newest). The counts of
+      a `ConsumerDetached` go into that `ConsumerProgress` too.
     - `Spawned`, `SpawnFailed`, `Exited` and `CommandDone` in arrival order;
-      a connection has one spawn result and one exit, and at most two
-      commands run at a time, so this queue stays short.
+      a connection has one spawn result and one exit, and few one-shot
+      commands run at a time (see `RunCommand`), so this queue stays short.
 
-    `take` returns them in this order: `Start`, `CallbackFailed`,
-    `KillRequest`, `StopRequest`, `ConsumerDetached`, the results, then
-    `ConsumerProgress`. Requests that race each other end the same way in any
-    order (G4), so among requests the fixed order loses nothing. A result that
-    waits together with a request is taken after it, even if it arrived
-    first. Both orders are valid, because the two are concurrent (the poster
-    of the request cannot have seen the result: state is published only after
-    `StreamCore.handle`), but they can end differently, and the table defines
-    both outcomes. For example, a ``stop()`` that races a spawn failure in
-    CONNECTING ends STOPPED (the STOPPING spawn_failed row) instead of FAILED.
+    `take` returns them in this order: `ConsumerProgress`, `Start`,
+    `CallbackFailed`, `KillRequest`, `StopRequest`, `ConsumerDetached`, then
+    the results. Progress comes first because its counts are cumulative: the
+    core then decides on a request with the freshest outbox fill (whether a
+    kill or a failure actually discards anything), and what a waiting detach
+    discarded is counted, with its WARNING, before a stop that waits with it
+    ends the run. Requests that race each other end in the same state in any
+    order (G4); the stop comes before the detach, so a raced
+    ``stop(flush=...)`` still sets ``flush_failed`` as it would alone. A
+    result that waits together with a request is taken after it, even if it
+    arrived first. Both orders are valid, because the two are concurrent
+    (the poster of the request cannot have seen the result: state is
+    published only after `StreamCore.handle`), but they can end differently,
+    and the table defines both outcomes. For example, a ``stop()`` that races
+    a spawn failure in CONNECTING ends STOPPED (the STOPPING spawn_failed
+    row) instead of FAILED.
     """
 
     __slots__ = (
@@ -419,24 +435,30 @@ class ControlInbox:
             case StopRequest():
                 if self._stop is None:
                     self._stop = event
-            case ConsumerDetached():
+            case ConsumerDetached(counts=counts):
                 self._detached = event
-            case ConsumerProgress():
-                self._progress = event
+                self._merge_progress(counts)
+            case ConsumerProgress(counts=counts):
+                self._merge_progress(counts)
             case Spawned() | SpawnFailed() | Exited() | CommandDone():
                 self._results.append(event)
             case _:
                 msg = f"{type(event).__name__} is not a control event"
                 raise TypeError(msg)
 
+    def _merge_progress(self, counts: OutboxCounts) -> None:
+        waiting = self._progress
+        self._progress = ConsumerProgress(
+            counts if waiting is None else waiting.counts.newest(counts)
+        )
+
     def take(self) -> Event | None:
         """Remove and return the next event, or None when none waits."""
-        for name in ("_start", "_failed", "_kill", "_stop", "_detached"):
+        for name in ("_progress", "_start", "_failed", "_kill", "_stop", "_detached"):
             event = getattr(self, name)
             if event is not None:
                 setattr(self, name, None)
                 return event
         if self._results:
             return self._results.popleft()
-        event, self._progress = self._progress, None
-        return event
+        return None

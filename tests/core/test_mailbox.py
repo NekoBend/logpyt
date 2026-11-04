@@ -318,11 +318,13 @@ def test_terminal_group_survives_full_outbox() -> None:
 
 
 def test_control_inbox_takes_in_priority_order() -> None:
+    """Progress first (its counts are the freshest fill), then the requests."""
     inbox = ControlInbox()
     progress = ConsumerProgress(_counts(1, 1))
     result = CommandDone(1, CLOCK_OK)
     failed = CallbackFailed("on_item", ValueError("x"))
-    for event in (progress, result, ConsumerDetached(), StopRequest(), KillRequest()):
+    detached = ConsumerDetached(_counts(1, 1))
+    for event in (result, detached, StopRequest(), KillRequest(), progress):
         inbox.post(event)
     inbox.post(failed)
     inbox.post(Start())
@@ -331,35 +333,67 @@ def test_control_inbox_takes_in_priority_order() -> None:
     taken = [inbox.take() for _ in range(8)]
 
     assert taken == [
+        progress,
         Start(),
         failed,
         KillRequest(),
         StopRequest(),
-        ConsumerDetached(),
+        detached,
         result,
-        progress,
         None,
     ]
 
 
 def test_control_inbox_keeps_one_record_per_request() -> None:
-    """Bounded: the first stop and failure, the latest progress, one of each flag."""
+    """Bounded: the first stop and failure, the newest counts, one of each flag."""
     inbox = ControlInbox()
     first = CallbackFailed("on_item", ValueError("first"))
     for index in range(1000):
         inbox.post(StopRequest(flush=float(index)))
         inbox.post(KillRequest())
         inbox.post(ConsumerProgress(_counts(index, index)))
-        inbox.post(ConsumerDetached())
+        inbox.post(ConsumerDetached(_counts(index, index)))
     inbox.post(first)
     inbox.post(CallbackFailed("on_event", ValueError("second")))
 
     assert len(inbox) == 5
+    assert inbox.take() == ConsumerProgress(_counts(999, 999))
     assert inbox.take() is first
     assert inbox.take() == KillRequest()
     assert inbox.take() == StopRequest(flush=0.0)
-    assert inbox.take() == ConsumerDetached()
-    assert inbox.take() == ConsumerProgress(_counts(999, 999))
+    assert inbox.take() == ConsumerDetached(_counts(999, 999))
+
+
+def test_control_inbox_merges_reports_to_the_newest_counts() -> None:
+    """Both sides report; an older report posted last does not hide a newer one."""
+    inbox = ControlInbox()
+    engine = OutboxCounts(taken_entries=2, discarded_entries=5, events_coalesced=1)
+    consumer = OutboxCounts(taken_entries=3)  # posted later, snapshot older
+
+    inbox.post(ConsumerProgress(engine))
+    inbox.post(ConsumerProgress(consumer))
+
+    assert inbox.take() == ConsumerProgress(
+        OutboxCounts(taken_entries=3, discarded_entries=5, events_coalesced=1)
+    )
+    assert inbox.take() is None
+
+
+def test_control_inbox_hands_detach_counts_first() -> None:
+    """A waiting detach's counts come before the requests; the detach stays last."""
+    inbox = ControlInbox()
+    counts = OutboxCounts(discarded_entries=6, discarded_bytes=600)
+    inbox.post(StopRequest(flush=1.0))
+    inbox.post(ConsumerDetached(counts))
+
+    taken = [inbox.take() for _ in range(4)]
+
+    assert taken == [
+        ConsumerProgress(counts),
+        StopRequest(flush=1.0),
+        ConsumerDetached(counts),
+        None,
+    ]
 
 
 def test_control_inbox_keeps_results_in_order() -> None:

@@ -150,6 +150,7 @@ type _Timer = Literal[
     "flush",
     "hold",
     "idle",
+    "stderr_report",
 ]
 
 
@@ -280,6 +281,7 @@ class StreamCore:
         self._counts = OutboxCounts()
         self._tally = Tally()
         self._warned_discard = False
+        self._discard_reason = "the consumer detached"  # of the outbox's discards
         self._stderr_log = StderrLog()
 
     # -- public interface ----------------------------------------------------------
@@ -375,12 +377,12 @@ class StreamCore:
 
     def _terminal(self, event: Event) -> None:
         """G2: in a terminal state only the outbox accounting changes."""
-        if isinstance(event, ConsumerProgress):
+        if isinstance(event, ConsumerProgress | ConsumerDetached):
+            if isinstance(event, ConsumerDetached):
+                self._detached = True
             self._progress(event.counts)
             if self._outcome is not None:
                 self._outcome.stats = self.stats()
-        elif isinstance(event, ConsumerDetached):
-            self._detached = True
 
     def _dispatch(self, event: Event, now: float) -> None:
         if self._state is S.IDLE:
@@ -398,8 +400,8 @@ class StreamCore:
                 self._kill()
             case CallbackFailed(stage=stage, error=error):
                 self._callback_failed(stage, error)
-            case ConsumerDetached():
-                self._consumer_detached(now)
+            case ConsumerDetached(counts=counts):
+                self._consumer_detached(counts, now)
             case ConsumerProgress(counts=counts):
                 self._progress(counts)
             case CommandDone(request=request, result=result):
@@ -447,7 +449,13 @@ class StreamCore:
                 )
                 conn.last_activity = now
                 if pipe == "stdout":
-                    if state is S.CONNECTING and conn.marker is None:
+                    # Output that comes after the core gave the connection up
+                    # (Kill after a failed state check) does not make it RUNNING.
+                    if (
+                        state is S.CONNECTING
+                        and conn.marker is None
+                        and not conn.killed
+                    ):
                         self._enter_running(now)
                     self._first_output(conn, now)
                 self._lines_of(pipe, conn.framers[pipe].feed(chunk), now)
@@ -461,6 +469,8 @@ class StreamCore:
             case Exited(returncode=returncode):
                 self._check(event, possible=conn.alive)
                 conn.returncode = returncode
+                # An exited adb needs no state check: EOF or exit_drain ends it.
+                conn.connect_at = None
                 conn.exit_drain = Pausable(
                     self._config.exit_drain, now, running=self.intake_open
                 )
@@ -562,11 +572,13 @@ class StreamCore:
         self._enter_stopping(Mode.FAIL)
         self._kill_child()
 
-    def _consumer_detached(self, now: float) -> None:
+    def _consumer_detached(self, counts: OutboxCounts, now: float) -> None:
         """No consumer is left: the rest is discarded and counted (design 3.5)."""
         self._detached = True
-        if self._admission.queued_entries:
-            self._warn_discard("the consumer detached")
+        self._discard_reason = "the consumer detached"
+        # The counts include what the detach discarded: the WARNING follows
+        # what was discarded, not the core's estimate of the fill.
+        self._progress(counts)
         state = self._state
         if state is S.CONNECTING:
             self._stop_connecting(now)
@@ -579,9 +591,17 @@ class StreamCore:
             self._discard_pending()
 
     def _progress(self, counts: OutboxCounts) -> None:
-        """G6: the consumer side's latest counts update admission."""
-        self._counts = counts
-        self._admission.release(counts)
+        """G6: the outbox's latest counts update admission.
+
+        Entries the outbox discarded (a detach, or items put into a detached
+        outbox) get the run's one discard WARNING here, while the run is live.
+        """
+        merged = self._counts.newest(counts)
+        discarded = merged.discarded_entries > self._counts.discarded_entries
+        self._counts = merged
+        self._admission.release(merged)
+        if discarded and self._state not in TERMINAL:
+            self._warn_discard(self._discard_reason)
 
     # -- one-shot commands ---------------------------------------------------------
 
@@ -672,6 +692,10 @@ class StreamCore:
             reason = f"adb get-state failed: {exc}"
         else:
             if device_state == "device":
+                if not conn.alive or conn.killed:
+                    # adb exited (or was killed) while the check ran: the
+                    # connection-ended row decides, not a quiet device.
+                    return
                 if conn.marker is None:
                     self._enter_running(now)
                 else:
@@ -952,12 +976,18 @@ class StreamCore:
         self._terminate(now)
 
     def _discard_undelivered(self) -> None:
+        self._discard_reason = (
+            "kill()"
+            if self._mode is Mode.KILL or self._kill_requested
+            else "the consumer failed"
+        )
+        # The estimate of the fill can only be too high, and the control inbox
+        # hands over a waiting ConsumerProgress before any request, so it
+        # counts every report posted before this one. The report of what the
+        # discard removed comes too late for a WARNING when the discard ends
+        # the run (G2), though still before Finished is carried out.
         if self._admission.queued_entries:
-            self._warn_discard(
-                "kill()"
-                if self._mode is Mode.KILL or self._kill_requested
-                else "the consumer failed"
-            )
+            self._warn_discard(self._discard_reason)
         self._flush_records()
         self._out.append(DiscardUndelivered())
 
@@ -996,7 +1026,9 @@ class StreamCore:
         conn = self._conn
         assert conn is not None  # noqa: S101  (stdout lines come from the live one)
         marker = conn.marker
-        if marker is not None and not self._dropping():
+        if marker is not None:
+            # Before the start marker nothing belongs to the capture, also
+            # while a kill or a failure discards the rest (design A.20).
             self._before_start(conn, marker, line, now)
             return
         if line.truncated:
@@ -1053,7 +1085,7 @@ class StreamCore:
         # The marker is read: a later attempt resumes after it instead of
         # starting at its own clock.
         self._read_any = True
-        if self._state is S.CONNECTING:
+        if self._state is S.CONNECTING and not conn.killed:
             self._enter_running(now)
 
     def _evaluate(self, entry: LogEntry, now: float) -> None:
@@ -1087,7 +1119,7 @@ class StreamCore:
 
     def _stage_failed(self, stage: CallbackStage, error: Exception) -> None:
         """A where/group_by failure [P]: the line is discarded and the run fails."""
-        self._tally.dropped += 1
+        self._drop(1, f"{stage} raised")
         self._callback_failed(stage, error)
 
     def _emit(self, item: Item) -> None:
@@ -1226,6 +1258,7 @@ class StreamCore:
         state = self._state
         config = self._config
         conn = self._conn
+        usable = False  # a live adb that the core has not killed
         if conn is not None:
             if state is S.CONNECTING:
                 found["connect"] = conn.connect_at
@@ -1252,7 +1285,9 @@ class StreamCore:
                 found["stall"] = self._bp_since + config.stall_timeout
         if state is S.RECONNECTING:
             found["backoff"] = self._backoff_at
-        if state is S.RUNNING:
+        if state is S.RUNNING and usable:
+            # A connection whose adb exited or was killed is ending: it does
+            # not reset the reconnect budget, however long its end takes.
             found["stable"] = self._stable_at
         if self._mode is Mode.FLUSH and self._flush is not None:
             found["flush"] = self._flush.deadline()
@@ -1260,6 +1295,9 @@ class StreamCore:
             found["hold"] = self._attribution.deadline()
             if self._grouper is not None and state is not S.CONNECTING:
                 found["idle"] = self._grouper.idle_deadline()
+            # Not a table event: the count of rate-limited stderr lines is
+            # logged when their window ends (design 5.9).
+            found["stderr_report"] = self._stderr_log.due()
         return {name: when for name, when in found.items() if when is not None}
 
     def _fire_due(self, now: float) -> None:
@@ -1312,6 +1350,8 @@ class StreamCore:
                 else:
                     for group in self._grouper.flush_idle(now):
                         self._emit(group)
+            case "stderr_report":
+                self._out += self._stderr_log.pending()
             case _:
                 assert_never(name)
 
