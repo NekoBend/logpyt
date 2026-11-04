@@ -1,0 +1,281 @@
+{
+ "id": "R1",
+ "title": "Output shapes of -v threadtime, year, usec, nsec, epoch, uid, zone",
+ "recorded_at": "2026-11-04T04:22:21+00:00",
+ "tool": "tools/device_probe.py",
+ "device": {
+  "ro.build.version.release": "16",
+  "ro.build.version.sdk": "36",
+  "ro.build.type": "userdebug",
+  "ro.product.cpu.abi": "x86_64",
+  "ro.build.fingerprint": "google/sdk_gphone64_x86_64/emu64xa:16/BE2A.250530.026.F3/13894323:userdebug/dev-keys",
+  "persist.sys.timezone": "Etc/UTC",
+  "serial": "emulator-5554",
+  "adb_client": "Version 37.0.1-15733141"
+ },
+ "facts": {},
+ "notes": [],
+ "steps": [
+  {
+   "name": "threadtime",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "logcat",
+    "-d",
+    "-t",
+    "3",
+    "-v",
+    "threadtime"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.034,
+   "stdout": [
+    "--------- beginning of main",
+    "11-04 04:22:25.557  1193  1611 I Nearby  : Successfully shutdown executor ClientProxy.endpointIdRotationExecutor. [CONTEXT service_id=49 ]",
+    "11-04 04:22:25.557  1193  1611 I Nearby  : Successfully shutdown executor AnalyticsRecorder.analyticsExecutor. [CONTEXT service_id=49 ]",
+    "11-04 04:22:25.832   669   807 D WifiConfigStore: Writing to stores completed in 6 ms."
+   ],
+   "stdout_total_lines": 4,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "threadtime+year",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "logcat",
+    "-d",
+    "-t",
+    "3",
+    "-v",
+    "threadtime",
+    "-v",
+    "year"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.028,
+   "stdout": [
+    "--------- beginning of main",
+    "2026-11-04 04:22:25.557  1193  1611 I Nearby  : Successfully shutdown executor AnalyticsRecorder.analyticsExecutor. [CONTEXT service_id=49 ]",
+    "2026-11-04 04:22:25.832   669   807 D WifiConfigStore: Writing to stores completed in 6 ms.",
+    "--------- beginning of kernel",
+    "2026-11-04 04:22:26.049     0     0 I logd    : logdr: UID=2000 GID=2000 PID=3210 n tail=3 logMask=99 pid=0 start=0ns deadline=0ns"
+   ],
+   "stdout_total_lines": 5,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "threadtime+year+usec",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "logcat",
+    "-d",
+    "-t",
+    "3",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.027,
+   "stdout": [
+    "--------- beginning of main",
+    "2026-11-04 04:22:25.832143   669   807 D WifiConfigStore: Writing to stores completed in 6 ms.",
+    "--------- beginning of kernel",
+    "2026-11-04 04:22:26.049866     0     0 I logd    : logdr: UID=2000 GID=2000 PID=3210 n tail=3 logMask=99 pid=0 start=0ns deadline=0ns",
+    "2026-11-04 04:22:26.078987     0     0 I logd    : logdr: UID=2000 GID=2000 PID=3213 n tail=3 logMask=99 pid=0 start=0ns deadline=0ns"
+   ],
+   "stdout_total_lines": 5,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "threadtime+year+nsec",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "logcat",
+    "-d",
+    "-t",
+    "3",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "nsec"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.027,
+   "stdout": [
+    "--------- beginning of kernel",
+    "2026-11-04 04:22:26.049866669     0     0 I logd    : logdr: UID=2000 GID=2000 PID=3210 n tail=3 logMask=99 pid=0 start=0ns deadline=0ns",
+    "2026-11-04 04:22:26.078987669     0     0 I logd    : logdr: UID=2000 GID=2000 PID=3213 n tail=3 logMask=99 pid=0 start=0ns deadline=0ns",
+    "2026-11-04 04:22:26.106648669     0     0 I logd    : logdr: UID=2000 GID=2000 PID=3216 n tail=3 logMask=99 pid=0 start=0ns deadline=0ns"
+   ],
+   "stdout_total_lines": 4,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "threadtime+epoch",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "logcat",
+    "-d",
+    "-t",
+    "3",
+    "-v",
+    "threadtime",
+    "-v",
+    "epoch"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.03,
+   "stdout": [
+    "--------- beginning of kernel",
+    "         1793766146.078     0     0 I logd    : logdr: UID=2000 GID=2000 PID=3213 n tail=3 logMask=99 pid=0 start=0ns deadline=0ns",
+    "         1793766146.106     0     0 I logd    : logdr: UID=2000 GID=2000 PID=3216 n tail=3 logMask=99 pid=0 start=0ns deadline=0ns",
+    "         1793766146.134     0     0 I logd    : logdr: UID=2000 GID=2000 PID=3219 n tail=3 logMask=99 pid=0 start=0ns deadline=0ns"
+   ],
+   "stdout_total_lines": 4,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "threadtime+epoch+usec",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "logcat",
+    "-d",
+    "-t",
+    "3",
+    "-v",
+    "threadtime",
+    "-v",
+    "epoch",
+    "-v",
+    "usec"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.032,
+   "stdout": [
+    "--------- beginning of kernel",
+    "         1793766146.163954     0     0 I logd    : logdr: UID=2000 GID=2000 PID=3222 n tail=3 logMask=99 pid=0 start=0ns deadline=0ns",
+    "--------- beginning of main",
+    "         1793766146.084365  1193  1193 D BoundBrokerSvc: onUnbind: Intent { act=com.google.android.gms.clearcut.bootcount.service.START dat=chimera-action:/... xflg=0x4 cmp=com.google.android.gms/.chimera.PersistentBoundBrokerService }",
+    "         1793766146.099442  1193  1193 D BoundBrokerSvc: onUnbind: Intent { act=com.google.android.gms.significantplaces.api.START dat=chimera-action:/... xflg=0x4 cmp=com.google.android.gms/.chimera.PersistentApiService }"
+   ],
+   "stdout_total_lines": 5,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "threadtime+uid",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "logcat",
+    "-d",
+    "-t",
+    "3",
+    "-v",
+    "threadtime",
+    "-v",
+    "uid"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.032,
+   "stdout": [
+    "--------- beginning of main",
+    "11-04 04:22:26.084 10146  1193  1193 D BoundBrokerSvc: onUnbind: Intent { act=com.google.android.gms.clearcut.bootcount.service.START dat=chimera-action:/... xflg=0x4 cmp=com.google.android.gms/.chimera.PersistentBoundBrokerService }",
+    "11-04 04:22:26.099 10146  1193  1193 D BoundBrokerSvc: onUnbind: Intent { act=com.google.android.gms.significantplaces.api.START dat=chimera-action:/... xflg=0x4 cmp=com.google.android.gms/.chimera.PersistentApiService }",
+    "--------- beginning of kernel",
+    "11-04 04:22:26.194  root     0     0 I logd    : logdr: UID=2000 GID=2000 PID=3225 n tail=3 logMask=99 pid=0 start=0ns deadline=0ns"
+   ],
+   "stdout_total_lines": 5,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "threadtime+year+UTC+zone",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "logcat",
+    "-d",
+    "-t",
+    "3",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "UTC",
+    "-v",
+    "zone"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.026,
+   "stdout": [
+    "--------- beginning of main",
+    "2026-11-04 04:22:26.099  1193  1193 D BoundBrokerSvc: onUnbind: Intent { act=com.google.android.gms.significantplaces.api.START dat=chimera-action:/... xflg=0x4 cmp=com.google.android.gms/.chimera.PersistentApiService }",
+    "--------- beginning of kernel",
+    "2026-11-04 04:22:26.194     0     0 I logd    : logdr: UID=2000 GID=2000 PID=3225 n tail=3 logMask=99 pid=0 start=0ns deadline=0ns",
+    "2026-11-04 04:22:26.227     0     0 I logd    : logdr: UID=2000 GID=2000 PID=3228 n tail=3 logMask=99 pid=0 start=0ns deadline=0ns"
+   ],
+   "stdout_total_lines": 5,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "default",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "logcat",
+    "-d",
+    "-t",
+    "3"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.026,
+   "stdout": [
+    "--------- beginning of kernel",
+    "11-04 04:22:26.194     0     0 I logd    : logdr: UID=2000 GID=2000 PID=3225 n tail=3 logMask=99 pid=0 start=0ns deadline=0ns",
+    "11-04 04:22:26.227     0     0 I logd    : logdr: UID=2000 GID=2000 PID=3228 n tail=3 logMask=99 pid=0 start=0ns deadline=0ns",
+    "11-04 04:22:26.255     0     0 I logd    : logdr: UID=2000 GID=2000 PID=3231 n tail=3 logMask=99 pid=0 start=0ns deadline=0ns"
+   ],
+   "stdout_total_lines": 4,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  }
+ ]
+}

@@ -1,0 +1,137 @@
+{
+ "id": "R5",
+ "title": "Ring sizes, backlog size, timestamp collision rates",
+ "recorded_at": "2026-11-04T04:22:19+00:00",
+ "tool": "tools/device_probe.py",
+ "device": {
+  "ro.build.version.release": "16",
+  "ro.build.version.sdk": "36",
+  "ro.build.type": "userdebug",
+  "ro.product.cpu.abi": "x86_64",
+  "ro.build.fingerprint": "google/sdk_gphone64_x86_64/emu64xa:16/BE2A.250530.026.F3/13894323:userdebug/dev-keys",
+  "persist.sys.timezone": "Etc/UTC",
+  "serial": "emulator-5554",
+  "adb_client": "Version 37.0.1-15733141"
+ },
+ "facts": {
+  "backlog": {
+   "lines": 80429,
+   "bytes": 12343849,
+   "parsed": 80429,
+   "usec_shared_fraction": 0.6371,
+   "usec_largest_group": 98,
+   "ms_shared_fraction": 0.929,
+   "ms_largest_group": 164,
+   "identical_groups": 2518,
+   "identical_largest_group": 5,
+   "identical_largest_group_T": "1793766118.849932"
+  }
+ },
+ "notes": [
+  "the stored backlog lines are the largest group of byte-identical lines at one timestamp"
+ ],
+ "steps": [
+  {
+   "name": "ring_default",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "logcat",
+    "-g"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.292,
+   "stdout": [
+    "main: ring buffer is 2 MiB (1 MiB consumed, 6 MiB readable), max entry is 5120 B, max payload is 4068 B",
+    "system: ring buffer is 2 MiB (701 KiB consumed, 1 MiB readable), max entry is 5120 B, max payload is 4068 B",
+    "crash: ring buffer is 2 MiB (0 B consumed, 0 B readable), max entry is 5120 B, max payload is 4068 B",
+    "kernel: ring buffer is 2 MiB (122 KiB consumed, 312 KiB readable), max entry is 5120 B, max payload is 4068 B"
+   ],
+   "stdout_total_lines": 4,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "ring_all",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "logcat",
+    "-b",
+    "all",
+    "-g"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.523,
+   "stdout": [
+    "main: ring buffer is 2 MiB (1 MiB consumed, 6 MiB readable), max entry is 5120 B, max payload is 4068 B",
+    "radio: ring buffer is 256 KiB (153 KiB consumed, 519 KiB readable), max entry is 5120 B, max payload is 4068 B",
+    "events: ring buffer is 256 KiB (80 KiB consumed, 88 KiB readable), max entry is 5120 B, max payload is 4068 B",
+    "system: ring buffer is 2 MiB (701 KiB consumed, 1 MiB readable), max entry is 5120 B, max payload is 4068 B",
+    "crash: ring buffer is 2 MiB (0 B consumed, 0 B readable), max entry is 5120 B, max payload is 4068 B",
+    "stats: ring buffer is 256 KiB (0 B consumed, 0 B readable), max entry is 5120 B, max payload is 4068 B",
+    "security: ring buffer is 256 KiB (0 B consumed, 0 B readable), max entry is 5120 B, max payload is 4068 B",
+    "kernel: ring buffer is 2 MiB (122 KiB consumed, 312 KiB readable), max entry is 5120 B, max payload is 4068 B"
+   ],
+   "stdout_total_lines": 8,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "uptime",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "shell",
+    "cat /proc/uptime"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.029,
+   "stdout": [
+    "40.44 12.59"
+   ],
+   "stdout_total_lines": 1,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "backlog",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "logcat",
+    "-d",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.383,
+   "stdout": [
+    "2026-11-04 04:21:58.849932 +0000 10182   905   905 W BatteryControllerGoogle: \tat com.google.android.systemui.dagger.DaggerSysUIGoogleGlobalRootComponent$SysUIGoogleSysUIComponentImpl$SwitchingProvider.get(go/retraceme 5ef7505f3172d45c77e95a8eba788f1ba3487bafbb4dd5bf3a1ad9be0371fc04:3582)",
+    "2026-11-04 04:21:58.849932 +0000 10182   905   905 W BatteryControllerGoogle: \tat com.google.android.systemui.dagger.DaggerSysUIGoogleGlobalRootComponent$SysUIGoogleSysUIComponentImpl$SwitchingProvider.get(go/retraceme 5ef7505f3172d45c77e95a8eba788f1ba3487bafbb4dd5bf3a1ad9be0371fc04:3582)",
+    "2026-11-04 04:21:58.849932 +0000 10182   905   905 W BatteryControllerGoogle: \tat com.google.android.systemui.dagger.DaggerSysUIGoogleGlobalRootComponent$SysUIGoogleSysUIComponentImpl$SwitchingProvider.get(go/retraceme 5ef7505f3172d45c77e95a8eba788f1ba3487bafbb4dd5bf3a1ad9be0371fc04:3582)",
+    "2026-11-04 04:21:58.849932 +0000 10182   905   905 W BatteryControllerGoogle: \tat com.google.android.systemui.dagger.DaggerSysUIGoogleGlobalRootComponent$SysUIGoogleSysUIComponentImpl$SwitchingProvider.get(go/retraceme 5ef7505f3172d45c77e95a8eba788f1ba3487bafbb4dd5bf3a1ad9be0371fc04:3582)",
+    "2026-11-04 04:21:58.849932 +0000 10182   905   905 W BatteryControllerGoogle: \tat com.google.android.systemui.dagger.DaggerSysUIGoogleGlobalRootComponent$SysUIGoogleSysUIComponentImpl$SwitchingProvider.get(go/retraceme 5ef7505f3172d45c77e95a8eba788f1ba3487bafbb4dd5bf3a1ad9be0371fc04:3582)"
+   ],
+   "stdout_total_lines": 80432,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  }
+ ]
+}

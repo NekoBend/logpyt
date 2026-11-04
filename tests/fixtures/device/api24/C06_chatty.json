@@ -1,0 +1,297 @@
+{
+ "id": "C06",
+ "title": "chatty expire/identical notices: text, timestamp, backlog, resume",
+ "recorded_at": "2026-11-04T04:38:05+00:00",
+ "tool": "tools/device_probe.py",
+ "device": {
+  "ro.build.version.release": "7.0",
+  "ro.build.version.sdk": "24",
+  "ro.build.type": "userdebug",
+  "ro.product.cpu.abi": "x86_64",
+  "ro.build.fingerprint": "Android/sdk_google_phone_x86_64/generic_x86_64:7.0/NYC/6696031:userdebug/dev-keys",
+  "persist.sys.timezone": "Etc/UTC",
+  "serial": "emulator-5556",
+  "adb_client": "Version 37.0.1-15733141"
+ },
+ "facts": {
+  "lines_written": 40000,
+  "writer_lines_per_s": 148899,
+  "liblog_drop_events": {
+   "events": 472,
+   "lines_dropped": 34177
+  },
+  "own_lines_kept": 3669,
+  "own_seq_kept_range": [
+   11556,
+   39663
+  ],
+  "notices": 52,
+  "notices_by_uid": {
+   "10014": 32,
+   "shell": 14,
+   "10052": 6
+  },
+  "notices_between_list_neighbors": 12,
+  "notice_details": [
+   {
+    "line": "2026-11-04 04:21:49.499885 +0000 10014  1987  1987 I chatty  : uid=10014(com.google.android.gms) com.google.process.gapps expire 4 lines",
+    "count": 4,
+    "ts_minus_prev_line_us": 922,
+    "next_line_minus_ts_us": 687,
+    "between_list_neighbors": true
+   },
+   {
+    "line": "2026-11-04 04:21:50.975239 +0000 10014  2236  2236 I chatty  : uid=10014(com.google.android.gms) expire 26 lines",
+    "count": 26,
+    "ts_minus_prev_line_us": 332458,
+    "next_line_minus_ts_us": 4860,
+    "between_list_neighbors": true
+   },
+   {
+    "line": "2026-11-04 04:21:50.980099 +0000 10014  1811  2235 I chatty  : uid=10014 com.google.android.gms.persistent expire 2 lines",
+    "count": 2,
+    "ts_minus_prev_line_us": 4860,
+    "next_line_minus_ts_us": 3551,
+    "between_list_neighbors": true
+   },
+   {
+    "line": "2026-11-04 04:21:51.000785 +0000 10014  1811  2220 I chatty  : uid=10014 com.google.android.gms.persistent expire 2 lines",
+    "count": 2,
+    "ts_minus_prev_line_us": 3411,
+    "next_line_minus_ts_us": 18318,
+    "between_list_neighbors": true
+   },
+   {
+    "line": "2026-11-04 04:21:51.019103 +0000 10014  1811  2230 I chatty  : uid=10014(com.google.android.gms) GeofencerStateM expire 1 line",
+    "count": 1,
+    "ts_minus_prev_line_us": 18318,
+    "next_line_minus_ts_us": 9479,
+    "between_list_neighbors": true
+   },
+   {
+    "line": "2026-11-04 04:21:51.084116 +0000 10014  1811  2266 I chatty  : uid=10014(com.google.android.gms) GoogleLocationS expire 2 lines",
+    "count": 2,
+    "ts_minus_prev_line_us": 13111,
+    "next_line_minus_ts_us": 46432,
+    "between_list_neighbors": true
+   },
+   {
+    "line": "2026-11-04 04:21:51.130548 +0000 10014  2236  2304 I chatty  : uid=10014(com.google.android.gms) expire 16 lines",
+    "count": 16,
+    "ts_minus_prev_line_us": 46432,
+    "next_line_minus_ts_us": 73903,
+    "between_list_neighbors": true
+   },
+   {
+    "line": "2026-11-04 04:21:51.240303 +0000 10014  1811  2316 I chatty  : uid=10014(com.google.android.gms) lowpool[3] expire 3 lines",
+    "count": 3,
+    "ts_minus_prev_line_us": 24690,
+    "next_line_minus_ts_us": 4250,
+    "between_list_neighbors": true
+   },
+   {
+    "line": "2026-11-04 04:21:51.337335 +0000 10014  2236  2305 I chatty  : uid=10014(com.google.android.gms) expire 1 line",
+    "count": 1,
+    "ts_minus_prev_line_us": 40500,
+    "next_line_minus_ts_us": 51551,
+    "between_list_neighbors": true
+   },
+   {
+    "line": "2026-11-04 04:21:51.388886 +0000 10014  2236  2357 I chatty  : uid=10014(com.google.android.gms) lowpool[0] expire 2 lines",
+    "count": 2,
+    "ts_minus_prev_line_us": 51551,
+    "next_line_minus_ts_us": 1069,
+    "between_list_neighbors": true
+   },
+   {
+    "line": "2026-11-04 04:21:51.455790 +0000 10014  2236  2374 I chatty  : uid=10014(com.google.android.gms) expire 15 lines",
+    "count": 15,
+    "ts_minus_prev_line_us": 16875,
+    "next_line_minus_ts_us": 25341,
+    "between_list_neighbors": true
+   },
+   {
+    "line": "2026-11-04 04:21:51.481131 +0000 10014  2236  2373 I chatty  : uid=10014(com.google.android.gms) expire 21 lines",
+    "count": 21,
+    "ts_minus_prev_line_us": 25341,
+    "next_line_minus_ts_us": 12970,
+    "between_list_neighbors": true
+   }
+  ],
+  "notices_in_resume_from_1s_before_first_notice": 52
+ },
+ "notes": [],
+ "steps": [
+  {
+   "name": "writer",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "logwrapper sh -c 'i=0; while [ $i -lt 40000 ]; do echo lp-ch-4979173b-$i; i=$((i+1)); done'"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.269,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "liblog_events",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-b",
+    "events",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid",
+    "-T",
+    "1793767090.000000",
+    "-s",
+    "liblog"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.012,
+   "stdout": [
+    "2026-11-04 04:38:11.075489 +0000 shell  3739  3739 I liblog  : 36",
+    "2026-11-04 04:38:11.075647 +0000 shell  3739  3739 I liblog  : 18",
+    "2026-11-04 04:38:11.075769 +0000 shell  3739  3739 I liblog  : 13",
+    "2026-11-04 04:38:11.075888 +0000 shell  3739  3739 I liblog  : 15",
+    "2026-11-04 04:38:11.076217 +0000 shell  3739  3739 I liblog  : 30",
+    "2026-11-04 04:38:11.076339 +0000 shell  3739  3739 I liblog  : 13",
+    "2026-11-04 04:38:11.076418 +0000 shell  3739  3739 I liblog  : 7",
+    "2026-11-04 04:38:11.076606 +0000 shell  3739  3739 I liblog  : 19",
+    "2026-11-04 04:38:11.076724 +0000 shell  3739  3739 I liblog  : 12",
+    "2026-11-04 04:38:11.077776 +0000 shell  3739  3739 I liblog  : 10"
+   ],
+   "stdout_total_lines": 472,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "dump",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.041,
+   "stdout": [
+    "2026-11-04 04:21:49.494945 +0000  1000  1599  1620 V PackageManager: reconcileAppsData finished 98 packages; restoreconNeeded was false",
+    "2026-11-04 04:21:49.498963 +0000  1000  1599  1610 I WindowManager: Destroying surface Surface(name=com.android.settings/com.android.settings.FallbackHome) called by com.android.server.wm.WindowStateAnimator.destroySurface:2016 com.android.server.wm.WindowStateAnimator.destroySurfaceLocked:882 com.android.server.wm.WindowState.removeLocked:1456 com.android.server.wm.WindowManagerService.removeWind",
+    "2026-11-04 04:21:49.499885 +0000 10014  1987  1987 I chatty  : uid=10014(com.google.android.gms) com.google.process.gapps expire 4 lines",
+    "2026-11-04 04:21:49.500572 +0000 10015  1970  1970 W System  : ClassLoader referenced unknown path: /system/priv-app/GoogleExtServices/lib/x86_64",
+    "2026-11-04 04:21:49.506036 +0000  1000  1599  1868 I ActivityManager: Start proc 1987:com.google.process.gapps/u0a14 for content provider com.google.android.gsf/.gservices.GservicesProvider",
+    "2026-11-04 04:21:50.636202 +0000  1000  1599  1649 D SntpClient: round trip: 25ms, clock offset: 492ms",
+    "2026-11-04 04:21:50.642781 +0000  1000  1599  1866 W ActivityManager: Unable to start service Intent { act=com.google.android.gms.nearby.discovery:ACTION_PERMISSION_CHANGE cmp=com.google.android.gms/.nearby.discovery.service.DiscoveryService } U=0: not found",
+    "2026-11-04 04:21:50.975239 +0000 10014  2236  2236 I chatty  : uid=10014(com.google.android.gms) expire 26 lines",
+    "2026-11-04 04:21:50.980099 +0000 10014  1811  2235 I chatty  : uid=10014 com.google.android.gms.persistent expire 2 lines",
+    "2026-11-04 04:21:50.983650 +0000  1000  1599  1868 I ActivityManager: Start proc 2236:com.google.android.gms/u0a14 for service com.google.android.gms/.chimera.GmsIntentOperationService",
+    "2026-11-04 04:21:50.989104 +0000 10004  2251  2251 W art     : Unexpected CPU variant for X86 using defaults: x86_64",
+    "2026-11-04 04:21:50.997374 +0000  1000  1599  1610 I ActivityManager: Start proc 2251:com.android.cellbroadcastreceiver/u0a4 for broadcast com.android.cellbroadcastreceiver/.CellBroadcastReceiver",
+    "2026-11-04 04:21:51.000785 +0000 10014  1811  2220 I chatty  : uid=10014 com.google.android.gms.persistent expire 2 lines",
+    "2026-11-04 04:21:51.019103 +0000 10014  1811  2230 I chatty  : uid=10014(com.google.android.gms) GeofencerStateM expire 1 line",
+    "2026-11-04 04:21:51.028582 +0000 10004  2251  2251 W System  : ClassLoader referenced unknown path: /system/priv-app/CellBroadcastReceiver/lib/x86_64",
+    "2026-11-04 04:21:51.037908 +0000 10004  2251  2251 D CellBroadcastReceiver: Service state changed! 3 Full: 3 3 voice home data home null null null null null null  Unknown Unknown CSS not supported -1 -1 RoamInd=-1 DefRoamInd=-1 EmergOnly=false IsDataRoamingFromRegistration=false Current state=-1",
+    "2026-11-04 04:21:51.048524 +0000  1000  1599  2096 I ActivityManager: Start proc 2271:com.google.android.deskclock/u0a64 for broadcast com.google.android.deskclock/com.android.deskclock.AlarmInitReceiver",
+    "2026-11-04 04:21:51.071005 +0000 10064  2271  2271 W System  : ClassLoader referenced unknown path: /system/app/PrebuiltDeskClockGoogle/lib/x86_64",
+    "2026-11-04 04:21:51.084116 +0000 10014  1811  2266 I chatty  : uid=10014(com.google.android.gms) GoogleLocationS expire 2 lines",
+    "2026-11-04 04:21:51.130548 +0000 10014  2236  2304 I chatty  : uid=10014(com.google.android.gms) expire 16 lines",
+    "2026-11-04 04:21:51.204451 +0000 10064  2271  2271 I GAv4    : Google Analytics 8.4.87 is starting up. To enable debug logging on a device run:",
+    "2026-11-04 04:21:51.204451 +0000 10064  2271  2271 I GAv4    :   adb shell setprop log.tag.GAv4 DEBUG",
+    "2026-11-04 04:21:51.214693 +0000 10064  2271  2271 I AlarmClock: AlarmInitReceiver android.intent.action.TIME_SET",
+    "2026-11-04 04:21:51.215613 +0000 10064  2271  2315 W GAv4    : AnalyticsService not registered in the app manifest. Hits might not be delivered reliably. See http://goo.gl/8Rd3yj for instructions.",
+    "2026-11-04 04:21:51.240303 +0000 10014  1811  2316 I chatty  : uid=10014(com.google.android.gms) lowpool[3] expire 3 lines",
+    "2026-11-04 04:21:51.244553 +0000 10064  2271  2323 V AlarmClock: AlarmInitReceiver finished",
+    "2026-11-04 04:21:51.248425 +0000 10004  2251  2251 D CellBroadcastReceiver: Service state changed! 0 Full: 0 0 voice home data home Android Android 310260 Android Android 310260  Unknown LTE CSS not supported -1 -1 RoamInd=-1 DefRoamInd=-1 EmergOnly=false IsDataRoamingFromRegistration=false Current state=3",
+    "2026-11-04 04:21:51.295183 +0000 radio  1833  2134 D IccSmsInterfaceManager: [IccSmsInterfaceManager] Failed to remove GSM cell broadcast subscription for MID range 50 to 50 from client com.android.cellbroadcastreceiver",
+    "2026-11-04 04:21:51.296835 +0000 10011  2329  2329 W System  : ClassLoader referenced unknown path: /system/priv-app/MediaProvider/lib/x86_64",
+    "2026-11-04 04:21:51.337335 +0000 10014  2236  2305 I chatty  : uid=10014(com.google.android.gms) expire 1 line",
+    "2026-11-04 04:21:51.388886 +0000 10014  2236  2357 I chatty  : uid=10014(com.google.android.gms) lowpool[0] expire 2 lines",
+    "2026-11-04 04:21:51.389955 +0000 10011  2329  2329 D MediaScannerReceiver: action: android.intent.action.MEDIA_MOUNTED path: /storage/emulated/0",
+    "2026-11-04 04:21:51.392461 +0000 10057  2358  2358 W art     : Unexpected CPU variant for X86 using defaults: x86_64",
+    "2026-11-04 04:21:51.438911 +0000 10057  2358  2358 I MultiDex: install",
+    "2026-11-04 04:21:51.438915 +0000 10057  2358  2358 I MultiDex: VM has multidex support, MultiDex support library is disabled.",
+    "2026-11-04 04:21:51.455790 +0000 10014  2236  2374 I chatty  : uid=10014(com.google.android.gms) expire 15 lines",
+    "2026-11-04 04:21:51.481131 +0000 10014  2236  2373 I chatty  : uid=10014(com.google.android.gms) expire 21 lines",
+    "2026-11-04 04:21:51.494101 +0000 10014  2236  2348 I chatty  : uid=10014(com.google.android.gms) expire 4 lines",
+    "2026-11-04 04:21:51.507622 +0000 10014  2236  2247 I chatty  : uid=10014(com.google.android.gms) HeapTaskDaemon expire 1 line"
+   ],
+   "stdout_total_lines": 6741,
+   "stdout_clipped_lines": 1,
+   "stderr": []
+  },
+  {
+   "name": "dump_from_1s_before_first_notice",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid",
+    "-T",
+    "1793766108.499885"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.036,
+   "stdout": [
+    "--------- beginning of system",
+    "2026-11-04 04:21:48.504808 +0000  1000  1599  1599 I ActivityManager: Start proc 1851:com.android.settings/1000 for activity com.android.settings/.FallbackHome",
+    "2026-11-04 04:21:48.507012 +0000  1000  1599  1612 W LocationProviderProxy-network: Odd, no component found for service com.android.location.service.v3.NetworkLocationProvider",
+    "2026-11-04 04:21:49.499885 +0000 10014  1987  1987 I chatty  : uid=10014(com.google.android.gms) com.google.process.gapps expire 4 lines",
+    "2026-11-04 04:21:50.975239 +0000 10014  2236  2236 I chatty  : uid=10014(com.google.android.gms) expire 26 lines",
+    "2026-11-04 04:21:50.980099 +0000 10014  1811  2235 I chatty  : uid=10014 com.google.android.gms.persistent expire 2 lines",
+    "2026-11-04 04:21:51.000785 +0000 10014  1811  2220 I chatty  : uid=10014 com.google.android.gms.persistent expire 2 lines",
+    "2026-11-04 04:21:51.019103 +0000 10014  1811  2230 I chatty  : uid=10014(com.google.android.gms) GeofencerStateM expire 1 line",
+    "2026-11-04 04:21:51.084116 +0000 10014  1811  2266 I chatty  : uid=10014(com.google.android.gms) GoogleLocationS expire 2 lines",
+    "2026-11-04 04:21:51.130548 +0000 10014  2236  2304 I chatty  : uid=10014(com.google.android.gms) expire 16 lines",
+    "2026-11-04 04:21:51.240303 +0000 10014  1811  2316 I chatty  : uid=10014(com.google.android.gms) lowpool[3] expire 3 lines",
+    "2026-11-04 04:21:51.337335 +0000 10014  2236  2305 I chatty  : uid=10014(com.google.android.gms) expire 1 line",
+    "2026-11-04 04:21:51.388886 +0000 10014  2236  2357 I chatty  : uid=10014(com.google.android.gms) lowpool[0] expire 2 lines"
+   ],
+   "stdout_total_lines": 5937,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  }
+ ]
+}

@@ -1,0 +1,185 @@
+{
+ "id": "C12",
+ "title": "ANDROID_LOG_TAGS from the host environment",
+ "recorded_at": "2026-11-04T04:22:28+00:00",
+ "tool": "tools/device_probe.py",
+ "device": {
+  "ro.build.version.release": "16",
+  "ro.build.version.sdk": "36",
+  "ro.build.type": "userdebug",
+  "ro.product.cpu.abi": "x86_64",
+  "ro.build.fingerprint": "google/sdk_gphone64_x86_64/emu64xa:16/BE2A.250530.026.F3/13894323:userdebug/dev-keys",
+  "persist.sys.timezone": "Etc/UTC",
+  "serial": "emulator-5554",
+  "adb_client": "Version 37.0.1-15733141"
+ },
+ "facts": {
+  "tags_silent": {
+   "lines": 0,
+   "distinct_tags": 0,
+   "top_tags": {}
+  },
+  "tags_logpyt_only": {
+   "lines": 2,
+   "distinct_tags": 1,
+   "top_tags": {
+    "logpyt": 2
+   }
+  },
+  "tags_removed": {
+   "lines": 816,
+   "distinct_tags": 51,
+   "top_tags": {
+    "SettingsToPropertiesMapper": 524,
+    "43-ServiceEntitlementIn": 33,
+    "resolv": 30,
+    "BugleDataModel": 30,
+    "InetDiagMessage": 30
+   }
+  },
+  "tags_silent_with_filterspec": {
+   "lines": 816,
+   "distinct_tags": 51,
+   "top_tags": {
+    "SettingsToPropertiesMapper": 524,
+    "43-ServiceEntitlementIn": 32,
+    "resolv": 30,
+    "BugleDataModel": 30,
+    "InetDiagMessage": 30
+   }
+  }
+ },
+ "notes": [],
+ "steps": [
+  {
+   "name": "log_t",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "shell",
+    "log -t logpyt lp-tags-6282a029"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.014,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "tags_silent",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "logcat",
+    "-d",
+    "-t",
+    "300",
+    "-v",
+    "threadtime"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.038,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": [],
+   "env": {
+    "ANDROID_LOG_TAGS": "*:S"
+   }
+  },
+  {
+   "name": "tags_logpyt_only",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "logcat",
+    "-d",
+    "-t",
+    "300",
+    "-v",
+    "threadtime"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.035,
+   "stdout": [
+    "--------- beginning of main",
+    "11-04 04:22:33.210  3390  3390 I logpyt  : lp-mark-6282a029",
+    "11-04 04:22:33.438  3402  3402 I logpyt  : lp-tags-6282a029"
+   ],
+   "stdout_total_lines": 3,
+   "stdout_clipped_lines": 0,
+   "stderr": [],
+   "env": {
+    "ANDROID_LOG_TAGS": "logpyt:V *:S"
+   }
+  },
+  {
+   "name": "tags_removed",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "logcat",
+    "-d",
+    "-t",
+    "300",
+    "-v",
+    "threadtime"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.027,
+   "stdout": [
+    "--------- beginning of main",
+    "11-04 04:22:29.523  1495  3340 I 43-ServiceEntitlementIn: [Ts.43-ServiceEntitlementIntentOperation] Unavailable Open Gateway Interfaces (OGI) for 3P [CONTEXT service_id=359 ]",
+    "11-04 04:22:29.524  1495  3340 I 43-ServiceEntitlementIn: [Ts.43-ServiceEntitlementIntentOperation] onDestroy [CONTEXT service_id=359 ]",
+    "11-04 04:22:29.524  1495  3349 I 43-ServiceEntitlementIn: [Ts.43-ServiceEntitlementIntentOperation] onCreate [CONTEXT service_id=359 ]",
+    "11-04 04:22:29.525  1495  3349 I 43-ServiceEntitlementIn: [Ts.43-ServiceEntitlementIntentOperation] Unavailable Open Gateway Interfaces (OGI) for 3P [CONTEXT service_id=359 ]"
+   ],
+   "stdout_total_lines": 819,
+   "stdout_clipped_lines": 0,
+   "stderr": [],
+   "env": {
+    "ANDROID_LOG_TAGS": null
+   }
+  },
+  {
+   "name": "tags_silent_with_filterspec",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "logcat",
+    "-d",
+    "-t",
+    "300",
+    "-v",
+    "threadtime",
+    "*:V"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.028,
+   "stdout": [
+    "--------- beginning of main",
+    "11-04 04:22:29.524  1495  3340 I 43-ServiceEntitlementIn: [Ts.43-ServiceEntitlementIntentOperation] onDestroy [CONTEXT service_id=359 ]",
+    "11-04 04:22:29.524  1495  3349 I 43-ServiceEntitlementIn: [Ts.43-ServiceEntitlementIntentOperation] onCreate [CONTEXT service_id=359 ]",
+    "11-04 04:22:29.525  1495  3349 I 43-ServiceEntitlementIn: [Ts.43-ServiceEntitlementIntentOperation] Unavailable Open Gateway Interfaces (OGI) for 3P [CONTEXT service_id=359 ]",
+    "11-04 04:22:29.527  1495  3344 I 43-ServiceEntitlementIn: [Ts.43-ServiceEntitlementIntentOperation] Unavailable Open Gateway Interfaces (OGI) for 3P [CONTEXT service_id=359 ]"
+   ],
+   "stdout_total_lines": 819,
+   "stdout_clipped_lines": 0,
+   "stderr": [],
+   "env": {
+    "ANDROID_LOG_TAGS": "*:S"
+   }
+  }
+ ]
+}

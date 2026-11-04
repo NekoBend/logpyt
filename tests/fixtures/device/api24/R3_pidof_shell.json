@@ -1,0 +1,78 @@
+{
+ "id": "R3",
+ "title": "adb shell pidof runs shell metacharacters; no process is rc 1",
+ "recorded_at": "2026-11-04T04:22:20+00:00",
+ "tool": "tools/device_probe.py",
+ "device": {
+  "ro.build.version.release": "7.0",
+  "ro.build.version.sdk": "24",
+  "ro.build.type": "userdebug",
+  "ro.product.cpu.abi": "x86_64",
+  "ro.build.fingerprint": "Android/sdk_google_phone_x86_64/generic_x86_64:7.0/NYC/6696031:userdebug/dev-keys",
+  "persist.sys.timezone": "Etc/UTC",
+  "serial": "emulator-5556",
+  "adb_client": "Version 37.0.1-15733141"
+ },
+ "facts": {},
+ "notes": [],
+ "steps": [
+  {
+   "name": "metachar",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "pidof",
+    "com.example.none; echo INJECTED_VIA_SEMICOLON"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.011,
+   "stdout": [
+    "INJECTED_VIA_SEMICOLON"
+   ],
+   "stdout_total_lines": 1,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "two_names_one_arg",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "pidof",
+    "system_server zygote64"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.009,
+   "stdout": [
+    "1353 1599"
+   ],
+   "stdout_total_lines": 1,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "unknown",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "pidof",
+    "com.example.none"
+   ],
+   "rc": 1,
+   "timed_out": false,
+   "elapsed_s": 0.009,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  }
+ ]
+}

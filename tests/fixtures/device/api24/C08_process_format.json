@@ -1,0 +1,50 @@
+{
+ "id": "C08",
+ "title": "-v process line shape and its (tag) suffix",
+ "recorded_at": "2026-11-04T04:22:20+00:00",
+ "tool": "tools/device_probe.py",
+ "device": {
+  "ro.build.version.release": "7.0",
+  "ro.build.version.sdk": "24",
+  "ro.build.type": "userdebug",
+  "ro.product.cpu.abi": "x86_64",
+  "ro.build.fingerprint": "Android/sdk_google_phone_x86_64/generic_x86_64:7.0/NYC/6696031:userdebug/dev-keys",
+  "persist.sys.timezone": "Etc/UTC",
+  "serial": "emulator-5556",
+  "adb_client": "Version 37.0.1-15733141"
+ },
+ "facts": {},
+ "notes": [],
+ "steps": [
+  {
+   "name": "process",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-t",
+    "6",
+    "-v",
+    "process"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.009,
+   "stdout": [
+    "--------- beginning of system",
+    "I( 1599) Killing 2271:com.google.android.deskclock/u0a64 (adj 906): empty #18  (ActivityManager)",
+    "I( 1599) Killing 2197:com.google.android.partnersetup/u0a19 (adj 906): empty #17  (ActivityManager)",
+    "D( 1599) cleanUpApplicationRecord -- 2197  (ActivityManager)",
+    "D( 1599) cleanUpApplicationRecord -- 2710  (ActivityManager)",
+    "D( 1599) cleanUpApplicationRecord -- 2271  (ActivityManager)",
+    "--------- beginning of main",
+    "W( 2753) bcq TOOK TOO LONG! (15039ms > 10000ms)  (Babel)"
+   ],
+   "stdout_total_lines": 8,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  }
+ ]
+}

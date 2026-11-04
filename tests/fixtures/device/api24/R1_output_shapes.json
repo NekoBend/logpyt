@@ -1,0 +1,285 @@
+{
+ "id": "R1",
+ "title": "Output shapes of -v threadtime, year, usec, nsec, epoch, uid, zone",
+ "recorded_at": "2026-11-04T04:22:19+00:00",
+ "tool": "tools/device_probe.py",
+ "device": {
+  "ro.build.version.release": "7.0",
+  "ro.build.version.sdk": "24",
+  "ro.build.type": "userdebug",
+  "ro.product.cpu.abi": "x86_64",
+  "ro.build.fingerprint": "Android/sdk_google_phone_x86_64/generic_x86_64:7.0/NYC/6696031:userdebug/dev-keys",
+  "persist.sys.timezone": "Etc/UTC",
+  "serial": "emulator-5556",
+  "adb_client": "Version 37.0.1-15733141"
+ },
+ "facts": {},
+ "notes": [],
+ "steps": [
+  {
+   "name": "threadtime",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-t",
+    "3",
+    "-v",
+    "threadtime"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.01,
+   "stdout": [
+    "--------- beginning of system",
+    "11-04 04:22:22.688  1599  1868 D ActivityManager: cleanUpApplicationRecord -- 2710",
+    "11-04 04:22:22.688  1599  1610 D ActivityManager: cleanUpApplicationRecord -- 2271",
+    "--------- beginning of main",
+    "11-04 04:22:24.088  2753  2963 W Babel   : bcq TOOK TOO LONG! (15039ms > 10000ms)"
+   ],
+   "stdout_total_lines": 5,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "threadtime+year",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-t",
+    "3",
+    "-v",
+    "threadtime",
+    "-v",
+    "year"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.008,
+   "stdout": [
+    "--------- beginning of system",
+    "2026-11-04 04:22:22.688  1599  1868 D ActivityManager: cleanUpApplicationRecord -- 2710",
+    "2026-11-04 04:22:22.688  1599  1610 D ActivityManager: cleanUpApplicationRecord -- 2271",
+    "--------- beginning of main",
+    "2026-11-04 04:22:24.088  2753  2963 W Babel   : bcq TOOK TOO LONG! (15039ms > 10000ms)"
+   ],
+   "stdout_total_lines": 5,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "threadtime+year+usec",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-t",
+    "3",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.011,
+   "stdout": [
+    "--------- beginning of system",
+    "2026-11-04 04:22:22.688198  1599  1868 D ActivityManager: cleanUpApplicationRecord -- 2710",
+    "2026-11-04 04:22:22.688379  1599  1610 D ActivityManager: cleanUpApplicationRecord -- 2271",
+    "--------- beginning of main",
+    "2026-11-04 04:22:24.088576  2753  2963 W Babel   : bcq TOOK TOO LONG! (15039ms > 10000ms)"
+   ],
+   "stdout_total_lines": 5,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "threadtime+year+nsec",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-t",
+    "3",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "nsec"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.009,
+   "stdout": [
+    "--------- beginning of system",
+    "2026-11-04 04:22:22.688 +0000  1599  1868 D ActivityManager: cleanUpApplicationRecord -- 2710",
+    "2026-11-04 04:22:22.688 +0000  1599  1610 D ActivityManager: cleanUpApplicationRecord -- 2271",
+    "--------- beginning of main",
+    "2026-11-04 04:22:24.088 +0000  2753  2963 W Babel   : bcq TOOK TOO LONG! (15039ms > 10000ms)"
+   ],
+   "stdout_total_lines": 5,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "threadtime+epoch",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-t",
+    "3",
+    "-v",
+    "threadtime",
+    "-v",
+    "epoch"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.01,
+   "stdout": [
+    "--------- beginning of system",
+    "         1793766142.688  1599  1868 D ActivityManager: cleanUpApplicationRecord -- 2710",
+    "         1793766142.688  1599  1610 D ActivityManager: cleanUpApplicationRecord -- 2271",
+    "--------- beginning of main",
+    "         1793766144.088  2753  2963 W Babel   : bcq TOOK TOO LONG! (15039ms > 10000ms)"
+   ],
+   "stdout_total_lines": 5,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "threadtime+epoch+usec",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-t",
+    "3",
+    "-v",
+    "threadtime",
+    "-v",
+    "epoch",
+    "-v",
+    "usec"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.009,
+   "stdout": [
+    "--------- beginning of system",
+    "         1793766142.688198  1599  1868 D ActivityManager: cleanUpApplicationRecord -- 2710",
+    "         1793766142.688379  1599  1610 D ActivityManager: cleanUpApplicationRecord -- 2271",
+    "--------- beginning of main",
+    "         1793766144.088576  2753  2963 W Babel   : bcq TOOK TOO LONG! (15039ms > 10000ms)"
+   ],
+   "stdout_total_lines": 5,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "threadtime+uid",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-t",
+    "3",
+    "-v",
+    "threadtime",
+    "-v",
+    "uid"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.01,
+   "stdout": [
+    "--------- beginning of system",
+    "11-04 04:22:22.688  1000  1599  1868 D ActivityManager: cleanUpApplicationRecord -- 2710",
+    "11-04 04:22:22.688  1000  1599  1610 D ActivityManager: cleanUpApplicationRecord -- 2271",
+    "--------- beginning of main",
+    "11-04 04:22:24.088 10052  2753  2963 W Babel   : bcq TOOK TOO LONG! (15039ms > 10000ms)"
+   ],
+   "stdout_total_lines": 5,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "threadtime+year+UTC+zone",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-t",
+    "3",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "UTC",
+    "-v",
+    "zone"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.009,
+   "stdout": [
+    "--------- beginning of system",
+    "2026-11-04 04:22:22.688  1599  1868 D ActivityManager: cleanUpApplicationRecord -- 2710",
+    "2026-11-04 04:22:22.688  1599  1610 D ActivityManager: cleanUpApplicationRecord -- 2271",
+    "--------- beginning of main",
+    "2026-11-04 04:22:24.088  2753  2963 W Babel   : bcq TOOK TOO LONG! (15039ms > 10000ms)"
+   ],
+   "stdout_total_lines": 5,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "default",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-t",
+    "3"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.008,
+   "stdout": [
+    "--------- beginning of system",
+    "11-04 04:22:22.688  1599  1868 D ActivityManager: cleanUpApplicationRecord -- 2710",
+    "11-04 04:22:22.688  1599  1610 D ActivityManager: cleanUpApplicationRecord -- 2271",
+    "--------- beginning of main",
+    "11-04 04:22:24.088  2753  2963 W Babel   : bcq TOOK TOO LONG! (15039ms > 10000ms)"
+   ],
+   "stdout_total_lines": 5,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  }
+ ]
+}

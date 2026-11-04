@@ -1,0 +1,133 @@
+{
+ "id": "R5",
+ "title": "Ring sizes, backlog size, timestamp collision rates",
+ "recorded_at": "2026-11-04T04:22:19+00:00",
+ "tool": "tools/device_probe.py",
+ "device": {
+  "ro.build.version.release": "7.0",
+  "ro.build.version.sdk": "24",
+  "ro.build.type": "userdebug",
+  "ro.product.cpu.abi": "x86_64",
+  "ro.build.fingerprint": "Android/sdk_google_phone_x86_64/generic_x86_64:7.0/NYC/6696031:userdebug/dev-keys",
+  "persist.sys.timezone": "Etc/UTC",
+  "serial": "emulator-5556",
+  "adb_client": "Version 37.0.1-15733141"
+ },
+ "facts": {
+  "backlog": {
+   "lines": 4358,
+   "bytes": 643229,
+   "parsed": 4358,
+   "usec_shared_fraction": 0.3417,
+   "usec_largest_group": 25,
+   "ms_shared_fraction": 0.8194,
+   "ms_largest_group": 378,
+   "identical_groups": 9,
+   "identical_largest_group": 2,
+   "identical_largest_group_T": "1793766114.474948"
+  }
+ },
+ "notes": [
+  "the stored backlog lines are the largest group of byte-identical lines at one timestamp"
+ ],
+ "steps": [
+  {
+   "name": "ring_default",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-g"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.009,
+   "stdout": [
+    "main: ring buffer is 256Kb (252Kb consumed), max entry is 5120b, max payload is 4068b",
+    "system: ring buffer is 256Kb (127Kb consumed), max entry is 5120b, max payload is 4068b",
+    "crash: ring buffer is 256Kb (0b consumed), max entry is 5120b, max payload is 4068b"
+   ],
+   "stdout_total_lines": 3,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "ring_all",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-b",
+    "all",
+    "-g"
+   ],
+   "rc": 1,
+   "timed_out": false,
+   "elapsed_s": 0.008,
+   "stdout": [
+    "main: ring buffer is 256Kb (252Kb consumed), max entry is 5120b, max payload is 4068b",
+    "radio: ring buffer is 256Kb (117Kb consumed), max entry is 5120b, max payload is 4068b",
+    "events: ring buffer is 256Kb (16Kb consumed), max entry is 5120b, max payload is 4068b",
+    "system: ring buffer is 256Kb (127Kb consumed), max entry is 5120b, max payload is 4068b",
+    "crash: ring buffer is 256Kb (0b consumed), max entry is 5120b, max payload is 4068b",
+    "kernel: ring buffer is 256Kb (41Kb consumed), max entry is 5120b, max payload is 4068b"
+   ],
+   "stdout_total_lines": 6,
+   "stdout_clipped_lines": 0,
+   "stderr": [
+    "failed to get the readable 'security' log size"
+   ]
+  },
+  {
+   "name": "uptime",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "cat /proc/uptime"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.006,
+   "stdout": [
+    "40.37 61.23"
+   ],
+   "stdout_total_lines": 1,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "backlog",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.024,
+   "stdout": [
+    "2026-11-04 04:21:54.474948 +0000 10052  2753  2753 W GmsNativeLibraryLoader: \tat java.lang.reflect.Method.invoke(Native Method)",
+    "2026-11-04 04:21:54.474948 +0000 10052  2753  2753 W GmsNativeLibraryLoader: \tat java.lang.reflect.Method.invoke(Native Method)"
+   ],
+   "stdout_total_lines": 4360,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  }
+ ]
+}

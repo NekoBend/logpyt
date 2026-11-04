@@ -1,0 +1,910 @@
+{
+ "id": "C05",
+ "title": "Stalled reader under heavy logging: skip, notice or disconnect?",
+ "recorded_at": "2026-11-04T04:56:32+00:00",
+ "tool": "tools/device_probe.py",
+ "device": {
+  "ro.build.version.release": "7.0",
+  "ro.build.version.sdk": "24",
+  "ro.build.type": "userdebug",
+  "ro.product.cpu.abi": "x86_64",
+  "ro.build.fingerprint": "Android/sdk_google_phone_x86_64/generic_x86_64:7.0/NYC/6696031:userdebug/dev-keys",
+  "persist.sys.timezone": "Etc/UTC",
+  "serial": "emulator-5556",
+  "adb_client": "Version 37.0.1-15733141"
+ },
+ "facts": {
+  "fast": {
+   "lines_written": 150000,
+   "writer_s": 15.9,
+   "writer_lines_per_s": 9455,
+   "stall_s": 18.9,
+   "stalled_reader_rc_during_stall": null,
+   "stalled_reader_bytes_during_stall": 1010,
+   "stalled_reader_rc_after_resume": 1,
+   "control_reader": {
+    "received": 150000,
+    "missing": 0,
+    "missing_ranges": [],
+    "missing_range_count": 0,
+    "duplicates": 0,
+    "saw_start": true,
+    "saw_end": true,
+    "other_lines": [
+     "--------- beginning of main"
+    ],
+    "lines_read": 150003
+   },
+   "stalled_reader": {
+    "received": 74146,
+    "missing": 75854,
+    "missing_ranges": [
+     [
+      74146,
+      149999
+     ]
+    ],
+    "missing_range_count": 1,
+    "duplicates": 0,
+    "saw_start": true,
+    "saw_end": false,
+    "other_lines": [
+     "--------- beginning of main"
+    ],
+    "lines_read": 74148
+   },
+   "liblog_drop_events": {
+    "events": 0,
+    "lines_dropped": 0
+   },
+   "ring_after": [
+    "main: ring buffer is 256Kb (2Mb consumed), max entry is 5120b, max payload is 4068b",
+    "system: ring buffer is 256Kb (130Kb consumed), max entry is 5120b, max payload is 4068b",
+    "crash: ring buffer is 256Kb (0b consumed), max entry is 5120b, max payload is 4068b"
+   ]
+  },
+  "slow": {
+   "lines_written": 150000,
+   "writer_s": 153.3,
+   "writer_lines_per_s": 978,
+   "stall_s": 156.3,
+   "stalled_reader_rc_during_stall": null,
+   "stalled_reader_bytes_during_stall": 84,
+   "stalled_reader_rc_after_resume": 1,
+   "control_reader": {
+    "received": 150000,
+    "missing": 0,
+    "missing_ranges": [],
+    "missing_range_count": 0,
+    "duplicates": 0,
+    "saw_start": true,
+    "saw_end": true,
+    "other_lines": [
+     "--------- beginning of main"
+    ],
+    "lines_read": 150003
+   },
+   "stalled_reader": {
+    "received": 69780,
+    "missing": 80220,
+    "missing_ranges": [
+     [
+      69780,
+      149999
+     ]
+    ],
+    "missing_range_count": 1,
+    "duplicates": 0,
+    "saw_start": true,
+    "saw_end": false,
+    "other_lines": [
+     "--------- beginning of main"
+    ],
+    "lines_read": 69782
+   },
+   "liblog_drop_events": {
+    "events": 0,
+    "lines_dropped": 0
+   },
+   "ring_after": [
+    "main: ring buffer is 256Kb (250Kb consumed), max entry is 5120b, max payload is 4068b",
+    "system: ring buffer is 256Kb (130Kb consumed), max entry is 5120b, max payload is 4068b",
+    "crash: ring buffer is 256Kb (0b consumed), max entry is 5120b, max payload is 4068b"
+   ]
+  },
+  "slow_reader": {
+   "lines_written": 300000,
+   "writer_s": 153.7,
+   "writer_lines_per_s": 1952,
+   "stall_s": 156.7,
+   "stalled_reader_rc_during_stall": null,
+   "stalled_reader_bytes_during_stall": 7872275,
+   "stalled_reader_rc_after_resume": 1,
+   "control_reader": {
+    "received": 300000,
+    "missing": 0,
+    "missing_ranges": [],
+    "missing_range_count": 0,
+    "duplicates": 0,
+    "saw_start": true,
+    "saw_end": true,
+    "other_lines": [
+     "--------- beginning of main"
+    ],
+    "lines_read": 300003
+   },
+   "stalled_reader": {
+    "received": 101762,
+    "missing": 198238,
+    "missing_ranges": [
+     [
+      101762,
+      299999
+     ]
+    ],
+    "missing_range_count": 1,
+    "duplicates": 0,
+    "saw_start": true,
+    "saw_end": false,
+    "other_lines": [
+     "--------- beginning of main"
+    ],
+    "lines_read": 101764
+   },
+   "liblog_drop_events": {
+    "events": 0,
+    "lines_dropped": 0
+   },
+   "ring_after": [
+    "main: ring buffer is 256Kb (248Kb consumed), max entry is 5120b, max payload is 4068b",
+    "system: ring buffer is 256Kb (130Kb consumed), max entry is 5120b, max payload is 4068b",
+    "crash: ring buffer is 256Kb (0b consumed), max entry is 5120b, max payload is 4068b"
+   ]
+  }
+ },
+ "notes": [],
+ "steps": [
+  {
+   "name": "fast_start_marker_0",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "log -t sh lp-st-2aa72f0efast-start"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.013,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "fast_start_marker_1",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "log -t sh lp-st-2aa72f0efast-start"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.015,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "fast_writer",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "logwrapper sh -c 'i=0; while [ $i -lt 150000 ]; do echo lp-st-2aa72f0efast-$i; i=$((i+1)); if [ $((i % 100)) -eq 0 ]; then sleep 0.01; fi; done'"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 15.864,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "fast_end_marker",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "log -t sh lp-st-2aa72f0efast-end"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.014,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "fast_control_reader",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid",
+    "-T",
+    "1793768197.000000",
+    "-s",
+    "sh:V"
+   ],
+   "rc": null,
+   "timed_out": true,
+   "elapsed_s": 36.045,
+   "stdout": [
+    "--------- beginning of main",
+    "2026-11-04 04:56:44.924776 +0000 shell  4160  4160 I sh      : lp-st-2aa72f0efast-start ",
+    "2026-11-04 04:56:44.985204 +0000 shell  4164  4164 I sh      : lp-st-2aa72f0efast-0",
+    "2026-11-04 04:56:44.985209 +0000 shell  4164  4164 I sh      : lp-st-2aa72f0efast-1",
+    "2026-11-04 04:56:44.985211 +0000 shell  4164  4164 I sh      : lp-st-2aa72f0efast-2"
+   ],
+   "stdout_total_lines": 5,
+   "stdout_clipped_lines": 0,
+   "stderr": [],
+   "live": true,
+   "first_byte_s": 7.041,
+   "bytes_read": 13239094,
+   "lines_read": 150003
+  },
+  {
+   "name": "fast_stalled_reader",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid",
+    "-T",
+    "1793768197.000000",
+    "-s",
+    "sh:V"
+   ],
+   "rc": 1,
+   "timed_out": false,
+   "elapsed_s": 36.044,
+   "stdout": [
+    "--------- beginning of main",
+    "2026-11-04 04:56:44.924776 +0000 shell  4160  4160 I sh      : lp-st-2aa72f0efast-start ",
+    "2026-11-04 04:56:44.985204 +0000 shell  4164  4164 I sh      : lp-st-2aa72f0efast-0",
+    "2026-11-04 04:56:44.985209 +0000 shell  4164  4164 I sh      : lp-st-2aa72f0efast-1",
+    "2026-11-04 04:56:44.985211 +0000 shell  4164  4164 I sh      : lp-st-2aa72f0efast-2"
+   ],
+   "stdout_total_lines": 5,
+   "stdout_clipped_lines": 0,
+   "stderr": [
+    "read: unexpected EOF!"
+   ],
+   "live": true,
+   "first_byte_s": 7.04,
+   "bytes_read": 6513855,
+   "lines_read": 74148
+  },
+  {
+   "name": "fast_liblog_events",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-b",
+    "events",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid",
+    "-T",
+    "1793768197.000000",
+    "-s",
+    "liblog"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.019,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "fast_logd_in_kernel_buffer",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-b",
+    "kernel",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid",
+    "-T",
+    "1793768197.000000"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.01,
+   "stdout": [],
+   "stdout_total_lines": 1,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "slow_start_marker_0",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "log -t sh lp-st-2aa72f0eslow-start"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.011,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "slow_start_marker_1",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "log -t sh lp-st-2aa72f0eslow-start"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.011,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "slow_writer",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "logwrapper sh -c 'i=0; while [ $i -lt 150000 ]; do echo lp-st-2aa72f0eslow-$i; i=$((i+1)); if [ $((i % 10)) -eq 0 ]; then sleep 0.01; fi; done'"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 153.327,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "slow_end_marker",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "log -t sh lp-st-2aa72f0eslow-end"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.008,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "slow_control_reader",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid",
+    "-T",
+    "1793768233.000000",
+    "-s",
+    "sh:V"
+   ],
+   "rc": null,
+   "timed_out": true,
+   "elapsed_s": 173.455,
+   "stdout": [
+    "--------- beginning of main",
+    "2026-11-04 04:57:21.024434 +0000 shell  4186  4186 I sh      : lp-st-2aa72f0eslow-start ",
+    "2026-11-04 04:57:21.034144 +0000 shell  4190  4190 I sh      : lp-st-2aa72f0eslow-0",
+    "2026-11-04 04:57:21.034183 +0000 shell  4190  4190 I sh      : lp-st-2aa72f0eslow-1",
+    "2026-11-04 04:57:21.034184 +0000 shell  4190  4190 I sh      : lp-st-2aa72f0eslow-2"
+   ],
+   "stdout_total_lines": 5,
+   "stdout_clipped_lines": 0,
+   "stderr": [],
+   "live": true,
+   "first_byte_s": 7.038,
+   "bytes_read": 13239094,
+   "lines_read": 150003
+  },
+  {
+   "name": "slow_stalled_reader",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid",
+    "-T",
+    "1793768233.000000",
+    "-s",
+    "sh:V"
+   ],
+   "rc": 1,
+   "timed_out": false,
+   "elapsed_s": 173.453,
+   "stdout": [
+    "--------- beginning of main",
+    "2026-11-04 04:57:21.024434 +0000 shell  4186  4186 I sh      : lp-st-2aa72f0eslow-start ",
+    "2026-11-04 04:57:21.034144 +0000 shell  4190  4190 I sh      : lp-st-2aa72f0eslow-0",
+    "2026-11-04 04:57:21.034183 +0000 shell  4190  4190 I sh      : lp-st-2aa72f0eslow-1",
+    "2026-11-04 04:57:21.034184 +0000 shell  4190  4190 I sh      : lp-st-2aa72f0eslow-2"
+   ],
+   "stdout_total_lines": 5,
+   "stdout_clipped_lines": 0,
+   "stderr": [
+    "read: unexpected EOF!"
+   ],
+   "live": true,
+   "first_byte_s": 7.038,
+   "bytes_read": 6129647,
+   "lines_read": 69782
+  },
+  {
+   "name": "slow_liblog_events",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-b",
+    "events",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid",
+    "-T",
+    "1793768233.000000",
+    "-s",
+    "liblog"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.01,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "slow_logd_in_kernel_buffer",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-b",
+    "kernel",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid",
+    "-T",
+    "1793768233.000000"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.011,
+   "stdout": [],
+   "stdout_total_lines": 36,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "slow_reader_start_marker_0",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "log -t sh lp-st-2aa72f0eslow_reader-start"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.012,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "slow_reader_start_marker_1",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "log -t sh lp-st-2aa72f0eslow_reader-start"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.01,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "slow_reader_writer",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "logwrapper sh -c 'i=0; while [ $i -lt 300000 ]; do echo lp-st-2aa72f0eslow_reader-$i; i=$((i+1)); if [ $((i % 20)) -eq 0 ]; then sleep 0.01; fi; done'"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 153.72,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "slow_reader_end_marker",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "log -t sh lp-st-2aa72f0eslow_reader-end"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.01,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "slow_reader_control_reader",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid",
+    "-T",
+    "1793768407.000000",
+    "-s",
+    "sh:V"
+   ],
+   "rc": null,
+   "timed_out": true,
+   "elapsed_s": 174.606,
+   "stdout": [
+    "--------- beginning of main",
+    "2026-11-04 05:00:14.545322 +0000 shell  4214  4214 I sh      : lp-st-2aa72f0eslow_reader-start ",
+    "2026-11-04 05:00:14.555110 +0000 shell  4218  4218 I sh      : lp-st-2aa72f0eslow_reader-0",
+    "2026-11-04 05:00:14.555118 +0000 shell  4218  4218 I sh      : lp-st-2aa72f0eslow_reader-1",
+    "2026-11-04 05:00:14.555119 +0000 shell  4218  4218 I sh      : lp-st-2aa72f0eslow_reader-2"
+   ],
+   "stdout_total_lines": 5,
+   "stdout_clipped_lines": 0,
+   "stderr": [],
+   "live": true,
+   "first_byte_s": 7.043,
+   "bytes_read": 28689108,
+   "lines_read": 300003
+  },
+  {
+   "name": "slow_reader_stalled_reader",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid",
+    "-T",
+    "1793768407.000000",
+    "-s",
+    "sh:V"
+   ],
+   "rc": 1,
+   "timed_out": false,
+   "elapsed_s": 174.604,
+   "stdout": [
+    "--------- beginning of main",
+    "2026-11-04 05:00:14.545322 +0000 shell  4214  4214 I sh      : lp-st-2aa72f0eslow_reader-start ",
+    "2026-11-04 05:00:14.555110 +0000 shell  4218  4218 I sh      : lp-st-2aa72f0eslow_reader-0",
+    "2026-11-04 05:00:14.555118 +0000 shell  4218  4218 I sh      : lp-st-2aa72f0eslow_reader-1",
+    "2026-11-04 05:00:14.555119 +0000 shell  4218  4218 I sh      : lp-st-2aa72f0eslow_reader-2"
+   ],
+   "stdout_total_lines": 5,
+   "stdout_clipped_lines": 0,
+   "stderr": [
+    "read: unexpected EOF!"
+   ],
+   "live": true,
+   "first_byte_s": 7.043,
+   "bytes_read": 9658166,
+   "lines_read": 101764
+  },
+  {
+   "name": "slow_reader_liblog_events",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-b",
+    "events",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid",
+    "-T",
+    "1793768407.000000",
+    "-s",
+    "liblog"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.01,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "slow_reader_logd_in_kernel_buffer",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-b",
+    "kernel",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid",
+    "-T",
+    "1793768407.000000"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.01,
+   "stdout": [],
+   "stdout_total_lines": 69,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "adb_root",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "root"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 1.309,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "id_u",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "id -u"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.009,
+   "stdout": [
+    "0"
+   ],
+   "stdout_total_lines": 1,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "dmesg_logd",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "dmesg | grep -i -E 'logd|reader|prune' | tail -n 30"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.013,
+   "stdout": [
+    "[    1.077991] init: (Parsing /system/etc/init/logd.rc took 0.00s.)",
+    "[    1.098007] init: Starting service 'logd'...",
+    "[    1.107793] logd.auditd: start",
+    "[    1.108258] logd.klogd: 1108256050",
+    "[    1.433092] init: Starting service 'logd-reinit'...",
+    "[    1.435315] logd.daemon: reinit",
+    "[    1.441304] init: Service 'logd-reinit' (pid 1300) exited with status 0",
+    "[    1.916891] init: Starting service 'logd-reinit'...",
+    "[    1.919637] logd.daemon: reinit",
+    "[    1.920650] init: Service 'logd-reinit' (pid 1350) exited with status 0"
+   ],
+   "stdout_total_lines": 10,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "adb_unroot",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "unroot"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 3.111,
+   "stdout": [
+    "restarting adbd as non root"
+   ],
+   "stdout_total_lines": 1,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "id_u",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "id -u"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.009,
+   "stdout": [
+    "2000"
+   ],
+   "stdout_total_lines": 1,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  }
+ ]
+}

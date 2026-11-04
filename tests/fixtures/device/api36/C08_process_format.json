@@ -1,0 +1,51 @@
+{
+ "id": "C08",
+ "title": "-v process line shape and its (tag) suffix",
+ "recorded_at": "2026-11-04T04:22:22+00:00",
+ "tool": "tools/device_probe.py",
+ "device": {
+  "ro.build.version.release": "16",
+  "ro.build.version.sdk": "36",
+  "ro.build.type": "userdebug",
+  "ro.product.cpu.abi": "x86_64",
+  "ro.build.fingerprint": "google/sdk_gphone64_x86_64/emu64xa:16/BE2A.250530.026.F3/13894323:userdebug/dev-keys",
+  "persist.sys.timezone": "Etc/UTC",
+  "serial": "emulator-5554",
+  "adb_client": "Version 37.0.1-15733141"
+ },
+ "facts": {},
+ "notes": [],
+ "steps": [
+  {
+   "name": "process",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "logcat",
+    "-d",
+    "-t",
+    "6",
+    "-v",
+    "process"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.027,
+   "stdout": [
+    "--------- beginning of main",
+    "I( 1495) [83] 1 [vision.ocr]  (GmsDebugLogger)",
+    "W( 1495) Request for optional module download of ocr failed. Request again.  (Vision)",
+    "W( 1495) Would have logged:  (Vision)",
+    "W( 1495) # gptm@37884fe7  (Vision)",
+    "I( 1495) Schedule retrying download ocr at 42057 with backoff 20 seconds  (Vision)",
+    "--------- beginning of kernel",
+    "I(    0) logdr: UID=2000 GID=2000 PID=3240 b tail=0 logMask=99 pid=0 start=0ns deadline=0ns  (logd)",
+    "W(    0) SocketClient: write error (Connection reset by peer)  (logd)"
+   ],
+   "stdout_total_lines": 9,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  }
+ ]
+}

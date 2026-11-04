@@ -1,0 +1,189 @@
+{
+ "id": "C12",
+ "title": "ANDROID_LOG_TAGS from the host environment",
+ "recorded_at": "2026-11-04T04:22:25+00:00",
+ "tool": "tools/device_probe.py",
+ "device": {
+  "ro.build.version.release": "7.0",
+  "ro.build.version.sdk": "24",
+  "ro.build.type": "userdebug",
+  "ro.product.cpu.abi": "x86_64",
+  "ro.build.fingerprint": "Android/sdk_google_phone_x86_64/generic_x86_64:7.0/NYC/6696031:userdebug/dev-keys",
+  "persist.sys.timezone": "Etc/UTC",
+  "serial": "emulator-5556",
+  "adb_client": "Version 37.0.1-15733141"
+ },
+ "facts": {
+  "tags_silent": {
+   "lines": 0,
+   "distinct_tags": 0,
+   "top_tags": {}
+  },
+  "tags_logpyt_only": {
+   "lines": 2,
+   "distinct_tags": 1,
+   "top_tags": {
+    "logpyt": 2
+   }
+  },
+  "tags_removed": {
+   "lines": 663,
+   "distinct_tags": 61,
+   "top_tags": {
+    "GmsNativeLibraryLoader": 267,
+    "YouTube": 47,
+    "MS_RegisterService": 45,
+    "IccSmsInterfaceManager": 30,
+    "Conscrypt": 24
+   }
+  },
+  "tags_silent_with_filterspec": {
+   "lines": 663,
+   "distinct_tags": 61,
+   "top_tags": {
+    "GmsNativeLibraryLoader": 267,
+    "YouTube": 47,
+    "MS_RegisterService": 45,
+    "IccSmsInterfaceManager": 30,
+    "Conscrypt": 24
+   }
+  }
+ },
+ "notes": [],
+ "steps": [
+  {
+   "name": "log_t",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "log -t logpyt lp-tags-8aacd936"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.01,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "tags_silent",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-t",
+    "300",
+    "-v",
+    "threadtime"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.01,
+   "stdout": [
+    "--------- beginning of main",
+    "--------- beginning of system"
+   ],
+   "stdout_total_lines": 2,
+   "stdout_clipped_lines": 0,
+   "stderr": [],
+   "env": {
+    "ANDROID_LOG_TAGS": "*:S"
+   }
+  },
+  {
+   "name": "tags_logpyt_only",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-t",
+    "300",
+    "-v",
+    "threadtime"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.011,
+   "stdout": [
+    "--------- beginning of main",
+    "--------- beginning of system",
+    "11-04 04:22:29.968  3421  3421 I logpyt  : lp-mark-8aacd936 ",
+    "11-04 04:22:30.025  3432  3432 I logpyt  : lp-tags-8aacd936 "
+   ],
+   "stdout_total_lines": 4,
+   "stdout_clipped_lines": 0,
+   "stderr": [],
+   "env": {
+    "ANDROID_LOG_TAGS": "logpyt:V *:S"
+   }
+  },
+  {
+   "name": "tags_removed",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-t",
+    "300",
+    "-v",
+    "threadtime"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.009,
+   "stdout": [
+    "--------- beginning of main",
+    "11-04 04:21:55.280  1833  1954 D IccSmsInterfaceManager: [IccSmsInterfaceManager] Failed to add cdma broadcast subscription for MID range 4097 to 4097 from client com.android.cellbroadcastreceiver",
+    "11-04 04:21:55.287  2236  2553 I Checkin : [EventLogChimeraService] Opted in for usage reporting: false",
+    "11-04 04:21:55.287  2236  2553 I Checkin : [EventLogChimeraService] Accumulating logs since 1793766113711",
+    "11-04 04:21:55.291  1833  1954 D IccSmsInterfaceManager: [IccSmsInterfaceManager] Calling setCdmaBroadcastConfig with 1 configurations"
+   ],
+   "stdout_total_lines": 665,
+   "stdout_clipped_lines": 0,
+   "stderr": [],
+   "env": {
+    "ANDROID_LOG_TAGS": null
+   }
+  },
+  {
+   "name": "tags_silent_with_filterspec",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-t",
+    "300",
+    "-v",
+    "threadtime",
+    "*:V"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.011,
+   "stdout": [
+    "--------- beginning of main",
+    "11-04 04:21:55.280  1833  1954 D IccSmsInterfaceManager: [IccSmsInterfaceManager] Failed to add cdma broadcast subscription for MID range 4097 to 4097 from client com.android.cellbroadcastreceiver",
+    "11-04 04:21:55.287  2236  2553 I Checkin : [EventLogChimeraService] Opted in for usage reporting: false",
+    "11-04 04:21:55.287  2236  2553 I Checkin : [EventLogChimeraService] Accumulating logs since 1793766113711",
+    "11-04 04:21:55.291  1833  1954 D IccSmsInterfaceManager: [IccSmsInterfaceManager] Calling setCdmaBroadcastConfig with 1 configurations"
+   ],
+   "stdout_total_lines": 665,
+   "stdout_clipped_lines": 0,
+   "stderr": [],
+   "env": {
+    "ANDROID_LOG_TAGS": "*:S"
+   }
+  }
+ ]
+}
