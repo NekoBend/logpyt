@@ -170,6 +170,120 @@ def test_errors_survive_pickle_and_copy_with_attributes_and_notes(
     assert restored.__notes__ == ["seen by test"]
 
 
+class _KeywordOnlyError(Exception):
+    """Pickles, but cannot unpickle: ``__init__`` takes no positional args."""
+
+    def __init__(self, *, code: int) -> None:
+        super().__init__(f"code {code}")
+
+
+def _raised(
+    error: LogpytError,
+    *,
+    cause: BaseException | None,
+    context: Exception | None = None,
+) -> LogpytError:
+    """Raise ``error`` from ``cause``, while handling ``context`` if given."""
+    try:
+        if context is not None:
+            try:
+                raise context
+            except type(context):
+                raise error from cause
+        raise error from cause
+    except LogpytError as caught:
+        return caught
+
+
+@pytest.mark.parametrize("make", _MAKERS, ids=[e.__name__ for e in NEW_ERRORS])
+@pytest.mark.parametrize("clone", _CLONES, ids=["pickle", "copy", "deepcopy"])
+def test_errors_survive_pickle_and_copy_with_their_cause(
+    make: Callable[[], LogpytError], clone: Callable[[LogpytError], LogpytError]
+) -> None:
+    error = _raised(make(), cause=ValueError("x"))
+    error.add_note("seen by test")
+    restored = clone(error)
+    assert type(restored.__cause__) is ValueError
+    assert str(restored.__cause__) == "x"
+    assert restored.__context__ is None
+    assert restored.__suppress_context__ is True
+    assert vars(restored) == vars(error)
+    assert restored.__notes__ == ["seen by test"]
+
+
+@pytest.mark.parametrize("make", _MAKERS, ids=[e.__name__ for e in NEW_ERRORS])
+@pytest.mark.parametrize("clone", _CLONES, ids=["pickle", "copy", "deepcopy"])
+def test_errors_survive_pickle_and_copy_with_cause_and_context(
+    make: Callable[[], LogpytError], clone: Callable[[LogpytError], LogpytError]
+) -> None:
+    restored = clone(_raised(make(), cause=ValueError("x"), context=KeyError("k")))
+    assert type(restored.__cause__) is ValueError
+    assert str(restored.__cause__) == "x"
+    assert type(restored.__context__) is KeyError
+    assert restored.__context__.args == ("k",)
+    assert restored.__suppress_context__ is True
+
+
+@pytest.mark.parametrize("make", _MAKERS, ids=[e.__name__ for e in NEW_ERRORS])
+@pytest.mark.parametrize("clone", _CLONES, ids=["pickle", "copy", "deepcopy"])
+def test_errors_survive_pickle_and_copy_raised_from_none(
+    make: Callable[[], LogpytError], clone: Callable[[LogpytError], LogpytError]
+) -> None:
+    restored = clone(_raised(make(), cause=None, context=KeyError("k")))
+    assert restored.__cause__ is None
+    assert type(restored.__context__) is KeyError
+    assert restored.__suppress_context__ is True
+
+
+@pytest.mark.parametrize("make", _MAKERS, ids=[e.__name__ for e in NEW_ERRORS])
+@pytest.mark.parametrize("clone", _CLONES, ids=["pickle", "copy", "deepcopy"])
+def test_errors_survive_pickle_and_copy_with_an_implicit_context(
+    make: Callable[[], LogpytError], clone: Callable[[LogpytError], LogpytError]
+) -> None:
+    error = make()
+    try:
+        try:
+            raise KeyError("k")
+        except KeyError:
+            raise error  # noqa: B904  the implicit chain under test
+    except LogpytError as caught:
+        restored = clone(caught)
+    assert restored.__cause__ is None
+    assert type(restored.__context__) is KeyError
+    assert restored.__suppress_context__ is False
+
+
+@pytest.mark.parametrize("clone", _CLONES, ids=["pickle", "copy", "deepcopy"])
+def test_a_cause_that_is_also_the_context_stays_one_object(
+    clone: Callable[[LogpytError], LogpytError],
+) -> None:
+    error = CallbackError("on_item raised", stage="on_item", stats=_STATS)
+    cause = ZeroDivisionError("boom")
+    restored = clone(_raised(error, cause=cause, context=cause))
+    assert type(restored.__cause__) is ZeroDivisionError
+    assert restored.__cause__ is restored.__context__
+
+
+@pytest.mark.parametrize("clone", _CLONES, ids=["pickle", "copy", "deepcopy"])
+def test_a_link_that_does_not_survive_pickling_is_left_out(
+    clone: Callable[[LogpytError], LogpytError],
+) -> None:
+    class LocalError(Exception):
+        """Cannot pickle: a local class has no importable name."""
+
+    error = _raised(
+        CallbackError("on_item raised", stage="on_item", stats=_STATS),
+        cause=_KeywordOnlyError(code=5),
+        context=LocalError("local"),
+    )
+    restored = clone(error)
+    assert type(restored) is CallbackError
+    assert restored.__cause__ is None
+    assert restored.__context__ is None
+    assert restored.__suppress_context__ is True
+    assert vars(restored) == vars(error)
+
+
 @pytest.mark.parametrize(
     ("name", "module"),
     [

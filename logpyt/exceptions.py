@@ -8,7 +8,8 @@ The driver rewrites switch to the 3.0 classes and the last one deletes the 2.x o
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+import pickle  # noqa: S403  only round-trips objects this process holds
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -98,11 +99,29 @@ def _restore_error[E: LogpytError](cls: type[E], args: tuple[object, ...]) -> E:
     return cls.__new__(cls, *args)
 
 
+def _portable(link: BaseException | None) -> BaseException | None:
+    """Return ``link`` when it survives a pickle round-trip, else None.
+
+    A chained exception can come from user code and fail to pickle or to
+    unpickle (a local class, a keyword-only ``__init__``); leaving it out
+    keeps the error itself picklable.
+    """
+    if link is None:
+        return None
+    try:
+        pickle.loads(pickle.dumps(link))  # noqa: S301  bytes made one line above
+    except Exception:  # noqa: BLE001  any failure means the link does not travel
+        return None
+    return link
+
+
 class LogpytError(Exception):
     """Base class of every error logpyt raises on purpose.
 
-    Instances pickle and copy with all their attributes and notes, although the
-    subclasses take keyword-only constructor arguments.
+    Instances pickle and copy with all their attributes and notes, and with
+    ``__cause__``, ``__context__`` and ``__suppress_context__``, although the
+    subclasses take keyword-only constructor arguments. A cause or context
+    that does not survive pickling is left out; the traceback never travels.
     """
 
     def __reduce__(
@@ -110,10 +129,35 @@ class LogpytError(Exception):
     ) -> tuple[
         Callable[[type[LogpytError], tuple[object, ...]], LogpytError],
         tuple[type[LogpytError], tuple[object, ...]],
-        dict[str, object],
+        dict[str, Any],
     ]:
-        """Pickle as (class, args) plus the attribute dict, bypassing ``__init__``."""
-        return (_restore_error, (type(self), self.args), self.__dict__)
+        """Pickle as (class, args) plus the attributes and the chaining state.
+
+        ``BaseException.__reduce__`` keeps only the attribute dict, so a copy
+        would lose the exception chain; ``__init__`` is bypassed.
+        """
+        state: dict[str, Any] = {
+            **self.__dict__,
+            "__cause__": _portable(self.__cause__),
+            "__context__": _portable(self.__context__),
+            "__suppress_context__": self.__suppress_context__,
+        }
+        return (_restore_error, (type(self), self.args), state)
+
+    def __setstate__(self, state: dict[str, Any] | None, /) -> None:
+        """Restore what `__reduce__` saved, ``__suppress_context__`` last.
+
+        Assigning ``__cause__`` sets ``__suppress_context__`` to True, so the
+        saved flag is applied after it, whatever the order of ``state``.
+        """
+        if state is None:
+            return
+        fields = dict(state)
+        suppress_context = fields.pop("__suppress_context__", None)
+        for name, value in fields.items():
+            setattr(self, name, value)
+        if suppress_context is not None:
+            self.__suppress_context__ = suppress_context
 
 
 class UsageError(LogpytError, RuntimeError):
