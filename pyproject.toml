@@ -1,6 +1,6 @@
 [project]
 name = "logpyt"
-version = "2.0.0"
+dynamic = ["version"]
 description = "Structured logging toolkit around Android logcat streams"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -24,6 +24,9 @@ classifiers = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.version]
+path = "logpyt/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["logpyt"]
 
@@ -40,6 +43,12 @@ dev = [
 asyncio_mode = "strict"
 markers = [
     "device: needs a live device or emulator (LOGPYT_DEVICE=<serial>, adb server on 127.0.0.1:5037); skipped otherwise",
+]
+# An exception that escapes a library thread or a __del__ must fail the test
+# that caused it, not scroll by as a warning.
+filterwarnings = [
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
+    "error::pytest.PytestUnraisableExceptionWarning",
 ]
 
 [tool.ruff.lint]
