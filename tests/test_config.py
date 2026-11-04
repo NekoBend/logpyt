@@ -363,6 +363,7 @@ def test_adb_path_and_serial_keep_their_value() -> None:
         ("-b", "all"),
         ("--pid=1234",),
         ("--pid", "1234"),
+        ("--pid=2147483647",),
         ("-e", "FATAL|ANR"),
         ("-eFATAL",),
         ("--regex", "x"),
@@ -385,6 +386,12 @@ def test_adb_path_and_serial_keep_their_value() -> None:
         ("-s", "MyApp:V"),
         ("MyApp:V", "-b", "crash"),
         ("-b", "crash", "-b", "main", "-D", "-s", "Tag:W"),
+        # Numeric priorities, as filterCharToPri maps them on the device.
+        ("Tag:5",),
+        ("*:1",),
+        ("A:1 B:2,C:3\tD:4",),
+        ("A:6,B:7 C:8\tD:9",),
+        ("*:9", "Tag:7"),
     ],
 )
 def test_whitelisted_logcat_args_are_accepted(args: tuple[str, ...]) -> None:
@@ -464,6 +471,7 @@ def test_other_options_and_spellings_are_rejected(arg: str) -> None:
 @pytest.mark.parametrize("arg", ["-b", "--buffer", "-e", "--regex", "--pid"])
 def test_value_options_without_a_value_are_rejected(arg: str) -> None:
     _rejects(lambda: StreamConfig(logcat_args=(arg,)), "needs a value")
+    _rejects(lambda: StreamConfig(logcat_args=("-s", arg)), "needs a value")
 
 
 @pytest.mark.parametrize(
@@ -482,16 +490,39 @@ def test_unknown_buffer_names_are_rejected(args: tuple[str, ...]) -> None:
 
 
 @pytest.mark.parametrize("args", [("-e", ""), ("--regex", ""), ("--regex=",)])
-def test_empty_regex_is_rejected(args: tuple[str, ...]) -> None:
-    _rejects(lambda: StreamConfig(logcat_args=args), "non-empty regular expression")
+def test_an_explicitly_empty_regex_is_accepted(args: tuple[str, ...]) -> None:
+    # logcat hands any pattern to pcrecpp::RE, and the empty one matches every line.
+    assert StreamConfig(logcat_args=args).logcat_args == args
+    assert _parse_logcat_args(args).regex == ""
 
 
 @pytest.mark.parametrize(
-    "value", ["0", "-1", "abc", "0123", "0x1f", "", " 12", "12 ", "+12", "1.5"]
+    "value",
+    [
+        *("0", "00", "-1", "-0", "abc", "", " 12", "12 ", "12\n", "1.5", "1e3"),
+        # Spellings strtoll(..., 0) reads on the device, refused on purpose.
+        *("+12", "+1234", "0x1f", "0x4d2", "0X4D2", "0123", "01234"),
+        "\uff11\uff12",  # full-width digits, which int() would read
+    ],
 )
 def test_pid_must_be_a_plain_decimal_of_at_least_one(value: str) -> None:
-    _rejects(lambda: StreamConfig(logcat_args=(f"--pid={value}",)), "decimal pid")
-    _rejects(lambda: StreamConfig(logcat_args=("--pid", value)), "decimal pid")
+    match = "only a plain decimal pid"
+    _rejects(lambda: StreamConfig(logcat_args=(f"--pid={value}",)), match)
+    _rejects(lambda: StreamConfig(logcat_args=("--pid", value)), match)
+
+
+@pytest.mark.parametrize(
+    "value", ["2147483648", "4294967296", "9223372036854775808", "9" * 5000]
+)
+def test_pid_above_the_32_bit_pid_t_range_is_rejected(value: str) -> None:
+    match = "out of range: a plain decimal pid is from 1 to 2147483647"
+    _rejects(lambda: StreamConfig(logcat_args=(f"--pid={value}",)), match)
+    _rejects(lambda: StreamConfig(logcat_args=("--pid", value)), match)
+
+
+@pytest.mark.parametrize("args", [("--pid=2147483647",), ("--pid", "2147483647")])
+def test_pid_accepts_the_largest_32_bit_pid(args: tuple[str, ...]) -> None:
+    assert _parse_logcat_args(args).pid == 2**31 - 1
 
 
 @pytest.mark.parametrize("arg", ["", " ", " , ", "\t,"])
@@ -500,14 +531,29 @@ def test_filterspec_without_a_rule_is_rejected(arg: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "arg", [":V", "Tag:", "Tag:X", "Tag:VV", "Tag:5", "Tag:V:x", "A:I B:Q", "A:I,:D"]
+    "arg",
+    [
+        *(":V", "Tag:", "Tag:X", "Tag:V:x", "A:I B:Q", "A:I,:D"),
+        # Priority characters logcat refuses: "0" is ANDROID_LOG_UNKNOWN.
+        *("Tag:0", "*:0", "A:I B:0", "Tag:-", "Tag:+", "Tag:\u0665"),
+        # logcat ignores what follows the priority character; logpyt refuses it.
+        *("Tag:VV", "Tag:10", "Tag:5x"),
+    ],
 )
 def test_malformed_filterspec_rules_are_rejected(arg: str) -> None:
     _rejects(lambda: StreamConfig(logcat_args=(arg,)), "is not tag\\[:priority\\]")
 
 
+def test_malformed_filterspec_message_lists_the_numeric_priorities() -> None:
+    _rejects(lambda: StreamConfig(logcat_args=("Tag:0",)), "\\* or a digit 1-9")
+
+
 @pytest.mark.parametrize(
-    "arg", ["logpyt", "logpyt:S", "logpyt:V", "A:I logpyt:V", "logpyt:s,*:S"]
+    "arg",
+    [
+        *("logpyt", "logpyt:S", "logpyt:V", "A:I logpyt:V", "logpyt:s,*:S"),
+        *("logpyt:1", "logpyt:5", "*:9 logpyt:8"),
+    ],
 )
 def test_filterspec_naming_the_marker_tag_is_rejected(arg: str) -> None:
     _rejects(lambda: StreamConfig(logcat_args=(arg,)), "reserved")
@@ -594,6 +640,8 @@ def test_a_separate_value_is_taken_verbatim_even_with_a_dash() -> None:
     [
         (("--pid=7",), ("--pid=",)),
         (("-e", "x"), ("-e/--regex",)),
+        (("-e", ""), ("-e/--regex",)),
+        (("--regex=",), ("-e/--regex",)),
         (("-b", "crash"), ("a -b set without main",)),
         (
             ("--pid=7", "--regex=x", "-b", "events"),
@@ -680,6 +728,43 @@ def test_since_rejects_a_number_from_json(since: str) -> None:
     )
 
 
+# pydantic reads the forms with a decimal point as epoch seconds ("1.0e2" is
+# 1970-01-01T00:01:40Z) and refuses the others with a vaguer message.
+EXPONENT_STRINGS = [
+    *("1e2", "1E2", "1e+2", "1E-3", "+1e2", "-1e2"),
+    *("1.0e2", "1.e2", ".1e3", "1.0E+2", "1.0e-2", "+1.0e2", "-1.0e2", "+.1E3"),
+    "1.7937604966e9",
+]
+
+
+@pytest.mark.parametrize(
+    "since", [*EXPONENT_STRINGS, *(text.encode() for text in EXPONENT_STRINGS)]
+)
+@pytest.mark.parametrize(
+    "make", [StreamConfig, _config], ids=["constructor", "model_validate"]
+)
+def test_since_rejects_numbers_in_exponent_notation(
+    make: Callable[..., StreamConfig], since: str | bytes
+) -> None:
+    _rejects(lambda: make(since=since), "not the number")
+
+
+@pytest.mark.parametrize("since", EXPONENT_STRINGS)
+def test_since_rejects_exponent_strings_from_json(since: str) -> None:
+    _rejects(
+        lambda: StreamConfig.model_validate_json(f'{{"since": "{since}"}}'),
+        "not the number",
+    )
+
+
+@pytest.mark.parametrize("since", ["1e2", "1E-3", "1.0e2", "-1.0e2", "1.7937604966e9"])
+def test_since_rejects_exponent_numbers_from_json(since: str) -> None:
+    _rejects(
+        lambda: StreamConfig.model_validate_json(f'{{"since": {since}}}'),
+        "not the number",
+    )
+
+
 @pytest.mark.parametrize(
     "since",
     [
@@ -701,6 +786,10 @@ def test_since_outside_the_logcat_epoch_range_is_rejected(since: datetime) -> No
         ("--regex=x",),
         ("-b", "crash"),
         ("--buffer=events", "-b", "system"),
+        # An empty regex counts too: the rule does not look at the pattern.
+        ("-e", ""),
+        ("--regex=",),
+        ("--regex", ""),
     ],
 )
 def test_since_now_rejects_args_that_hide_the_start_marker(

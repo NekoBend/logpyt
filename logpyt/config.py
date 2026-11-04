@@ -44,15 +44,19 @@ _BUFFER_NAMES = frozenset(
 _DEFAULT_BUFFERS = frozenset({"main", "system", "crash"})
 _BUFFER_GROUPS = {"default": _DEFAULT_BUFFERS, "all": _BUFFER_NAMES}
 
-# One filter rule: a tag up to the first ":", then an optional priority letter
-# (android_log_addFilterRule in logprint.c). The device would also accept digits
-# and ignore anything after the letter; both are rejected here as typos.
-_FILTER_RULE = re.compile(r"(?P<tag>[^:]+)(?::(?P<priority>[VDIWEFSvdiwefs*]))?")
+# One filter rule: a tag up to the first ":", then an optional priority character
+# (android_log_addFilterRule, nougat-release-logprint.c:347-366). filterCharToPri
+# (logprint.c:93-126) takes the letters in either case, "*", and the digits 1-9:
+# 1-7 are the android_LogPriority of that value (5 is WARN), 8 and 9 VERBOSE, while
+# 0 is ANDROID_LOG_UNKNOWN, which the rule refuses. The device ignores anything
+# after the priority character; logpyt rejects it as a typo.
+_FILTER_RULE = re.compile(r"(?P<tag>[^:]+)(?::(?P<priority>[VDIWEFSvdiwefs*1-9]))?")
 # android_log_addFilterString splits one argument on these characters.
 _FILTER_SEPARATORS = re.compile(r"[ \t,]")
-# --pid goes through strtoll(..., 0) on the device, so a leading 0 would make
-# the number octal; only plain decimal numbers >= 1 are accepted.
+# --pid takes one spelling only, plain decimal (see _parse_pid), up to the
+# largest 32-bit pid_t.
 _PID = re.compile(r"[1-9][0-9]*")
+_PID_MAX = 2**31 - 1
 
 _ALLOWED = "-b/--buffer, --pid=, -e/--regex, -s, -D and filterspecs"
 # The whitelisted spellings that take a value.
@@ -70,8 +74,10 @@ _OWNED_OPTIONS = {
 # logcat -T takes epoch seconds, which its log_time keeps in 32 unsigned bits.
 _SINCE_MIN = datetime(1970, 1, 1, tzinfo=UTC)
 _SINCE_END = _SINCE_MIN + timedelta(seconds=2**32)
-# The strings pydantic's lax datetime parsing reads as epoch seconds.
-_EPOCH_STRING = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)")
+# The numeric strings since= refuses: what pydantic's lax datetime parsing reads
+# as epoch seconds ("100", "1.5", "1.0e2", ".1e3"), plus the exponent forms
+# without a decimal point ("1e2"), which pydantic refuses with a vaguer message.
+_EPOCH_STRING = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +88,8 @@ class _LogcatArgs:
         buffers: The buffers logcat reads, with "default" and "all" expanded;
             logcat's own default set when no ``-b`` is given.
         pid: The ``--pid`` value (the last one wins, as on the device).
-        regex: The ``-e``/``--regex`` value (the last one wins).
+        regex: The ``-e``/``--regex`` value (the last one wins); an empty
+            pattern is kept as ``""``, which matches every line.
         filtered: A filterspec or ``-s`` is present, so the argv builder must
             append ``logpyt:V`` for the markers to pass (section 5.6).
     """
@@ -97,7 +104,9 @@ class _LogcatArgs:
 
         A marker is written to the main buffer by a short-lived ``log``
         process (design section 5.6), so a ``--pid``, a ``--regex`` or a
-        buffer set without main hides it. Empty when the markers are readable.
+        buffer set without main can hide it. Any regex counts, the empty one
+        included: the rule of design section 2.2 does not look at the
+        pattern. Empty when the markers are readable.
         """
         hidden_by: list[str] = []
         if self.pid is not None:
@@ -132,7 +141,7 @@ def _check_filterspec(arg: str) -> None:
         if match is None:
             msg = (
                 f"logcat_args: filterspec rule {rule!r} is not tag[:priority] with "
-                "priority one of V, D, I, W, E, F, S or *"
+                "priority one of V, D, I, W, E, F, S (either case), * or a digit 1-9"
             )
             raise ValueError(msg)
         if match["tag"] == _MARKER_TAG:
@@ -170,7 +179,9 @@ def _parse_logcat_args(args: Sequence[str]) -> _LogcatArgs:
             if name in {"-b", "--buffer"}:
                 buffers |= _parse_buffer(arg, value)
             elif name in {"-e", "--regex"}:
-                regex = _parse_regex(arg, value)
+                # Any pattern, the empty one included: logcat hands it to
+                # pcrecpp::RE unchecked (n-logcat.cpp:701-702).
+                regex = value
             else:
                 pid = _parse_pid(value)
     return _LogcatArgs(
@@ -219,26 +230,31 @@ def _parse_buffer(arg: str, value: str) -> frozenset[str]:
     raise ValueError(msg)
 
 
-def _parse_regex(arg: str, value: str) -> str:
-    """Return a ``-e``/``--regex`` value.
-
-    Raises:
-        ValueError: The value is empty.
-    """
-    if not value:
-        msg = f"logcat_args: {arg} needs a non-empty regular expression"
-        raise ValueError(msg)
-    return value
-
-
 def _parse_pid(value: str) -> int:
-    """Return a ``--pid`` value.
+    """Return a ``--pid`` value: a plain decimal number from 1 to 2**31 - 1.
+
+    Plain decimal is the only spelling on purpose. logcat reads the value with
+    ``strtoll(..., 0)`` (n-logcat.cpp:397-417, 618-623), which would also take a
+    sign and ``0x`` hex, and would read ``0123`` as octal 83; one unambiguous
+    spelling reads the same to a human, to logpyt and to the device. The bound
+    is the largest pid_t, which is 32 bits on Android: logcat itself refuses
+    only what overflows ``strtoll`` and hands the value on to liblog as a pid.
 
     Raises:
-        ValueError: The value is not a plain decimal number >= 1.
+        ValueError: The value is not plain decimal, or is outside 1 to 2**31 - 1.
     """
     if _PID.fullmatch(value) is None:
-        msg = f"logcat_args: --pid needs a decimal pid >= 1, got {value!r}"
+        msg = (
+            f"logcat_args: --pid takes only a plain decimal pid (no sign, no "
+            f"leading zero, no 0x) from 1 to {_PID_MAX}, got {value!r}"
+        )
+        raise ValueError(msg)
+    # The length check keeps int() off strings past its digit limit.
+    if len(value) > len(str(_PID_MAX)) or int(value) > _PID_MAX:
+        msg = (
+            f"logcat_args: --pid {value} is out of range: a plain decimal pid is "
+            f"from 1 to {_PID_MAX} (pid_t is 32 bits on Android)"
+        )
         raise ValueError(msg)
     return int(value)
 
@@ -347,7 +363,8 @@ class StreamConfig(
             and the tag ``logpyt`` is reserved for its markers.
         since: Where the first connection starts: the device backlog, ``"now"``
             (exact, by a start marker), or an aware datetime. A number or a
-            string of digits is rejected, not read as epoch seconds.
+            numeric string (``"100"``, ``"1.5"``, ``"1.0e2"``, also as bytes)
+            is rejected, not read as epoch seconds.
         read_timeout: Seconds without bytes on stdout or stderr while RUNNING
             before the connection counts as dead; None disables the check.
         connect_timeout: Seconds a new connection may stay silent before logpyt
@@ -410,8 +427,9 @@ class StreamConfig(
     @field_validator("since", mode="before")
     @classmethod
     def _refuse_number(cls, value: object) -> object:
-        # pydantic's lax datetime parsing reads a number or a string of digits as
-        # epoch seconds, so since=100 would start in 1970 instead of failing.
+        # pydantic's lax datetime parsing reads a number or a numeric string
+        # (_EPOCH_STRING) as epoch seconds, so since=100 would start in 1970
+        # instead of failing.
         # A bool is left to _reject_bool, which names it.
         text = value.decode("latin-1") if isinstance(value, bytes) else value
         is_number = isinstance(value, Number) and not isinstance(value, bool)
@@ -477,7 +495,7 @@ class StreamConfig(
             if hidden_by:
                 msg = (
                     'since="now" needs its start marker, which '
-                    f"{' and '.join(hidden_by)} in logcat_args would hide; "
+                    f"{' and '.join(hidden_by)} in logcat_args can hide; "
                     'remove it or use since="backlog" or an aware datetime'
                 )
                 raise ValueError(msg)
