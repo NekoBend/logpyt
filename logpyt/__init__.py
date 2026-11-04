@@ -46,7 +46,21 @@ from .exceptions import (
     UsageError,
 )
 from .exporters import export_logs
-from .filters import AdvancedFilter, Filter
+from .filters import (
+    And,
+    AnrCondition,
+    Condition,
+    CrashCondition,
+    Filter,
+    Level,
+    MessageContains,
+    MinLevel,
+    Not,
+    Or,
+    Package,
+    Tag,
+    Where,
+)
 from .groupers import LogGrouper, WindowedLogGrouper
 from .models import LogEntry
 from .parsers import LogParser, ThreadTimeLogParser
@@ -62,13 +76,17 @@ from .utils import enable_debug
 __all__ = [
     "AdbError",
     "AdbExitError",
-    "AdvancedFilter",
+    "And",
+    "AnrCondition",
     "AsyncLogStream",
     "AsyncStreamHandle",
     "CallbackError",
+    "Condition",
+    "CrashCondition",
     "Filter",
     "Gap",
     "IncompleteCaptureError",
+    "Level",
     "LogEntry",
     "LogFileReader",
     "LogGrouper",
@@ -81,6 +99,11 @@ __all__ = [
     "LogStreamStderrError",
     "LogStreamTimeoutError",
     "LogpytError",
+    "MessageContains",
+    "MinLevel",
+    "Not",
+    "Or",
+    "Package",
     "ReadTimeoutError",
     "Reconnect",
     "StateChange",
@@ -89,8 +112,10 @@ __all__ = [
     "StreamEvent",
     "StreamHandle",
     "StreamStats",
+    "Tag",
     "ThreadTimeLogParser",
     "UsageError",
+    "Where",
     "WindowedLogGrouper",
     "enable_debug",
     "export_logs",

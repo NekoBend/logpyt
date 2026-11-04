@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from logpyt import AdvancedFilter, AsyncLogStream, LogStreamError, LogStreamKilledError
+from logpyt import AsyncLogStream, LogStreamError, LogStreamKilledError
 from logpyt.filters import Condition
 from logpyt.streams import StreamState
 from tests.conftest import (
@@ -595,7 +595,7 @@ async def test_raising_on_state_starting_hook_does_not_strand_the_stream(
 class _ExplodingCondition(Condition):
     """A user condition that fails on one particular entry."""
 
-    def check(self, entry: LogEntry) -> bool:
+    def __call__(self, entry: LogEntry) -> bool:
         if entry.message == "m1":
             msg = "filter bug"
             raise ValueError(msg)
@@ -615,7 +615,7 @@ async def test_raising_filter_ends_the_stream(fake_adb: FakeAdb) -> None:
     """
     fake_adb.logcat(run(lines(3, threadtime("m{i}")), hang=True))
     rec = Recorder()
-    stream = _stream(rec, filter_by=AdvancedFilter(_ExplodingCondition()))
+    stream = _stream(rec, filter_by=_ExplodingCondition())
     try:
         await bounded(stream.start())
         outcome = await join_outcome(stream, timeout=PROMPT_END_TIMEOUT)

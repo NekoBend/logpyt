@@ -17,11 +17,25 @@ from typing import TYPE_CHECKING, Literal, assert_never, assert_type, overload
 from logpyt import (
     AdbError,
     AdbExitError,
+    And,
+    AnrCondition,
+    AsyncLogStream,
     CallbackError,
+    Condition,
+    CrashCondition,
+    Filter,
     Gap,
     IncompleteCaptureError,
+    Level,
     LogEntry,
+    LogFileReader,
     LogpytError,
+    LogStream,
+    MessageContains,
+    MinLevel,
+    Not,
+    Or,
+    Package,
     ReadTimeoutError,
     Reconnect,
     StateChange,
@@ -29,7 +43,10 @@ from logpyt import (
     StreamError,
     StreamEvent,
     StreamStats,
+    Tag,
     UsageError,
+    Where,
+    read_file,
 )
 from logpyt.adb import DeviceInfo, DeviceKind, list_devices, wait_for_device
 from logpyt.exceptions import CallbackStage
@@ -141,11 +158,60 @@ def check_adb_helpers() -> None:
     info.state = "offline"  # ty: ignore[invalid-assignment]
 
 
+def _is_error(entry: LogEntry) -> bool:
+    return entry.level == "E"
+
+
+def check_conditions(entry: LogEntry) -> None:
+    where = (Package("com.example") & MinLevel("warning")) | ~Tag(["a", "b"])
+    assert_type(where, Or)
+    assert_type(Tag("a") & Level("E"), And)
+    assert_type(~MessageContains("x"), Not)
+    assert_type(where(entry), bool)
+    assert_type(where.packages(), frozenset[str])
+    assert_type(Filter(package="com.example").conditions, tuple[Condition, ...])
+    as_and: And = Filter(tag="x", min_level="E")
+    as_condition: Condition = Where(_is_error)
+    crash: Condition = CrashCondition(package="com.example") | AnrCondition()
+    del as_and, as_condition, crash
+    Filter("com.example")  # ty: ignore[too-many-positional-arguments]
+    CrashCondition("AndroidRuntime")  # ty: ignore[too-many-positional-arguments]
+    AnrCondition(package=["com.example"])  # ty: ignore[invalid-argument-type]
+    MinLevel(["E"])  # ty: ignore[invalid-argument-type]
+    Where("E")  # ty: ignore[invalid-argument-type]
+    Tag("a") & _is_error  # ty: ignore[unsupported-operator]
+    And(Tag("a"), _is_error)  # ty: ignore[invalid-argument-type]
+
+
+class _RenamedParameter(Condition):
+    # Condition.__call__ takes the entry by position: an override may rename it.
+    def __call__(self, e: LogEntry) -> bool:
+        return e.level == "E"
+
+
+class _PositionalOnly(Condition):
+    def __call__(self, entry: LogEntry, /) -> bool:
+        return entry.level == "E"
+
+
+def check_custom_conditions(entry: LogEntry) -> None:
+    assert_type(_RenamedParameter()(entry), bool)
+    assert_type(_RenamedParameter() & _PositionalOnly(), And)
+    Tag("a")(entry=entry)  # ty: ignore[positional-only-parameter-as-kwarg]
+
+
+def check_filter_by_takes_any_condition() -> None:
+    # X-7: the 2.x entry points were annotated ``Filter | None``.
+    where = (Package("com.example") & Level("E")) | MessageContains("CRITICAL")
+    LogStream(filter_by=where)
+    AsyncLogStream(filter_by=CrashCondition(package="com.example"))
+    LogFileReader("app.log", filter_by=~Tag("noise"))
+    read_file("app.log", filter_by=Where(_is_error))
+    LogStream(filter_by=_is_error)  # ty: ignore[invalid-argument-type]
+    read_file("app.log", filter_by=_is_error)  # ty: ignore[invalid-argument-type]
+
+
 # -- the stream constructor overloads of design section 2.3, on a stand-in ----------
-
-
-class _Condition:
-    """Stands in for logpyt.Condition (PR-06)."""
 
 
 class _GroupBy:
@@ -165,7 +231,7 @@ class _StreamShape[T]:
         config: StreamConfig | None = None,
         /,
         *,
-        where: _Condition | None = None,
+        where: Condition | None = None,
         group_by: None = None,
         on_item: Callable[[LogEntry], object] | None = None,
         on_event: Callable[[StreamEvent], object] | None = None,
@@ -176,7 +242,7 @@ class _StreamShape[T]:
         config: StreamConfig | None = None,
         /,
         *,
-        where: _Condition | None = None,
+        where: Condition | None = None,
         group_by: _GroupBy,
         on_item: Callable[[_LogGroup], object] | None = None,
         on_event: Callable[[StreamEvent], object] | None = None,
@@ -186,7 +252,7 @@ class _StreamShape[T]:
         config: StreamConfig | None = None,
         /,
         *,
-        where: _Condition | None = None,
+        where: Condition | None = None,
         group_by: _GroupBy | None = None,
         on_item: Callable[[LogEntry], object]
         | Callable[[_LogGroup], object]
@@ -211,7 +277,7 @@ def check_stream_overloads() -> None:
         _StreamShape[LogEntry],
     )
     assert_type(
-        _StreamShape(where=_Condition(), on_event=events.append),
+        _StreamShape(where=Tag("x"), on_event=events.append),
         _StreamShape[LogEntry],
     )
     assert_type(_StreamShape(group_by=_GroupBy()), _StreamShape[_LogGroup])

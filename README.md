@@ -12,7 +12,7 @@ Structured logging toolkit around Android logcat streams.
 
 - Live `adb logcat` streaming - synchronous (`LogStream`) and asyncio (`AsyncLogStream`).
 - Multiple logcat format parsers: threadtime (default), brief, process, tag, raw.
-- Composable filtering: a simple `Filter` plus an `AdvancedFilter` DSL (`&`, `|`, `~`).
+- Composable filtering: conditions combined with `&`, `|`, `~`, plus a simple `Filter`.
 - Built-in crash / ANR detection and time-window grouping.
 - Offline log-file analysis and JSON / CSV export.
 
@@ -77,37 +77,39 @@ with LogStream(
 
 ### Filtering
 
-Use `Filter` for simple AND conditions, or `AdvancedFilter` for complex logic.
-The composable condition classes (`Tag`, `Level`, `Package`, `MessageContains`,
-`CrashCondition`, `AnrCondition`, and the `&` / `|` / `~` combinators) live in the
-`logpyt.filters` module; only `Filter` and `AdvancedFilter` are re-exported at the
-top level.
+Every condition (`Tag`, `Level`, `MinLevel`, `Package`, `MessageContains`,
+`CrashCondition`, `AnrCondition`, `Where`) is a filter, and conditions combine with
+`&`, `|` and `~`. `Filter` is the AND of keyword criteria. Levels are letters or
+names in any case (`"E"`, `"error"`, `"Warning"`); invalid values raise at once.
+A `Package` anywhere in the condition makes the stream resolve that package's pids.
 
 ```python
-from logpyt import LogStream
-from logpyt.filters import (
-    Filter, AdvancedFilter, Package, Tag, MessageContains,
-    CrashCondition, AnrCondition
+from logpyt import (
+    AnrCondition, CrashCondition, Filter, LogStream, MessageContains, MinLevel,
+    Package, Tag,
 )
 
 # Simple Filter (AND logic)
 simple_filter = Filter(
     package="com.example.app",
-    level=["E", "W"],
+    min_level="warning",
     tag="MyApp"
 )
 
-# Advanced Filter (DSL with &, |, ~)
-advanced_filter = AdvancedFilter(
+# Conditions combined with &, | and ~
+condition = (
     (Package("com.example.app") & Tag("MyApp"))
     | MessageContains("CRITICAL")
 )
 
-# Detect Crashes or ANRs
-crash_filter = AdvancedFilter(CrashCondition() | AnrCondition())
+# The app's crashes (Java and native) and ANRs, read from the lines' text:
+# no package attribution needed, so this also works on log files.
+crash_filter = (
+    CrashCondition(package="com.example.app") | AnrCondition(package="com.example.app")
+)
 
 with LogStream(
-    filter_by=advanced_filter,
+    filter_by=condition,
     # ... callbacks ...
 ) as stream:
     stream.join()
@@ -205,7 +207,7 @@ if __name__ == "__main__":
 - **`LogParser`**: Parses raw logcat lines into `LogEntry` objects.
 - **`LogStream` / `AsyncLogStream`**: Manages the ADB subprocess and dispatching of logs.
 - **`StreamHandle` / `AsyncStreamHandle`**: Safe handle to control the stream (stop, kill, pause, resume) from callbacks.
-- **`Filter` / `AdvancedFilter`**: Predicates to filter log entries.
+- **`Condition` / `Filter`**: Predicates to filter log entries (`&`, `|`, `~`).
 - **`LogGrouper`**: Groups consecutive logs based on keys and time thresholds.
 - **`logpyt.adb`**:
   - `resolve_adb()`: Finds the ADB executable.

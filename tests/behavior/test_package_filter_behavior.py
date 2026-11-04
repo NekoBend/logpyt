@@ -41,7 +41,6 @@ from typing import TYPE_CHECKING
 import pytest
 
 from logpyt import (
-    AdvancedFilter,
     AsyncLogStream,
     Filter,
     LogFileReader,
@@ -49,7 +48,7 @@ from logpyt import (
     ThreadTimeLogParser,
     read_file,
 )
-from logpyt.filters import Level, MessageContains, Package
+from logpyt.filters import Condition, Level, MessageContains, Package, Tag
 from tests.conftest import (
     FakeAdb,
     async_wait_until,
@@ -314,7 +313,7 @@ def _backoff_factor(*, backed_off: bool) -> float:
 
 
 def _start_sync(
-    filter_by: Filter | AdvancedFilter,
+    filter_by: Condition,
     collector: _Collector,
     *,
     parser: ThreadTimeLogParser | None = None,
@@ -324,9 +323,7 @@ def _start_sync(
     stream = LogStream(
         device_id=device_id,
         parser=parser,
-        # X-7: filter_by is annotated ``Filter | None`` although the README passes
-        # an AdvancedFilter, which works at runtime.
-        filter_by=filter_by,  # ty: ignore[invalid-argument-type]
+        filter_by=filter_by,
         stdout_callback=collector,
         pid_poll_interval=POLL_INTERVAL,
         pid_poll_backoff_factor=_backoff_factor(backed_off=backed_off),
@@ -337,7 +334,7 @@ def _start_sync(
 
 
 async def _start_async(
-    filter_by: Filter | AdvancedFilter,
+    filter_by: Condition,
     collector: _AsyncCollector,
     *,
     parser: ThreadTimeLogParser | None = None,
@@ -345,8 +342,7 @@ async def _start_async(
 ) -> AsyncLogStream:
     stream = AsyncLogStream(
         parser=parser,
-        # X-7: see _start_sync.
-        filter_by=filter_by,  # ty: ignore[invalid-argument-type]
+        filter_by=filter_by,
         stdout_callback=collector,
         pid_poll_interval=POLL_INTERVAL,
         pid_poll_backoff_factor=_backoff_factor(backed_off=backed_off),
@@ -620,17 +616,12 @@ def test_filter_package_delivers_only_that_packages_lines(fake_adb: FakeAdb) -> 
     assert collector.delivered() == [("mine 1", PACKAGE), ("mine 2", PACKAGE)]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="F5-1: PID lookup starts only for Filter; Package() in an "
-    "AdvancedFilter never matches a live line",
-)
 def test_advanced_filter_package_condition_delivers_that_packages_lines(
     fake_adb: FakeAdb,
 ) -> None:
-    """AdvancedFilter(Package(...)) delivers exactly the package's lines, each with
-    package set, like Filter(package=...) does (F5-1).
+    """A bare Package(...) condition delivers exactly the package's lines, each with
+    package set, like Filter(package=...) does (F5-1; 2.x wrapped it in the removed
+    AdvancedFilter).
     """
     _resolve_steadily(fake_adb)
     _logcat_until_parsed(
@@ -642,7 +633,7 @@ def test_advanced_filter_package_condition_delivers_that_packages_lines(
     )
     watcher = _ParseWatcher(FILLER)
     collector = _Collector()
-    stream = _start_sync(AdvancedFilter(Package(PACKAGE)), collector, parser=watcher)
+    stream = _start_sync(Package(PACKAGE), collector, parser=watcher)
     try:
         _unblock_if_never_looked_up(fake_adb)
         _end_logcat_once_parsed(fake_adb, watcher)
@@ -653,12 +644,6 @@ def test_advanced_filter_package_condition_delivers_that_packages_lines(
     assert collector.delivered() == [("mine 1", PACKAGE), ("mine 2", PACKAGE)]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="F5-1: PID lookup starts only for Filter; the Package() branch of "
-    "an AdvancedFilter never matches a live line",
-)
 def test_advanced_filter_package_combination_delivers_the_matching_lines(
     fake_adb: FakeAdb,
 ) -> None:
@@ -677,7 +662,7 @@ def test_advanced_filter_package_combination_delivers_the_matching_lines(
     watcher = _ParseWatcher(FILLER)
     collector = _Collector()
     condition = (Package(PACKAGE) & Level("E")) | MessageContains("CRITICAL")
-    stream = _start_sync(AdvancedFilter(condition), collector, parser=watcher)
+    stream = _start_sync(condition, collector, parser=watcher)
     try:
         _unblock_if_never_looked_up(fake_adb)
         _end_logcat_once_parsed(fake_adb, watcher)
@@ -686,6 +671,31 @@ def test_advanced_filter_package_combination_delivers_the_matching_lines(
         _shutdown(fake_adb, stream)
 
     assert collector.messages() == ["mine error", "theirs CRITICAL"]
+
+
+def test_package_under_not_in_an_or_is_looked_up(fake_adb: FakeAdb) -> None:
+    """A Package anywhere in the condition is looked up, here under Not inside an Or,
+    so the package's lines are attributed and left out (F5-1).
+    """
+    _resolve_steadily(fake_adb)
+    _logcat_until_parsed(
+        fake_adb,
+        wait("resolved"),
+        _line("mine"),
+        _line("theirs", pid=OTHER_PID),
+    )
+    watcher = _ParseWatcher(FILLER)
+    collector = _Collector()
+    stream = _start_sync(Tag("nothing") | ~Package(PACKAGE), collector, parser=watcher)
+    try:
+        _unblock_if_never_looked_up(fake_adb)
+        _end_logcat_once_parsed(fake_adb, watcher)
+        _join(stream)
+    finally:
+        _shutdown(fake_adb, stream)
+
+    assert {child.args[-1] for child in fake_adb.children("pidof")} == {PACKAGE}
+    assert collector.delivered() == [("theirs", None), (FILLER, None)]
 
 
 @pytest.mark.xfail(
@@ -819,12 +829,6 @@ def test_pid_lookup_queries_the_selected_device(fake_adb: FakeAdb) -> None:
     assert all(args[:2] == ("-s", serial) for args in lookups), lookups
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="F5-3: the package name reaches the device shell unquoted in "
-    "`adb shell pidof <package>`",
-)
 def test_package_name_with_shell_metacharacters_is_not_run_by_the_device(
     fake_adb: FakeAdb,
 ) -> None:
@@ -879,18 +883,13 @@ async def test_async_filter_package_delivers_only_that_packages_lines(
     assert collector.delivered() == [("mine 1", PACKAGE), ("mine 2", PACKAGE)]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="F5-1: PID lookup starts only for Filter; Package() in an "
-    "AdvancedFilter never matches a live line",
-)
 @pytest.mark.asyncio
 async def test_async_advanced_filter_package_condition_delivers_that_packages_lines(
     fake_adb: FakeAdb,
 ) -> None:
-    """AsyncLogStream with AdvancedFilter(Package(...)) delivers exactly the package's
-    lines, each with its package set, like Filter(package=...) does (F5-1).
+    """AsyncLogStream with a bare Package(...) condition delivers exactly the
+    package's lines, each with its package set, like Filter(package=...) does (F5-1;
+    2.x wrapped it in the removed AdvancedFilter).
     """
     _resolve_steadily(fake_adb)
     _logcat_until_parsed(
@@ -902,9 +901,7 @@ async def test_async_advanced_filter_package_condition_delivers_that_packages_li
     )
     watcher = _ParseWatcher(FILLER)
     collector = _AsyncCollector()
-    stream = await _start_async(
-        AdvancedFilter(Package(PACKAGE)), collector, parser=watcher
-    )
+    stream = await _start_async(Package(PACKAGE), collector, parser=watcher)
     try:
         await _unblock_if_never_looked_up_async(fake_adb)
         await _end_logcat_once_parsed_async(fake_adb, watcher)
@@ -1005,12 +1002,6 @@ async def test_async_restarted_app_is_picked_up_without_waiting_for_a_backed_off
     assert collector.messages() in _RESTART_DELIVERIES
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="F5-3: the package name reaches the device shell unquoted in "
-    "`adb shell pidof <package>`",
-)
 @pytest.mark.asyncio
 async def test_async_package_name_with_shell_metacharacters_is_not_run_by_the_device(
     fake_adb: FakeAdb,
@@ -1057,12 +1048,10 @@ def test_file_reader_package_filter_yields_nothing(tmp_path: Path) -> None:
 
 
 def test_read_file_package_condition_yields_nothing(tmp_path: Path) -> None:
-    """read_file with AdvancedFilter(Package(...)) yields no entries for the same reason
-    as Filter(package=...) (pinned; F5-4 is a docs item).
+    """read_file with a bare Package(...) condition yields no entries for the same
+    reason as Filter(package=...) (pinned; F5-4 is a docs item).
     """
     path = _write_log(tmp_path / "app.log")
-    package_filter = AdvancedFilter(Package(PACKAGE))
 
     assert [e.message for e in read_file(path)] == ["mine 1", "mine 2"]
-    # X-7: filter_by is annotated ``Filter | None``; AdvancedFilter works at runtime.
-    assert list(read_file(path, filter_by=package_filter)) == []  # ty: ignore[invalid-argument-type]
+    assert list(read_file(path, filter_by=Package(PACKAGE))) == []

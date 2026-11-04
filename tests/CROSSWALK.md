@@ -38,6 +38,14 @@ Rules:
 
 | old test id | replacement test id or reason |
 |---|---|
+| tests/test_filters.py::test_empty_conditions_are_no_constraint | tests/test_filters.py::test_empty_collection_raises |
+| tests/test_filters.py::test_filter_all_empty_criteria_passes_every_entry | tests/test_filters.py::test_filter_empty_collection_raises |
+| tests/test_filters.py::test_filter_empty_criterion_does_not_match_missing_field | tests/test_filters.py::test_filter_empty_collection_raises |
+| tests/test_filters.py::test_filter_empty_level_is_no_constraint | tests/test_filters.py::test_filter_empty_collection_raises |
+| tests/test_filters.py::test_filter_empty_message_contains_is_no_constraint | tests/test_filters.py::test_filter_empty_collection_raises |
+| tests/test_filters.py::test_filter_empty_package_is_no_constraint | tests/test_filters.py::test_filter_empty_collection_raises |
+| tests/test_filters.py::test_filter_empty_tag_is_no_constraint | tests/test_filters.py::test_filter_empty_collection_raises |
+| tests/test_filters.py::test_filter_non_empty_criterion_still_filters | tests/test_filters.py::test_filter_empty_collection_raises |
 | tests/test_parsers.py::test_log_parser_parse_common_override | tests/test_parsers.py::test_custom_parser_implements_the_protocol |
 | tests/test_parsers.py::test_log_parser_parse_stderr | API removed by decision D-9 |
 | tests/test_parsers.py::test_log_parser_parse_stdout | tests/test_parsers.py::test_unrecognised_line_becomes_unparsed_entry |
