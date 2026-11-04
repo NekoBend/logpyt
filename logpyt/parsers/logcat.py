@@ -206,12 +206,16 @@ class ThreadTimeLogParser:
 
 
 def _from_epoch(seconds: int, us: int, tzinfo: timezone | None) -> datetime | None:
-    """``-v epoch`` seconds as an aware datetime (UTC unless a zone is given)."""
+    """``-v epoch`` seconds as an aware datetime (UTC unless a zone is given).
+
+    None when the moment, or its wall clock in the given zone, is outside the
+    years 1..9999.
+    """
     try:
         moment = _EPOCH + timedelta(seconds=seconds, microseconds=us)
+        return moment if tzinfo is None else moment.astimezone(tzinfo)
     except OverflowError:
         return None
-    return moment if tzinfo is None else moment.astimezone(tzinfo)
 
 
 def _threadtime_timestamp(match: re.Match[str], ctx: ParseContext) -> datetime | None:

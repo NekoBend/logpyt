@@ -21,7 +21,8 @@ bounded (F8-1):
   grows with the depth, and the old scanner paid it for up to 4096 candidates.
   A run of adjacent brackets that are all that deep is skipped in one step.
 - A message with no more than ``_MAX_DEPTH`` brackets in total cannot nest
-  deeper, and its candidates go to the decoder directly. In any other message
+  deeper, and its candidates go to the decoder directly; what the decoder
+  reads counts against ``_MAX_WORK_CHARS`` as below. In any other message
   a depth check reads each candidate's strings and brackets (one token each)
   and hands the decoder only text it has read: up to the end of the value, up
   to the bracket that passes the depth limit, or up to a checkpoint. A
@@ -114,6 +115,39 @@ def _decode(doc: str, idx: int, work: _Work) -> tuple[bool, Any]:
         # ValueError: e.g. an integer over the digit limit (F8-2).
         # RecursionError: little stack left in the caller.
         return False, idx
+    return True, value
+
+
+def _decode_direct(text: str, start: int, work: _Work) -> tuple[bool, Any]:
+    """Decode the candidate at ``text[start]`` in place (no depth check needed).
+
+    The decoder reads up to the end of the value or up to its error position;
+    an error without a position (an integer over the digit limit) is charged
+    the rest of the text, which the decoder may have read.
+
+    Returns:
+        ``(True, value)``, or ``(False, position)`` with the position to resume
+        at, never before ``start + 1``.
+
+    Raises:
+        _BudgetExhaustedError: When the call's character budget is used up
+            before this decode.
+
+    """
+    if work.depth_chars + work.decoded_chars >= _MAX_WORK_CHARS:
+        raise _BudgetExhaustedError
+    work.decodes += 1
+    try:
+        value, end = _DECODER.raw_decode(text, start)
+    except json.JSONDecodeError as exc:
+        work.decoded_chars += exc.pos - start + 1
+        return False, max(start + 1, exc.pos)
+    except (ValueError, RecursionError):
+        # ValueError: e.g. an integer over the digit limit (F8-2).
+        # RecursionError: little stack left in the caller.
+        work.decoded_chars += len(text) - start
+        return False, start + 1
+    work.decoded_chars += end - start
     return True, value
 
 
@@ -267,9 +301,10 @@ def _extract(text: str, work: _Work) -> Any | None:  # noqa: ANN401  (arbitrary 
             except _BudgetExhaustedError:
                 return None
         else:
-            ok, result = _decode(text, start, work)
-            if not ok:
-                result = max(start + 1, result)
+            try:
+                ok, result = _decode_direct(text, start, work)
+            except _BudgetExhaustedError:
+                return None
         if ok:
             return result
         if result != _DEEP:

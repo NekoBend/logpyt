@@ -273,3 +273,28 @@ def test_empty_text_does_no_work() -> None:
     value, work = _run("no brackets at all")
     assert value is None
     assert work.candidates == 0
+
+
+def test_shallow_candidates_around_a_huge_integer_stay_in_the_work_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With at most _MAX_DEPTH brackets no depth check runs, but what the decoder
+    reads still counts (F8-1): an integer over the digit limit fails without a
+    position, and each candidate would read it again.
+    """
+    decode = json.JSONDecoder.raw_decode
+    seen: list[int] = []
+
+    def counting(self: json.JSONDecoder, s: str, idx: int = 0) -> tuple[object, int]:
+        seen.append(len(s) - idx)
+        return decode(self, s, idx)
+
+    monkeypatch.setattr(json.JSONDecoder, "raw_decode", counting)
+    text = "[" * _json._MAX_DEPTH + "1" * 900_000 + "]" * _json._MAX_DEPTH
+
+    value, work = _run(text)
+
+    assert value is None
+    assert len(seen) < _json._MAX_DEPTH
+    assert sum(seen) <= _json._MAX_WORK_CHARS + _json._MAX_SCAN_CHARS
+    assert work.decoded_chars >= sum(seen) - _json._MAX_SCAN_CHARS

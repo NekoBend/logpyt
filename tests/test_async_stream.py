@@ -957,3 +957,24 @@ async def test_async_join_timeout_is_nondestructive(
     release.set()
     await stream.stop()
     await stream.join(timeout=1.0)
+
+
+# A zoned threadtime line (an aware timestamp) and the divider logcat prints
+# before a buffer (an unparsed entry with a naive host-local timestamp).
+ZONED_LINE = "2026-11-04 04:21:44.870000 +0000  logd  1254  1254 I T: x\n"
+DIVIDER = "--------- beginning of crash\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["consecutive", "windowed"])
+async def test_grouping_takes_a_divider_after_a_zoned_line(
+    mock_resolve_adb, mode
+) -> None:
+    del mock_resolve_adb
+    stream = AsyncLogStream(group_keys=["tag"], group_interval=1000, group_mode=mode)
+
+    for line in (ZONED_LINE, DIVIDER, ZONED_LINE):
+        await stream._process_line(line, "stdout")
+
+    assert stream.group_by is not None
+    assert stream.group_by.flush()
