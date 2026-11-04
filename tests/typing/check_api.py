@@ -31,6 +31,7 @@ from logpyt import (
     StreamStats,
     UsageError,
 )
+from logpyt.adb import DeviceInfo, DeviceKind, list_devices, wait_for_device
 from logpyt.exceptions import CallbackStage
 from logpyt.streams._events import GapReason, IncompleteReason, StreamState
 
@@ -124,6 +125,20 @@ def check_errors(stats: StreamStats) -> None:
     ReadTimeoutError("silent")  # ty: ignore[missing-argument]
     as_timeout: TimeoutError = ReadTimeoutError("x", stats=stats)  # ty: ignore[invalid-assignment]
     del as_timeout
+
+
+def check_adb_helpers() -> None:
+    devices = list_devices()
+    assert_type(devices, list[DeviceInfo])
+    info = devices[0]
+    assert_type(info.kind, DeviceKind)
+    assert_type(info.transport_id, int | None)
+    assert_type(info.usb, str | None)
+    list_devices("emulator", adb_path="adb", timeout=None)
+    list_devices("device")  # ty: ignore[invalid-argument-type]
+    list_devices("usb", 5.0)  # ty: ignore[too-many-positional-arguments]
+    wait_for_device("emulator-5554", 5.0)  # ty: ignore[too-many-positional-arguments]
+    info.state = "offline"  # ty: ignore[invalid-assignment]
 
 
 # -- the stream constructor overloads of design section 2.3, on a stand-in ----------
