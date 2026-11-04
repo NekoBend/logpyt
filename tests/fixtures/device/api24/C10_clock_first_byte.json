@@ -1,0 +1,281 @@
+{
+ "id": "C10",
+ "title": "date +%s and +%s.%N; spawn to first byte",
+ "recorded_at": "2026-11-04T04:24:59+00:00",
+ "tool": "tools/device_probe.py",
+ "device": {
+  "ro.build.version.release": "7.0",
+  "ro.build.version.sdk": "24",
+  "ro.build.type": "userdebug",
+  "ro.product.cpu.abi": "x86_64",
+  "ro.build.fingerprint": "Android/sdk_google_phone_x86_64/generic_x86_64:7.0/NYC/6696031:userdebug/dev-keys",
+  "persist.sys.timezone": "Etc/UTC",
+  "serial": "emulator-5556",
+  "adb_client": "Version 37.0.1-15733141"
+ },
+ "facts": {
+  "date_s": "1793766304",
+  "device_minus_host_s": 4.2,
+  "date_s_N": "1793766304.N",
+  "date_N_supported": false,
+  "shell_true_s": [
+   0.006,
+   0.005,
+   0.005
+  ],
+  "spawn_to_first_byte_s": [
+   0.008,
+   0.012,
+   0.008
+  ],
+  "quiet_reader": {
+   "bytes_before_marker": 28,
+   "lines_before_marker": [
+    "--------- beginning of main"
+   ],
+   "marker_write_to_arrival_s": 0.02
+  }
+ },
+ "notes": [],
+ "steps": [
+  {
+   "name": "date_s",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "date +%s"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.008,
+   "stdout": [
+    "1793766304"
+   ],
+   "stdout_total_lines": 1,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "date_s_N",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "date +%s.%N"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.009,
+   "stdout": [
+    "1793766304.N"
+   ],
+   "stdout_total_lines": 1,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "shell_true_0",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "true"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.006,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "shell_true_1",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "true"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.005,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "shell_true_2",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "true"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.005,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "first_byte_0",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid"
+   ],
+   "rc": null,
+   "timed_out": true,
+   "elapsed_s": 0.052,
+   "stdout": [
+    "--------- beginning of main"
+   ],
+   "stdout_total_lines": 3803,
+   "stdout_clipped_lines": 0,
+   "stderr": [],
+   "live": true,
+   "first_byte_s": 0.008,
+   "bytes_read": 568013,
+   "lines_read": 3803
+  },
+  {
+   "name": "first_byte_1",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid"
+   ],
+   "rc": null,
+   "timed_out": true,
+   "elapsed_s": 0.052,
+   "stdout": [
+    "--------- beginning of main"
+   ],
+   "stdout_total_lines": 4194,
+   "stdout_clipped_lines": 0,
+   "stderr": [],
+   "live": true,
+   "first_byte_s": 0.012,
+   "bytes_read": 622371,
+   "lines_read": 4194
+  },
+  {
+   "name": "first_byte_2",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid"
+   ],
+   "rc": null,
+   "timed_out": true,
+   "elapsed_s": 0.052,
+   "stdout": [
+    "--------- beginning of main"
+   ],
+   "stdout_total_lines": 3916,
+   "stdout_clipped_lines": 0,
+   "stderr": [],
+   "live": true,
+   "first_byte_s": 0.008,
+   "bytes_read": 583385,
+   "lines_read": 3916
+  },
+  {
+   "name": "log_marker",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "log -t lpq3d7c4beb quiet-3d7c4beb"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.02,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "quiet_filter",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid",
+    "-T",
+    "1793766304.000000",
+    "-s",
+    "lpq3d7c4beb:V"
+   ],
+   "rc": null,
+   "timed_out": true,
+   "elapsed_s": 4.022,
+   "stdout": [
+    "--------- beginning of main",
+    "2026-11-04 04:25:08.816702 +0000 shell  3584  3584 I lpq3d7c4beb: quiet-3d7c4beb "
+   ],
+   "stdout_total_lines": 2,
+   "stdout_clipped_lines": 0,
+   "stderr": [],
+   "live": true,
+   "first_byte_s": 0.046,
+   "bytes_read": 110,
+   "lines_read": 2
+  }
+ ]
+}

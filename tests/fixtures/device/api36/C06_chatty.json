@@ -1,0 +1,124 @@
+{
+ "id": "C06",
+ "title": "chatty expire/identical notices: text, timestamp, backlog, resume",
+ "recorded_at": "2026-11-04T05:35:05+00:00",
+ "tool": "tools/device_probe.py",
+ "device": {
+  "ro.build.version.release": "16",
+  "ro.build.version.sdk": "36",
+  "ro.build.type": "userdebug",
+  "ro.product.cpu.abi": "x86_64",
+  "ro.build.fingerprint": "google/sdk_gphone64_x86_64/emu64xa:16/BE2A.250530.026.F3/13894323:userdebug/dev-keys",
+  "persist.sys.timezone": "Etc/UTC",
+  "serial": "emulator-5554",
+  "adb_client": "Version 37.0.1-15733141"
+ },
+ "facts": {
+  "lines_written": 800000,
+  "writer_lines_per_s": 91582,
+  "liblog_drop_events": {
+   "events": 785,
+   "lines_dropped": 205040
+  },
+  "own_lines_kept": 208705,
+  "own_seq_kept_range": [
+   529658,
+   797919
+  ],
+  "notices": 0,
+  "notices_by_uid": {},
+  "notices_between_list_neighbors": 0,
+  "notice_details": []
+ },
+ "notes": [],
+ "steps": [
+  {
+   "name": "writer",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "shell",
+    "logwrapper sh -c 'i=0; while [ $i -lt 800000 ]; do echo lp-ch-9b619b1a-$i; i=$((i+1)); done'"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 8.735,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "liblog_events",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "logcat",
+    "-d",
+    "-b",
+    "events",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid",
+    "-T",
+    "1793770510.000000",
+    "-s",
+    "liblog"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.082,
+   "stdout": [
+    "2026-11-04 05:35:18.860251 +0000 shell  2878  2878 I liblog  : 2",
+    "2026-11-04 05:35:18.872240 +0000 shell  2878  2878 I liblog  : 223",
+    "2026-11-04 05:35:18.872244 +0000 shell  2878  2878 I liblog  : 1",
+    "2026-11-04 05:35:18.880221 +0000 shell  2878  2878 I liblog  : 164",
+    "2026-11-04 05:35:18.894949 +0000 shell  2878  2878 I liblog  : 99",
+    "2026-11-04 05:35:18.911228 +0000 shell  2878  2878 I liblog  : 2552",
+    "2026-11-04 05:35:18.935810 +0000 shell  2878  2878 I liblog  : 360",
+    "2026-11-04 05:35:18.935816 +0000 shell  2878  2878 I liblog  : 1",
+    "2026-11-04 05:35:18.936754 +0000 shell  2878  2878 I liblog  : 3",
+    "2026-11-04 05:35:18.936768 +0000 shell  2878  2878 I liblog  : 4"
+   ],
+   "stdout_total_lines": 786,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "dump",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5554",
+    "logcat",
+    "-d",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 1.712,
+   "stdout": [],
+   "stdout_total_lines": 221966,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  }
+ ]
+}

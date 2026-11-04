@@ -1,0 +1,345 @@
+{
+ "id": "C04",
+ "title": "adb logcat on: device logcat killed, reconnect, server restart, unplug",
+ "recorded_at": "2026-11-04T05:31:04+00:00",
+ "tool": "tools/device_probe.py",
+ "device": {
+  "ro.build.version.release": "7.0",
+  "ro.build.version.sdk": "24",
+  "ro.build.type": "userdebug",
+  "ro.product.cpu.abi": "x86_64",
+  "ro.build.fingerprint": "Android/sdk_google_phone_x86_64/generic_x86_64:7.0/NYC/6696031:userdebug/dev-keys",
+  "persist.sys.timezone": "Etc/UTC",
+  "serial": "emulator-5556",
+  "adb_client": "Version 37.0.1-15733141"
+ },
+ "facts": {
+  "device_logcat_killed": {
+   "exited_by_itself": true,
+   "rc": 143,
+   "seconds_to_exit": 0.02,
+   "stderr": [],
+   "lines_before_action": 6158,
+   "lines_read": 6158
+  },
+  "adb_reconnect": {
+   "exited_by_itself": true,
+   "rc": 255,
+   "seconds_to_exit": 0.02,
+   "stderr": [],
+   "lines_before_action": 6158,
+   "lines_read": 6158
+  },
+  "server_restart": {
+   "exited_by_itself": true,
+   "rc": 255,
+   "seconds_to_exit": 1.32,
+   "stderr": [],
+   "lines_before_action": 6158,
+   "lines_read": 6158
+  },
+  "unplug": {
+   "exited_by_itself": true,
+   "rc": 255,
+   "seconds_to_exit": 0.85,
+   "stderr": [],
+   "lines_before_action": 6158,
+   "lines_read": 6158
+  },
+  "get_state_after_unplug": {
+   "exited": true,
+   "rc": 1,
+   "stderr": [
+    "error: device offline"
+   ]
+  },
+  "shell_date_after_unplug": {
+   "exited": true,
+   "rc": 1,
+   "stderr": [
+    "adb: device offline"
+   ]
+  },
+  "logcat_after_unplug": {
+   "exited": false,
+   "rc": null,
+   "stderr": [
+    "- waiting for device -"
+   ]
+  }
+ },
+ "notes": [
+  "the emulator was killed by the unplug case and stays down"
+ ],
+ "steps": [
+  {
+   "name": "pidof_logcat",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "pidof logcat"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.011,
+   "stdout": [
+    "1311 5934"
+   ],
+   "stdout_total_lines": 1,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "kill_logcat",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "kill 1311 5934"
+   ],
+   "rc": 1,
+   "timed_out": false,
+   "elapsed_s": 0.007,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": [
+    "/system/bin/sh: kill: 1311: Operation not permitted"
+   ]
+  },
+  {
+   "name": "device_logcat_killed_stream",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-v",
+    "threadtime"
+   ],
+   "rc": 143,
+   "timed_out": false,
+   "elapsed_s": 1.069,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": [],
+   "live": true,
+   "first_byte_s": 0.008,
+   "bytes_read": 660373,
+   "lines_read": 6158
+  },
+  {
+   "name": "reconnect",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "reconnect"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.019,
+   "stdout": [
+    "reconnecting emulator-5556 [device]",
+    ""
+   ],
+   "stdout_total_lines": 2,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "adb_reconnect_stream",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-v",
+    "threadtime"
+   ],
+   "rc": 255,
+   "timed_out": false,
+   "elapsed_s": 1.07,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": [],
+   "live": true,
+   "first_byte_s": 0.01,
+   "bytes_read": 660373,
+   "lines_read": 6158
+  },
+  {
+   "name": "wait_for_device_after_reconnect",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "wait-for-device"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 1.007,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "server_restart",
+   "where": "vm",
+   "argv": [
+    "~/android-sdk/platform-tools/adb kill-server; sleep 1; ~/android-sdk/platform-tools/adb start-server"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 1.32,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": [
+    "* daemon not running; starting now at tcp:5037",
+    "* daemon started successfully"
+   ]
+  },
+  {
+   "name": "server_restart_stream",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-v",
+    "threadtime"
+   ],
+   "rc": 255,
+   "timed_out": false,
+   "elapsed_s": 2.371,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": [],
+   "live": true,
+   "first_byte_s": 0.012,
+   "bytes_read": 660373,
+   "lines_read": 6158
+  },
+  {
+   "name": "wait_for_device_after_server_restart",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "wait-for-device"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.004,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "emu_kill",
+   "where": "vm",
+   "argv": [
+    "~/android-sdk/platform-tools/adb -s emulator-5556 emu kill"
+   ],
+   "rc": 0,
+   "timed_out": false,
+   "elapsed_s": 0.08,
+   "stdout": [
+    "OK: killing emulator, bye bye\r",
+    "OK\r"
+   ],
+   "stdout_total_lines": 2,
+   "stdout_clipped_lines": 0,
+   "stderr": []
+  },
+  {
+   "name": "unplug_stream",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-v",
+    "threadtime"
+   ],
+   "rc": 255,
+   "timed_out": false,
+   "elapsed_s": 1.896,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": [],
+   "live": true,
+   "first_byte_s": 0.012,
+   "bytes_read": 660373,
+   "lines_read": 6158
+  },
+  {
+   "name": "get_state_after_unplug",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "get-state"
+   ],
+   "rc": 1,
+   "timed_out": false,
+   "elapsed_s": 0.003,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": [
+    "error: device offline"
+   ]
+  },
+  {
+   "name": "shell_date_after_unplug",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "shell",
+    "date"
+   ],
+   "rc": 1,
+   "timed_out": false,
+   "elapsed_s": 0.003,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": [
+    "adb: device offline"
+   ]
+  },
+  {
+   "name": "logcat_after_unplug",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-5556",
+    "logcat",
+    "-d",
+    "-t",
+    "1"
+   ],
+   "rc": null,
+   "timed_out": true,
+   "elapsed_s": 10.012,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": [
+    "- waiting for device -"
+   ]
+  }
+ ]
+}

@@ -1,0 +1,137 @@
+{
+ "id": "R4",
+ "title": "An absent serial: logcat waits; get-state and shell date",
+ "recorded_at": "2026-11-04T04:22:29+00:00",
+ "tool": "tools/device_probe.py",
+ "device": {
+  "ro.build.version.release": "16",
+  "ro.build.version.sdk": "36",
+  "ro.build.type": "userdebug",
+  "ro.product.cpu.abi": "x86_64",
+  "ro.build.fingerprint": "google/sdk_gphone64_x86_64/emu64xa:16/BE2A.250530.026.F3/13894323:userdebug/dev-keys",
+  "persist.sys.timezone": "Etc/UTC",
+  "serial": "emulator-5554",
+  "adb_client": "Version 37.0.1-15733141"
+ },
+ "facts": {
+  "logcat_dump": {
+   "exited": false,
+   "rc": null,
+   "stderr": [
+    "- waiting for device -"
+   ]
+  },
+  "logcat_live": {
+   "exited": false,
+   "rc": null,
+   "stderr": [
+    "- waiting for device -"
+   ]
+  },
+  "get_state": {
+   "exited": true,
+   "rc": 1,
+   "stderr": [
+    "error: device 'emulator-9999' not found"
+   ]
+  },
+  "shell_date": {
+   "exited": true,
+   "rc": 1,
+   "stderr": [
+    "adb: device 'emulator-9999' not found"
+   ]
+  }
+ },
+ "notes": [
+  "each command was given 10 s; timed_out=true means adb was still waiting for emulator-9999"
+ ],
+ "steps": [
+  {
+   "name": "logcat_dump",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-9999",
+    "logcat",
+    "-d",
+    "-t",
+    "1"
+   ],
+   "rc": null,
+   "timed_out": true,
+   "elapsed_s": 10.012,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": [
+    "- waiting for device -"
+   ]
+  },
+  {
+   "name": "logcat_live",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-9999",
+    "logcat",
+    "-v",
+    "threadtime",
+    "-v",
+    "year",
+    "-v",
+    "usec",
+    "-v",
+    "zone",
+    "-v",
+    "uid"
+   ],
+   "rc": null,
+   "timed_out": true,
+   "elapsed_s": 10.014,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": [
+    "- waiting for device -"
+   ]
+  },
+  {
+   "name": "get_state",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-9999",
+    "get-state"
+   ],
+   "rc": 1,
+   "timed_out": false,
+   "elapsed_s": 0.009,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": [
+    "error: device 'emulator-9999' not found"
+   ]
+  },
+  {
+   "name": "shell_date",
+   "where": "adb",
+   "argv": [
+    "-s",
+    "emulator-9999",
+    "shell",
+    "date"
+   ],
+   "rc": 1,
+   "timed_out": false,
+   "elapsed_s": 0.003,
+   "stdout": [],
+   "stdout_total_lines": 0,
+   "stdout_clipped_lines": 0,
+   "stderr": [
+    "adb: device 'emulator-9999' not found"
+   ]
+  }
+ ]
+}

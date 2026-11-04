@@ -38,6 +38,9 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
+markers = [
+    "device: needs a live device or emulator (LOGPYT_DEVICE=<serial>, adb server on 127.0.0.1:5037); skipped otherwise",
+]
 
 [tool.ruff.lint]
 preview = true
