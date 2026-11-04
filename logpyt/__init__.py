@@ -28,13 +28,22 @@ Quick Start:
 
 __version__ = "2.0.0"
 
+from .config import Reconnect, StreamConfig
 from .exceptions import (
+    AdbError,
+    AdbExitError,
+    CallbackError,
+    IncompleteCaptureError,
+    LogpytError,
     LogStreamError,
     LogStreamInternalError,
     LogStreamKilledError,
     LogStreamPidResolveError,
     LogStreamStderrError,
     LogStreamTimeoutError,
+    ReadTimeoutError,
+    StreamError,
+    UsageError,
 )
 from .exporters import export_logs
 from .filters import AdvancedFilter, Filter
@@ -43,13 +52,23 @@ from .models import LogEntry
 from .parsers import LogParser, ThreadTimeLogParser
 from .readers import LogFileReader, read_file
 from .streams import AsyncLogStream, AsyncStreamHandle, LogStream, StreamHandle
+
+# 3.0 stream events. StreamState stays in logpyt.streams._events until the driver
+# rewrites switch over: logpyt.streams.StreamState is still the 2.x enum that the
+# current streams report (design section 8.1).
+from .streams._events import Gap, StateChange, StreamEvent, StreamStats
 from .utils import enable_debug, list_devices, resolve_adb
 
 __all__ = [
+    "AdbError",
+    "AdbExitError",
     "AdvancedFilter",
     "AsyncLogStream",
     "AsyncStreamHandle",
+    "CallbackError",
     "Filter",
+    "Gap",
+    "IncompleteCaptureError",
     "LogEntry",
     "LogFileReader",
     "LogGrouper",
@@ -61,8 +80,17 @@ __all__ = [
     "LogStreamPidResolveError",
     "LogStreamStderrError",
     "LogStreamTimeoutError",
+    "LogpytError",
+    "ReadTimeoutError",
+    "Reconnect",
+    "StateChange",
+    "StreamConfig",
+    "StreamError",
+    "StreamEvent",
     "StreamHandle",
+    "StreamStats",
     "ThreadTimeLogParser",
+    "UsageError",
     "WindowedLogGrouper",
     "enable_debug",
     "export_logs",

@@ -105,3 +105,8 @@ ignore = [
 # Pydantic models evaluate annotations at runtime, so imported field types
 # must stay importable outside TYPE_CHECKING blocks.
 runtime-evaluated-base-classes = ["pydantic.BaseModel"]
+
+[tool.ty.rules]
+# tests/typing/check_api.py pins calls ty must reject with `ty: ignore[<rule>]`;
+# an unused ignore means ty stopped rejecting one, so it must fail `ty check`.
+unused-ignore-comment = "error"
