@@ -273,6 +273,37 @@ def test_invalid_utf8_becomes_replacement_characters() -> None:
     assert decode_line(b"cut \xe6\x97") == "cut �"
 
 
+@pytest.mark.parametrize("char", ["é", "日", "\U0001f600"], ids=["2b", "3b", "4b"])
+def test_cut_inside_a_character_drops_it(char: str) -> None:
+    """The cap cuts bytes, so it can split a character: the cut line holds the
+    first max_line_bytes bytes, and decoding it with cut=True drops the
+    character's start instead of making it a U+FFFD. A cut between characters
+    drops nothing.
+    """
+    size = len(char.encode())
+    for pad in range(size):
+        data = b"a" * pad + char.encode() * LIMIT + b"\nnext\n"
+        whole = "a" * pad + char * ((LIMIT - pad) // size)
+
+        for chunks in _splits(data):
+            ((cut, truncated), after) = _frame(chunks)
+            assert (len(cut), truncated, after) == (LIMIT, True, (b"next", False))
+            assert decode_line(cut, cut=True) == whole, (pad, chunks)
+
+
+def test_cut_decoding_replaces_other_bad_bytes() -> None:
+    """cut=True drops only an unfinished sequence at the very end (at most 3
+    bytes); a byte that can start no character is replaced, at the end too.
+    """
+    assert decode_line(b"cut \xe6\x97", cut=True) == "cut "
+    assert decode_line(b"cut \xf0\x9f\x98", cut=True) == "cut "
+    assert decode_line(b"cut \xc3", cut=True) == "cut "
+    assert decode_line("cut 日".encode(), cut=True) == "cut 日"
+    assert decode_line(b"bad \xff", cut=True) == "bad �"
+    assert decode_line(b"bad \xe6\x97 mid", cut=True) == "bad � mid"
+    assert decode_line(b"", cut=True) == ""
+
+
 # -- every rule at once ----------------------------------------------------------------
 
 

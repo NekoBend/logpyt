@@ -2,7 +2,8 @@
 
 One `Pipeline` serves one parse session. For each `FramedLine` it runs, in order:
 
-1. decode: UTF-8, an undecodable byte becomes U+FFFD (`decode_line`);
+1. decode: UTF-8, an undecodable byte becomes U+FFFD (`decode_line`); a cut
+   line drops the start of the character the cap cut;
 2. dividers: logcat's ``--------- beginning of <buffer>`` lines are not entries
    and are not counted as unparsed;
 3. parse: ``parser.parse(text, ctx)``, or the fallback entry with
@@ -81,6 +82,7 @@ class Pipeline:
         "_uid_packages",
         "_unparsed",
         "_where",
+        "_with_uid",
     )
 
     def __init__(
@@ -102,6 +104,7 @@ class Pipeline:
         self._unparsed = 0
         self._truncated = 0
         self._rejected = 0
+        self._with_uid = 0
 
     @property
     def lines(self) -> int:
@@ -127,6 +130,13 @@ class Pipeline:
     def rejected(self) -> int:
         """The entries ``where`` rejected."""
         return self._rejected
+
+    @property
+    def with_uid(self) -> int:
+        """The entries whose uid is known (``entry.uid`` is not None), before
+        ``where``: only they can be attributed from ``uid_packages``.
+        """
+        return self._with_uid
 
     def push(self, line: FramedLine) -> Sequence[LogEntry | LogGroup]:
         """Run ``line`` through every stage; return what it delivers.
@@ -163,7 +173,7 @@ class Pipeline:
         self._lines += 1
         if line.truncated:
             self._truncated += 1
-        text = decode_line(line.data)
+        text = decode_line(line.data, cut=line.truncated)
         if is_divider(text):
             self._dividers += 1
             return None
@@ -177,6 +187,8 @@ class Pipeline:
                 f"{type(entry).__name__}, not a LogEntry or None"
             )
             raise TypeError(msg)
+        if entry.uid is not None:
+            self._with_uid += 1
         entry = self._amend(entry, truncated=line.truncated)
         if self._where is not None and not self._where(entry):
             self._rejected += 1

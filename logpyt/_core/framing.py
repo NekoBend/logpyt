@@ -19,11 +19,14 @@ holds at most ``max_line_bytes`` bytes of the open line (design 5.10); CRs that
 may still turn out to be the terminator are counted, not stored.
 
 Decoding comes after framing, per line (`decode_line`): LF never occurs inside a
-UTF-8 multibyte sequence, so a character split across chunks survives.
+UTF-8 multibyte sequence, so a character split across chunks survives. The cap
+counts bytes, so it can cut a character; the decoded text of a cut line ends
+before that character instead of with a U+FFFD for it.
 """
 
 from __future__ import annotations
 
+import codecs
 from typing import NamedTuple
 
 __all__ = [
@@ -43,6 +46,7 @@ MIN_MAX_LINE_BYTES = 4096
 _LF = b"\n"
 _CR = b"\r"
 _BOM = b"\xef\xbb\xbf"
+_UTF8_DECODER = codecs.getincrementaldecoder("utf-8")
 
 
 class FramedLine(NamedTuple):
@@ -60,9 +64,21 @@ class FramedLine(NamedTuple):
     truncated: bool = False
 
 
-def decode_line(data: bytes) -> str:
-    """Decode one framed line: UTF-8, an undecodable byte becomes U+FFFD."""
-    return data.decode("utf-8", "replace")
+def decode_line(data: bytes, *, cut: bool = False) -> str:
+    """Decode one framed line: UTF-8, an undecodable byte becomes U+FFFD.
+
+    With ``cut=True`` (the data of a `FramedLine` with ``truncated=True``), an
+    unfinished UTF-8 sequence at the very end, at most 3 bytes, is dropped
+    instead of replaced: the cap cut it off from the rest of its character.
+    Python's incremental decoder decides what is unfinished; it also holds
+    back ``ED A0``..``ED BF``, the start of an encoded surrogate, which is
+    dropped too. Every other undecodable byte becomes U+FFFD as usual.
+    """
+    if not cut:
+        return data.decode("utf-8", "replace")
+    # final=False holds back an unfinished sequence at the end; nothing follows
+    # it, so it is never decoded.
+    return _UTF8_DECODER("replace").decode(data, final=False)
 
 
 class Framer:

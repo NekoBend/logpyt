@@ -74,7 +74,10 @@ def read_file(
 
     The arguments are checked when ``read_file`` is called; the file is opened
     at the first ``next()`` and read in one pass. Every call is a parse session
-    of its own, so reading a file twice gives the same entries.
+    of its own, so reading a file twice resolves its yearless dates the same
+    way (F6-1). Lines without a timestamp (brief, process, tag and raw lines)
+    and unrecognised lines are dated with the host clock when they are read,
+    so a second read gives them other timestamps.
 
     How lines are read:
 
@@ -84,7 +87,8 @@ def read_file(
       UTF-8; an undecodable byte becomes U+FFFD.
     - A line longer than ``max_line_bytes`` keeps its first ``max_line_bytes``
       bytes and gives an entry with ``truncated=True``; the next line is read
-      as usual.
+      as usual. When the cut falls inside a character, the entry ends before
+      that character (at most 3 bytes are dropped), not with a U+FFFD.
     - logcat's ``--------- beginning of <buffer>`` dividers are skipped.
     - A line the parser does not recognise is yielded as an entry with
       ``parsed=False`` whose message is the whole line.
@@ -98,8 +102,11 @@ def read_file(
     At the end of a read, or when the iterator is closed early, one WARNING on
     logger ``logpyt.readers`` reports the lines the parser did not recognise
     (a format mismatch, F6-5), and another the cut lines, each only if there
-    were any. At the call, one WARNING names each package of ``where`` that no
-    ``uid_packages`` value names: no line can carry that package.
+    were any. With ``uid_packages``, a third one says so when lines were
+    parsed but none of them carries a uid (a file without a ``-v uid``
+    column): no entry could be attributed. At the call, one WARNING names
+    each package of ``where`` that no ``uid_packages`` value names: no line
+    can carry that package.
 
     Args:
         path: The log file.
@@ -129,7 +136,7 @@ def read_file(
         ValueError: ``where`` names packages and ``uid_packages`` is None
             (F5-4); ``year`` is outside 1..9999; a ``uid_packages`` key is
             negative or a value is not a package name; ``max_line_bytes`` is
-            below 4096.
+            below 4096; ``path`` contains a NUL character.
         OSError: From the first ``next()``: the file cannot be opened or read.
 
     Exceptions raised by a custom parser or condition propagate unchanged and
@@ -137,6 +144,10 @@ def read_file(
 
     """
     file_path = Path(path)
+    if "\x00" in str(file_path):
+        # open() would raise this ValueError only at the first next().
+        msg = "path must not contain a NUL character"
+        raise ValueError(msg)
     checked_parser = _check_parser(parser)
     checked_where = None if where is None else _require_condition(where, "where")
     if group_by is not None and not isinstance(group_by, GroupBy):
@@ -188,13 +199,26 @@ def _read(
                 yield from pipeline.push(line)
             yield from pipeline.finish()
         finally:
-            _report(path, parser, pipeline, max_line_bytes)
+            _report(
+                path,
+                parser,
+                pipeline,
+                max_line_bytes,
+                mapped=uid_packages is not None,
+            )
 
 
 def _report(
-    path: Path, parser: LogParser, pipeline: Pipeline, max_line_bytes: int
+    path: Path,
+    parser: LogParser,
+    pipeline: Pipeline,
+    max_line_bytes: int,
+    *,
+    mapped: bool,
 ) -> None:
-    """Log one WARNING each for unrecognised and for cut lines, if any."""
+    """Log one WARNING each for unrecognised lines, for cut lines and, with a
+    uid map (``mapped``), for parsed lines none of which carries a uid.
+    """
     if pipeline.unparsed:
         logger.warning(
             "%d of %d lines in %s are not in the %r format of %s; "
@@ -208,12 +232,23 @@ def _report(
     if pipeline.truncated:
         logger.warning(
             "%d of %d lines in %s are longer than max_line_bytes=%d; "
-            "their entries hold the first %d bytes (truncated=True).",
+            "their entries hold at most the first %d bytes (truncated=True).",
             pipeline.truncated,
             pipeline.lines,
             path,
             max_line_bytes,
             max_line_bytes,
+        )
+    parsed = pipeline.lines - pipeline.dividers - pipeline.unparsed
+    if mapped and parsed and not pipeline.with_uid:
+        # A file without a -v uid column: the map attributes nothing, and a
+        # Package condition matches no line; the F5-4 check at the call
+        # cannot tell, it reads no line.
+        logger.warning(
+            "uid_packages was given, but none of the %d parsed lines in %s "
+            "carries a uid (logcat -v uid): no entry was attributed.",
+            parsed,
+            path,
         )
 
 
@@ -319,7 +354,9 @@ def _check_package_condition(where: Condition, uids: Mapping[int, str] | None) -
         ValueError: ``uids`` is None and ``where.packages()`` is not empty.
 
     """
-    names = where.packages()
+    # An override at the root may return any iterable; the walk normalises
+    # only the overrides below the root.
+    names = frozenset(where.packages())
     if not names:
         return
     if uids is not None:

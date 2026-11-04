@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 
 from logpyt import readers
-from logpyt.filters import Filter, Package, Tag, Where
+from logpyt.filters import Condition, Filter, Package, Tag, Where
 from logpyt.groupers import GroupBy
 from logpyt.models import LogEntry, LogGroup
 from logpyt.parsers import BriefLogParser, ParseContext
@@ -23,7 +23,7 @@ from tests.device_facts import LEVELS, body, level_dir, load
 if TYPE_CHECKING:
     from collections.abc import Generator
 
-    from logpyt.filters import Condition
+    from logpyt.parsers import LogParser
 
 APP_UID = 10065
 APP = "com.example.app"
@@ -316,6 +316,27 @@ def test_line_of_exactly_max_line_bytes_is_whole(tmp_path: Path) -> None:
     assert [(len(e.raw), e.truncated) for e in entries] == [(CAP, False), (CAP, True)]
 
 
+@pytest.mark.parametrize("char", ["日", "\U0001f600"], ids=["3b", "4b"])
+def test_cut_inside_a_character_adds_no_replacement(tmp_path: Path, char: str) -> None:
+    """A cut that falls inside a character ends the entry before it: the
+    entry holds no U+FFFD that the file does not hold (design 5.5).
+    """
+    head = "11-19 12:34:56.789  1000  2000 D Long: "
+    size = len(char.encode())
+    for pad in range(size):
+        line = head + "a" * pad + char * CAP
+        log_file = _write_lines(
+            tmp_path / "cut.log", line, "11-19 12:34:57.000  1  1 I N: b"
+        )
+        kept = (CAP - len(head) - pad) // size
+
+        cut, after = read_file(log_file, year=2026, max_line_bytes=CAP)
+
+        assert (cut.truncated, cut.message) == (True, "a" * pad + char * kept), pad
+        assert cut.raw == line[: len(head) + pad + kept]
+        assert after.message == "b"
+
+
 @pytest.mark.parametrize("chunk", [1, 2, 3, 7, 4096])
 def test_small_reads_give_the_same_entries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, chunk: int
@@ -457,6 +478,66 @@ def test_uid_map_attributes_a_recorded_dump(tmp_path: Path, level: int) -> None:
     assert len(entries) == len(body(dump["stdout"])) == len(owners)
     assert all(e.parsed and e.package == uids[cast("int", e.uid)] for e in entries)
     assert [(e.uid, e.package) for e in mine] == [one]
+
+
+@pytest.mark.parametrize(
+    ("parser", "line"),
+    [
+        (ThreadTimeLogParser(), "11-04 05:11:16.661  4321  4321 I App: mine"),
+        (BriefLogParser(), "I/App( 4321): mine"),
+    ],
+    ids=["threadtime", "brief"],
+)
+def test_uid_map_on_lines_without_uids_warns_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, parser: LogParser, line: str
+) -> None:
+    """With uid_packages, a file whose parsed lines carry no uid (no -v uid
+    column) gives one WARNING at the end of the read: the map attributed no
+    entry, so Package matched none.
+    """
+    log_file = _write_lines(
+        tmp_path / "plain.log", "--------- beginning of main", line, line
+    )
+
+    with caplog.at_level(logging.WARNING, logger="logpyt.readers"):
+        entries = list(
+            read_file(
+                log_file,
+                parser=parser,
+                where=Package(APP),
+                uid_packages={APP_UID: APP},
+                year=2026,
+            )
+        )
+
+    assert entries == []
+    (warning,) = _warnings(caplog)
+    assert warning.startswith(
+        "uid_packages was given, but none of the 2 parsed lines in "
+    )
+    assert warning.endswith("carries a uid (logcat -v uid): no entry was attributed.")
+
+
+def test_no_uid_warning_without_a_map_or_a_parsed_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The uid WARNING needs a map and a parsed line: a file the parser does
+    not read at all gets only the format-mismatch WARNING (F6-5), and a file
+    with a uid on some lines gets none.
+    """
+    plain = _write_lines(tmp_path / "plain.log", "11-04 05:11:16.661  1  1 I A: a")
+    junk = _write_lines(tmp_path / "junk.log", "not a log line")
+    mixed = _write_lines(
+        tmp_path / "mixed.log", "11-04 05:11:16.661  1  1 I A: a", _uid_line("b")
+    )
+
+    with caplog.at_level(logging.WARNING, logger="logpyt.readers"):
+        list(read_file(plain, year=2026))
+        list(read_file(junk, uid_packages={APP_UID: APP}))
+        list(read_file(mixed, uid_packages={APP_UID: APP}, year=2026))
+
+    (warning,) = _warnings(caplog)
+    assert warning.startswith("1 of 1 lines in ")
 
 
 # -- grouping -------------------------------------------------------------------------
@@ -640,6 +721,48 @@ def test_bad_arguments_raise_at_the_call(
     """Every argument is checked when read_file is called, before any I/O."""
     with pytest.raises(error, match=match):
         read_file(tmp_path / "missing.log", **kwargs)
+
+
+@pytest.mark.parametrize("kind", ["str", "path"])
+def test_path_with_a_nul_raises_at_the_call(tmp_path: Path, kind: str) -> None:
+    """A NUL in the path is a ValueError of the call, like the other checks,
+    not one of the first next().
+    """
+    path = tmp_path / "a\x00b.log"
+
+    with pytest.raises(ValueError, match="NUL"):
+        read_file(str(path) if kind == "str" else path)
+
+
+class _ListPackages(Condition):
+    """A condition whose packages() override returns a list, not a set."""
+
+    def __call__(self, entry: LogEntry, /) -> bool:
+        return entry.package == "com.c"
+
+    def packages(self) -> frozenset[str]:
+        return cast("frozenset[str]", ["com.c"])
+
+
+def test_root_packages_override_may_return_a_list(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An override at the root is read like one below it (any iterable): the
+    uid map check warns or raises, never fails on the type.
+    """
+    log_file = _write_lines(tmp_path / "uid.log", _uid_line("a"))
+
+    with caplog.at_level(logging.WARNING, logger="logpyt.readers"):
+        entries = list(
+            read_file(log_file, where=_ListPackages(), uid_packages={APP_UID: APP})
+        )
+
+    assert entries == []
+    assert [w.split(",")[0] for w in _warnings(caplog)] == [
+        "where names package 'com.c'"
+    ]
+    with pytest.raises(ValueError, match=r"'com\.c'.*uid_packages"):
+        read_file(log_file, where=_ListPackages())
 
 
 def test_empty_uid_map_and_smallest_cap_are_accepted(
