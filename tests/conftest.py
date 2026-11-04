@@ -7,7 +7,8 @@ The child side and the config format are described in ``tests/fake_adb.py``.
     that a spawn of ``fake.path`` runs ``tests/fake_adb.py`` instead, and
     patches ``resolve_adb`` to return ``fake.path``. Configure behavior with
     ``logcat()`` / ``pidof()`` / ``command()``, observe it with ``calls()``,
-    ``wait_for()`` and ``release()``.
+    ``wait_for()`` and ``release()``. Outside pytest, ``install_fake_adb()``
+    sets up the same interception (``bench/stream_bench.py`` uses it).
 
 Child registry
     Every fake adb child is registered, with its ``subprocess.Popen`` or
@@ -702,10 +703,15 @@ def _hang_watchdog(request: pytest.FixtureRequest) -> Iterator[None]:
 # -- fake adb fixture --------------------------------------------------------
 
 
-@pytest.fixture
-def fake_adb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeAdb]:
-    """A real-subprocess fake adb; see the module docstring for the API."""
-    fake = FakeAdb(tmp_path / "fake-adb")
+def install_fake_adb(state: Path, monkeypatch: pytest.MonkeyPatch) -> FakeAdb:
+    """Create a ``FakeAdb`` in ``state`` and route every spawn of its path to it.
+
+    The patches go through ``monkeypatch`` and end when it is undone; call
+    ``FakeAdb.close()`` before that. The ``fake_adb`` fixture is the usual
+    caller; code outside pytest (``bench/stream_bench.py``) passes a
+    ``pytest.MonkeyPatch.context()``.
+    """
+    fake = FakeAdb(state)
 
     real_popen = subprocess.Popen
 
@@ -731,7 +737,7 @@ def fake_adb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeAd
                 await fake._async_hold(child)
             except asyncio.CancelledError:
                 # Cancelled while held: like asyncio's own cancelled spawn,
-                # end the child nobody will receive (the finalizer reaps it).
+                # end the child nobody will receive (FakeAdb.close() reaps it).
                 with contextlib.suppress(ProcessLookupError):
                     process.kill()
                 raise
@@ -741,5 +747,12 @@ def fake_adb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeAd
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _rewriting_exec)
     for target in RESOLVE_ADB_TARGETS:
         monkeypatch.setattr(target, lambda: fake.path)
+    return fake
+
+
+@pytest.fixture
+def fake_adb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeAdb]:
+    """A real-subprocess fake adb; see the module docstring for the API."""
+    fake = install_fake_adb(tmp_path / "fake-adb", monkeypatch)
     yield fake
     fake.close()
