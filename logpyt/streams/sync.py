@@ -12,14 +12,14 @@ from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, Literal, TextIO
 
 from logpyt import adb
-from logpyt.adb import _CREATE_NO_WINDOW
+from logpyt.adb import _CREATE_NO_WINDOW, _check_package_name
 from logpyt.exceptions import (
     LogStreamError,
     LogStreamInternalError,
     LogStreamKilledError,
     LogStreamTimeoutError,
 )
-from logpyt.filters import Filter
+from logpyt.filters import Condition, _require_condition
 from logpyt.groupers import LogGrouper, WindowedLogGrouper
 from logpyt.parsers import LogParser, ParseContext, ThreadTimeLogParser
 from logpyt.parsers._fallback import unparsed_entry
@@ -180,9 +180,8 @@ class PidMonitor:
 
     def _resolve_pids(self, package: str) -> list[int]:
         """Resolve PIDs for a package using ADB."""
-        cmd = build_pidof_command(self.adb_path, self.device_id, package)
-
         try:
+            cmd = build_pidof_command(self.adb_path, self.device_id, package)
             # Use a timeout to prevent hanging
             result = subprocess.run(
                 cmd,
@@ -197,7 +196,8 @@ class PidMonitor:
                 ]
         except Exception as exc:  # noqa: BLE001
             # A polling monitor must never crash: any failure (device disconnected,
-            # command failed, malformed output) degrades to returning no PIDs.
+            # command failed, malformed output, a name the builder refuses)
+            # degrades to returning no PIDs.
             logging.getLogger("logpyt").debug(
                 "pidof resolution failed for %s: %s", package, exc
             )
@@ -289,7 +289,7 @@ class LogStream:
         adb_path: str | None = None,
         device_id: str | None = None,
         parser: LogParser | None = None,
-        filter_by: Filter | None = None,
+        filter_by: Condition | None = None,
         group_by: LogGrouper | None = None,
         stdout_callback: LogCallback | None = None,
         stderr_callback: LogCallback | None = None,
@@ -318,7 +318,9 @@ class LogStream:
             adb_path: Path to ADB executable. If None, resolved automatically.
             device_id: Target device serial ID.
             parser: Parser to convert lines to LogEntry objects.
-            filter_by: Filter to apply to log entries.
+            filter_by: The condition an entry must meet to be delivered. The
+                packages of its `Package` conditions (anywhere in the tree,
+                under `Or` and `Not` too) are resolved to pids.
             group_by: Grouper to group log entries.
             stdout_callback: Callback for processed stdout entries.
                 Signature: `Callable[[LogEntry, StreamHandle], None]`.
@@ -355,7 +357,9 @@ class LogStream:
         self.parser = parser or ThreadTimeLogParser()
         # One parse session per adb connection (F6-1); replaced at each spawn.
         self._parse_context = ParseContext()
-        self.filter_by = filter_by
+        self.filter_by = (
+            None if filter_by is None else _require_condition(filter_by, "filter_by")
+        )
         self.auto_reconnect = auto_reconnect
         self.reconnect_delay = reconnect_delay
         self.max_queue_size = max_queue_size
@@ -398,11 +402,15 @@ class LogStream:
             tuple[list[LogEntry | list[LogEntry]], str] | None
         ] = queue.Queue(maxsize=self.max_queue_size)
         self._pid_monitor: PidMonitor | None = None
-        if isinstance(self.filter_by, Filter) and self.filter_by.packages:
+        # F5-1: every Package in the condition tree, not only Filter's. F5-3:
+        # each name reaches the device shell, and an override of packages()
+        # bypasses Package's own check, so a bad name fails here.
+        packages = frozenset() if self.filter_by is None else self.filter_by.packages()
+        if packages:
             self._pid_monitor = PidMonitor(
                 self.adb_path,
                 self.device_id,
-                list(self.filter_by.packages),
+                sorted(_check_package_name(name) for name in packages),
                 poll_interval=self.pid_poll_interval,
                 max_poll_interval=self.pid_max_poll_interval,
                 poll_backoff_factor=self.pid_poll_backoff_factor,
@@ -894,7 +902,7 @@ class LogStream:
                 entry = entry.model_copy(update={"package": pkg})
 
         # 2. Filter
-        if self.filter_by and not self.filter_by(entry):
+        if self.filter_by is not None and not self.filter_by(entry):
             return
 
         # 3. Group

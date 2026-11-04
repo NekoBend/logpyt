@@ -9,13 +9,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .filters import _require_condition
 from .parsers import LogParser, ParseContext, ThreadTimeLogParser
 from .parsers._fallback import is_divider, unparsed_entry
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from .filters import Filter
+    from .filters import Condition
     from .models import LogEntry
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,7 @@ class LogFileReader:
         self,
         file_path: str | Path,
         parser: LogParser | None = None,
-        filter_by: Filter | None = None,
+        filter_by: Condition | None = None,
         parse_error_log_interval: float = 5.0,
         *,
         year: int | None = None,
@@ -45,8 +46,9 @@ class LogFileReader:
             parser: Parser to use. If None, defaults to ThreadTimeLogParser.
                 A line the parser does not recognise is yielded as an entry
                 with ``parsed=False`` whose message is the whole line.
-            filter_by: Optional filter to apply to entries. Only entries
-                passing the filter will be yielded.
+            filter_by: Optional condition; only the entries that meet it are
+                yielded. A file carries no package attribution, so a
+                `Package` condition matches none of its entries.
             parse_error_log_interval: Minimum interval in seconds between
                 repeated parse error logs. Defaults to 5.0.
             year: The year of the first line that carries no year (yearless
@@ -56,7 +58,9 @@ class LogFileReader:
         """
         self.file_path = Path(file_path)
         self.parser = parser or ThreadTimeLogParser()
-        self.filter_by = filter_by
+        self.filter_by = (
+            None if filter_by is None else _require_condition(filter_by, "filter_by")
+        )
         ParseContext(year=year)  # a bad year fails here, not at the first line
         self.year = year
         self._parse_error_log_interval = max(0.0, parse_error_log_interval)
@@ -140,7 +144,7 @@ class LogFileReader:
                             unparsed += 1
 
                     # Apply filter if present
-                    if self.filter_by and not self.filter_by(entry):
+                    if self.filter_by is not None and not self.filter_by(entry):
                         continue
 
                     yield entry
@@ -182,7 +186,7 @@ def _mtime(fd: int) -> datetime | None:
 def read_file(
     file_path: str | Path,
     parser: LogParser | None = None,
-    filter_by: Filter | None = None,
+    filter_by: Condition | None = None,
     *,
     year: int | None = None,
 ) -> Iterator[LogEntry]:
@@ -193,7 +197,7 @@ def read_file(
     Args:
         file_path: Path to the log file.
         parser: Parser to use.
-        filter_by: Optional filter.
+        filter_by: Optional condition (see `LogFileReader`).
         year: The year of the first line that carries no year; None places it
             before the file's modification time.
 
