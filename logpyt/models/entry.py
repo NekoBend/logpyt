@@ -56,7 +56,8 @@ class LogEntry(BaseModel):
         parsed: False for the fallback entry of a line the parser did not
             recognise: its message and raw are the whole line.
         truncated: True when the line was longer than ``max_line_bytes``:
-            ``raw`` and ``message`` come from its first ``max_line_bytes`` bytes.
+            ``raw`` and ``message`` come from its first ``max_line_bytes`` bytes,
+            less the start of a character the cut split (at most 3 bytes).
         meta: Free-form data for the caller; empty unless the caller sets it.
             A dict passed in is stored as is, not copied.
 

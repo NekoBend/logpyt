@@ -133,6 +133,25 @@ def test_cut_line_gives_a_truncated_entry() -> None:
     assert pipe.truncated == 2
 
 
+@pytest.mark.parametrize("char", ["日", "\U0001f600"], ids=["3b", "4b"])
+def test_cut_line_ends_before_a_split_character(char: str) -> None:
+    """A line cut inside a character ends before it, with no U+FFFD; an
+    uncut line that ends inside one keeps the U+FFFD, the file holds it.
+    """
+    full = _line("x" + char * 2).data
+    for dropped in range(1, len(char.encode())):
+        data = full[:-dropped]
+        pipe = _pipeline()
+
+        cut, whole = _entries(
+            pipe, [FramedLine(data, truncated=True), FramedLine(data)]
+        )
+
+        assert (cut.message, cut.truncated) == ("x" + char, True)
+        assert cut.raw == data.decode(errors="ignore")
+        assert whole.message == "x" + char + "\ufffd"
+
+
 def test_uid_map_attributes_the_entries_it_names() -> None:
     """An entry whose uid the map names gets that package; others stay None."""
     pipe = _pipeline(uid_packages={APP_UID: APP, 1000: "android"})
@@ -351,6 +370,25 @@ def test_parser_returning_no_entry_raises_type_error() -> None:
     pipe = _pipeline(parser=_Wrong())  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError, match=r"_Wrong\.parse returned dict"):
         pipe.push(FramedLine(b"a"))
+
+
+def test_entries_with_a_uid_are_counted() -> None:
+    """with_uid counts the entries whose uid is known, before where rejects
+    them; a uid name logpyt does not know, a line without the column, an
+    unparsed line and a divider carry none.
+    """
+    pipe = _pipeline(where=Tag("Nothing"))
+    lines = [
+        _line("number"),
+        _line("name", uid="root"),
+        _line("unknown name", uid="zzz"),
+        FramedLine(b"11-19 12:34:56.789  1  1 D T: no uid column"),
+        FramedLine(b"junk"),
+        FramedLine(b"--------- beginning of main"),
+    ]
+
+    assert _entries(pipe, lines) == []
+    assert (pipe.with_uid, pipe.rejected) == (2, 5)
 
 
 def test_line_conservation() -> None:

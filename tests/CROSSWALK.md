@@ -80,7 +80,7 @@ Rules:
 | tests/test_readers.py::test_log_file_reader_error_handling | tests/test_readers.py::test_parser_exception_propagates |
 | tests/test_readers.py::test_log_file_reader_filtering | tests/test_readers.py::test_where_filters_entries |
 | tests/test_readers.py::test_log_file_reader_parse_error_logging_sanitizes_and_caps_preview | tests/test_readers.py::test_unparsed_line_becomes_fallback_entry |
-| tests/test_readers.py::test_log_file_reader_parse_error_logging_throttled | covered by tests/test_readers.py::test_parser_exception_propagates |
+| tests/test_readers.py::test_log_file_reader_parse_error_logging_throttled | tests/test_readers.py::test_parser_exception_propagates |
 | tests/behavior/test_offline_behavior.py::test_reader_filter_by_yields_only_matching_entries | tests/behavior/test_offline_behavior.py::test_reader_where_yields_only_matching_entries |
 | tests/behavior/test_package_filter_behavior.py::test_file_reader_package_filter_yields_nothing | tests/behavior/test_package_filter_behavior.py::test_read_file_package_condition_needs_a_uid_map |
 | tests/behavior/test_package_filter_behavior.py::test_read_file_package_condition_yields_nothing | tests/behavior/test_package_filter_behavior.py::test_read_file_package_condition_needs_a_uid_map |
