@@ -416,11 +416,13 @@ def _function_id(item: pytest.Function) -> str | None:
 
 
 def collected_test_ids(root: Path) -> set[str]:
-    """Return the function-level ids ``pytest --collect-only`` finds in ``root/tests``.
+    """Return the test ids a default ``pytest --collect-only`` finds in ``root``.
 
-    A separate pytest process collects the whole of ``tests/``, so the result
-    does not depend on what the current run selected (``-k``, a path,
-    ``PYTEST_ADDOPTS``).
+    A separate pytest process collects what a plain ``pytest`` run in ``root``
+    would collect, so the result does not depend on what the current run
+    selected (``-k``, a path, ``PYTEST_ADDOPTS``). No path is passed: an
+    explicit path would override ``testpaths``, and a test that ``testpaths``
+    leaves out is no longer run by CI.
     """
     command = [
         sys.executable,
@@ -431,7 +433,6 @@ def collected_test_ids(root: Path) -> set[str]:
         "-p",
         "no:cacheprovider",
         f"--rootdir={root}",
-        "tests",
     ]
     env = {**os.environ, "PYTEST_ADDOPTS": "", "PYTHONIOENCODING": "utf-8"}
     result = subprocess.run(
@@ -705,6 +706,24 @@ def test_main_overwrites_an_existing_file_with_force(tmp_path: Path) -> None:
 
     assert main(["--write-inventory", str(target), "--force"]) == 0
     assert target.read_bytes() == inventory_text(discover_test_ids(ROOT)).encode()
+
+
+def test_collected_test_ids_respect_testpaths(tmp_path: Path) -> None:
+    """A module that ``testpaths`` leaves out is found by ast but not collected."""
+    root = _tree(
+        tmp_path,
+        {
+            "pytest.ini": "[pytest]\ntestpaths = tests/kept\n",
+            "tests/kept/test_a.py": "def test_x(): ...\n",
+            "tests/dropped/test_b.py": "def test_y(): ...\n",
+        },
+    )
+
+    assert collected_test_ids(root) == {"tests/kept/test_a.py::test_x"}
+    assert discover_test_ids(root) == {
+        "tests/kept/test_a.py::test_x",
+        "tests/dropped/test_b.py::test_y",
+    }
 
 
 def test_collected_test_ids_leave_out_a_module_pytest_ignores(tmp_path: Path) -> None:
