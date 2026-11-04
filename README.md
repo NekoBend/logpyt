@@ -117,30 +117,35 @@ with LogStream(
 
 ### Grouping
 
-Group logs by fields (e.g., PID, TID) within a time threshold.
+Group logs by fields (e.g., PID, TID) that arrive within a time gap. A stream
+given `group_by=GroupBy(...)` delivers `LogGroup` objects: a sequence of the
+entries plus `key` and the `reason` the group closed (`"gap"`, `"key"`,
+`"size"`, `"evicted"`, `"idle"` or `"end"`). `mode="consecutive"` keeps one
+group open; `mode="windowed"` keeps one per key, so interleaved threads group
+apart. Memory is bounded (`max_group_size`, `max_total_entries`,
+`max_total_bytes`), and invalid arguments raise at once.
 
 ```python
-from logpyt import LogStream, LogEntry, StreamHandle
-from logpyt.groupers import LogGrouper
+from logpyt import GroupBy, LogGroup, LogStream, StreamHandle, read_file
 
 # Group logs by PID and TID if they occur within 50ms of each other
-grouper = LogGrouper(
-    by=("pid", "tid"),
-    threshold_ms=50.0,
-    emit_mode="group"  # Emits list[LogEntry] instead of single LogEntry
-)
+group_by = GroupBy(keys=("pid", "tid"), gap_ms=50.0, mode="windowed")
 
-def group_callback(entries: list[LogEntry], handle: StreamHandle):
-    print(f"Received group of {len(entries)} logs")
-    for entry in entries:
+def group_callback(group: LogGroup, handle: StreamHandle):
+    print(f"Received group of {len(group)} logs ({group.reason})")
+    for entry in group:
         print(f"  - {entry.message}")
 
 with LogStream(
-    group_by=grouper,
+    group_by=group_by,
     stdout_callback=group_callback,
     # ...
 ) as stream:
     stream.join()
+
+# The same grouping offline
+for group in group_by.groups(read_file("app.log")):
+    print(group.key, len(group))
 ```
 
 ### Offline Analysis
@@ -208,7 +213,7 @@ if __name__ == "__main__":
 - **`LogStream` / `AsyncLogStream`**: Manages the ADB subprocess and dispatching of logs.
 - **`StreamHandle` / `AsyncStreamHandle`**: Safe handle to control the stream (stop, kill, pause, resume) from callbacks.
 - **`Condition` / `Filter`**: Predicates to filter log entries (`&`, `|`, `~`).
-- **`LogGrouper`**: Groups consecutive logs based on keys and time thresholds.
+- **`GroupBy` / `LogGroup`**: Groups logs by keys and time gaps; a group is a sequence of entries with its key and close reason.
 - **`logpyt.adb`**:
   - `resolve_adb()`: Finds the ADB executable.
   - `list_devices()`, `wait_for_device()`, `adb_connect()`: Device helpers (async twins included).

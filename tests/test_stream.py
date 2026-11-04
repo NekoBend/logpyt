@@ -5,6 +5,7 @@ import threading
 import time
 from contextlib import suppress
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -16,8 +17,8 @@ from logpyt.exceptions import (
     LogStreamTimeoutError,
 )
 from logpyt.filters import Filter
-from logpyt.groupers import LogGrouper
-from logpyt.models import LogEntry, LogLevel
+from logpyt.groupers import GroupBy
+from logpyt.models import LogEntry, LogGroup, LogLevel
 from logpyt.parsers import RawLogParser
 from logpyt.streams import LogStream, StreamState
 
@@ -326,11 +327,11 @@ def test_stream_grouper_flushes_buffered_entries_on_stdout_eof(
     mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
     # Large threshold + same key => both entries buffer, nothing emitted early.
-    grouper = LogGrouper(by=["tag"], threshold_ms=10_000.0, emit_mode="group")
+    grouper = GroupBy(keys=("tag",), gap_ms=10_000.0)
 
-    received: list[list[LogEntry]] = []
+    received: list[LogGroup] = []
 
-    def callback(item: list[LogEntry], handle) -> None:
+    def callback(item: LogGroup, handle) -> None:
         del handle
         received.append(item)
 
@@ -361,10 +362,11 @@ def test_stream_grouper_flushes_buffered_entries_on_stdout_eof(
     stream.start()
     stream.join(timeout=1.0)
 
-    # emit_mode="group" delivers the buffered group as a single list argument.
+    # The buffered group is delivered as one LogGroup argument.
     assert len(received) == 1
     group = received[0]
-    assert isinstance(group, list)
+    assert isinstance(group, LogGroup)
+    assert group.reason == "end"
     assert [entry.message for entry in group] == ["line-1", "line-2"]
 
 
@@ -518,6 +520,35 @@ def test_queue_full_warning_rate_limited(caplog, mocker) -> None:
         rec for rec in caplog.records if "callback queue is full" in rec.message
     ]
     assert len(queue_warnings) == 1
+
+
+def test_queue_full_warning_counts_the_entries_of_a_dropped_group(
+    caplog, mocker
+) -> None:
+    """A dropped LogGroup counts as its entries, not as one item."""
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
+    stream = LogStream(group_by=GroupBy(keys=("pid",), gap_ms=50.0), max_queue_size=1)
+    entries = tuple(
+        LogEntry(
+            timestamp=datetime(2026, 11, 4, 12, 0, i, tzinfo=UTC),
+            pid=1,
+            tid=1,
+            level="I",
+            tag="T",
+            message=str(i),
+            raw=str(i),
+        )
+        for i in range(3)
+    )
+    group = LogGroup(key=(1,), entries=entries, reason="gap")
+    stream._callback_queue.put_nowait(([group], "stdout"))  # the queue is full
+
+    with caplog.at_level(logging.WARNING, logger="logpyt"):
+        stream._enqueue_callback_item(([group], "stdout"), "stdout")
+
+    assert [rec.message for rec in caplog.records] == [
+        "LogStream callback queue full; dropping 3 grouped entries."
+    ]
 
 
 def test_stop_does_not_hang_when_callback_queue_is_full(mock_popen, mocker) -> None:
@@ -941,7 +972,7 @@ def test_stream_grouper_only_groups_stdout_not_stderr(mock_popen, mocker) -> Non
     """A stderr line must not be grouped or misrouted through the shared grouper."""
     mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
 
-    grouper = LogGrouper(by=["tag"], threshold_ms=10_000.0, emit_mode="group")
+    grouper = GroupBy(keys=("tag",), gap_ms=10_000.0)
 
     stdout_items: list[object] = []
     stderr_items: list[object] = []
@@ -992,7 +1023,7 @@ def test_stream_grouper_only_groups_stdout_not_stderr(mock_popen, mocker) -> Non
     # The buffered stdout entries flush as one group, only to stdout_callback.
     assert len(stdout_items) == 1
     group = stdout_items[0]
-    assert isinstance(group, list)
+    assert isinstance(group, LogGroup)
     messages = []
     for entry in group:
         assert isinstance(entry, LogEntry)
@@ -1009,10 +1040,22 @@ DIVIDER = "--------- beginning of crash\n"
 @pytest.mark.parametrize("mode", ["consecutive", "windowed"])
 def test_grouping_takes_a_divider_after_a_zoned_line(mocker, mode) -> None:
     mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
-    stream = LogStream(group_keys=["tag"], group_interval=1000, group_mode=mode)
+    stream = LogStream(group_by=GroupBy(keys=("tag",), gap_ms=1000, mode=mode))
 
     for line in (ZONED_LINE, DIVIDER, ZONED_LINE):
         stream._process_line(line, "stdout")
 
-    assert stream.group_by is not None
-    assert stream.group_by.flush()
+    assert stream._grouper is not None
+    assert stream._grouper.flush()
+
+
+def test_group_by_takes_only_a_group_by(mocker) -> None:
+    """The 2.x grouper objects and the shortcut keywords are gone (design 2.1)."""
+    mocker.patch("logpyt.adb.resolve_adb", return_value="adb")
+    not_a_spec: Any = object()
+    shortcut: dict[str, Any] = {"group_keys": ["tag"], "group_interval": 10.0}
+
+    with pytest.raises(TypeError, match="group_by must be a GroupBy"):
+        LogStream(group_by=not_a_spec)
+    with pytest.raises(TypeError, match="group_keys"):
+        LogStream(**shortcut)

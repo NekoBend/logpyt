@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from logpyt import AsyncLogStream, LogStreamError, LogStreamKilledError
+from logpyt import AsyncLogStream, GroupBy, LogStreamError, LogStreamKilledError
 from logpyt.filters import Condition
 from logpyt.streams import StreamState
 from tests.conftest import (
@@ -42,7 +42,7 @@ from tests.conftest import (
 if TYPE_CHECKING:
     from collections.abc import Awaitable
 
-    from logpyt import AsyncStreamHandle, LogEntry
+    from logpyt import AsyncStreamHandle, LogEntry, LogGroup
     from tests.conftest import SpawnedChild
 
 # Generous bound for "the stream finishes" when nothing should block it. It also
@@ -289,6 +289,47 @@ async def test_all_accepted_entries_are_delivered_after_eof_with_a_slow_callback
 
     assert outcome is None
     assert delivered == [f"m{i}" for i in range(count)]
+
+
+@pytest.mark.asyncio
+async def test_group_by_delivers_log_groups_to_the_callback(fake_adb: FakeAdb) -> None:
+    """With group_by, stdout_callback receives LogGroup objects (design 2.6).
+
+    Two pids interleave, a line one second later expires both, and the group
+    still open when adb exits is delivered with reason "end".
+    """
+    fake_adb.logcat(
+        run(
+            out(threadtime("a1", pid=1, tid=1, time_="03:04:05.000")),
+            out(threadtime("b1", pid=2, tid=2, time_="03:04:05.001")),
+            out(threadtime("a2", pid=1, tid=1, time_="03:04:05.002")),
+            out(threadtime("late", pid=3, tid=3, time_="03:04:06.000")),
+        )
+    )
+    rec = Recorder()
+    groups: list[LogGroup] = []
+
+    async def on_group(group: LogGroup, _handle: AsyncStreamHandle) -> None:
+        groups.append(group)
+
+    stream = AsyncLogStream(
+        group_by=GroupBy(keys=("pid",), gap_ms=100.0, mode="windowed"),
+        stdout_callback=on_group,
+        on_error=rec.on_error,
+    )
+    try:
+        await bounded(stream.start())
+        outcome = await join_outcome(stream)
+    finally:
+        await shutdown(stream)
+
+    assert outcome is None
+    assert rec.errors == []
+    assert [(g.key, [e.message for e in g], g.reason) for g in groups] == [
+        ((2,), ["b1"], "gap"),
+        ((1,), ["a1", "a2"], "gap"),
+        ((3,), ["late"], "end"),
+    ]
 
 
 # -- read_timeout -----------------------------------------------------------

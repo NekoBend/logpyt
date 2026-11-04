@@ -11,6 +11,7 @@ section 11, risk 12: ty is pre-1.0 and may regress on self-typed overloads).
 
 from __future__ import annotations
 
+from collections.abc import Hashable, Iterator
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal, assert_never, assert_type, overload
 
@@ -25,10 +26,12 @@ from logpyt import (
     CrashCondition,
     Filter,
     Gap,
+    GroupBy,
     IncompleteCaptureError,
     Level,
     LogEntry,
     LogFileReader,
+    LogGroup,
     LogpytError,
     LogStream,
     MessageContains,
@@ -50,10 +53,12 @@ from logpyt import (
 )
 from logpyt.adb import DeviceInfo, DeviceKind, list_devices, wait_for_device
 from logpyt.exceptions import CallbackStage
+from logpyt.groupers import GroupKey
+from logpyt.models.group import GroupReason
 from logpyt.streams._events import GapReason, IncompleteReason, StreamState
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 
 def check_config() -> None:
@@ -211,15 +216,43 @@ def check_filter_by_takes_any_condition() -> None:
     read_file("app.log", filter_by=_is_error)  # ty: ignore[invalid-argument-type]
 
 
+def check_group_by(entries: list[LogEntry]) -> None:
+    spec = GroupBy(keys=("pid", "tag"), gap_ms=50.0, mode="windowed")
+    assert_type(spec.keys, tuple[GroupKey, ...])
+    assert_type(spec.gap_ms, float)
+    assert_type(spec.mode, Literal["consecutive", "windowed"])
+    assert_type(spec.idle_flush_ms, float | Literal["gap"] | None)
+    assert_type(spec.max_total_bytes, int)
+    assert_type(spec.groups(entries), Iterator[LogGroup])
+    GroupBy(keys=(), gap_ms=1, idle_flush_ms=None)
+    GroupBy(keys="pid", gap_ms=50.0)  # ty: ignore[invalid-argument-type]
+    GroupBy(keys=["pid"], gap_ms=50.0)  # ty: ignore[invalid-argument-type]
+    GroupBy(keys=("pdi",), gap_ms=50.0)  # ty: ignore[invalid-argument-type]
+    GroupBy(keys=("pid",), gap_ms=50.0, mode="windows")  # ty: ignore[invalid-argument-type]
+    GroupBy(keys=("pid",), gap_ms=50.0, idle_flush_ms="never")  # ty: ignore[invalid-argument-type]
+    GroupBy(keys=("pid",), gap_ms=50.0, emit_mode="group")  # ty: ignore[unknown-argument]
+    GroupBy(("pid",), 50.0)  # ty: ignore[missing-argument, too-many-positional-arguments]
+    spec.gap_ms = 10.0  # ty: ignore[invalid-assignment]
+
+
+def check_log_group(group: LogGroup) -> None:
+    assert_type(group.key, tuple[Hashable, ...])
+    assert_type(group.entries, tuple[LogEntry, ...])
+    assert_type(group.reason, GroupReason)
+    assert_type(group[0], LogEntry)
+    assert_type(group[1:], tuple[LogEntry, ...])
+    assert_type(len(group), int)
+    as_sequence: Sequence[LogEntry] = group
+    del as_sequence
+    for entry in group:
+        assert_type(entry, LogEntry)
+    LogGroup(key=(1,), entries=(group[0],), reason="gap")
+    LogGroup(key=(1,), entries=(group[0],), reason="timeout")  # ty: ignore[invalid-argument-type]
+    LogGroup(key=(1,), entries=[group[0]], reason="end")  # ty: ignore[invalid-argument-type]
+    group.reason = "end"  # ty: ignore[invalid-assignment]
+
+
 # -- the stream constructor overloads of design section 2.3, on a stand-in ----------
-
-
-class _GroupBy:
-    """Stands in for logpyt.GroupBy (PR-07)."""
-
-
-class _LogGroup:
-    """Stands in for logpyt.LogGroup (PR-07)."""
 
 
 class _StreamShape[T]:
@@ -238,13 +271,13 @@ class _StreamShape[T]:
     ) -> None: ...
     @overload
     def __init__(
-        self: _StreamShape[_LogGroup],
+        self: _StreamShape[LogGroup],
         config: StreamConfig | None = None,
         /,
         *,
         where: Condition | None = None,
-        group_by: _GroupBy,
-        on_item: Callable[[_LogGroup], object] | None = None,
+        group_by: GroupBy,
+        on_item: Callable[[LogGroup], object] | None = None,
         on_event: Callable[[StreamEvent], object] | None = None,
     ) -> None: ...
     def __init__(
@@ -253,9 +286,9 @@ class _StreamShape[T]:
         /,
         *,
         where: Condition | None = None,
-        group_by: _GroupBy | None = None,
+        group_by: GroupBy | None = None,
         on_item: Callable[[LogEntry], object]
-        | Callable[[_LogGroup], object]
+        | Callable[[LogGroup], object]
         | None = None,
         on_event: Callable[[StreamEvent], object] | None = None,
     ) -> None:
@@ -268,7 +301,7 @@ def _on_event(event: StreamEvent) -> None:
 
 def check_stream_overloads() -> None:
     entries: list[LogEntry] = []
-    groups: list[_LogGroup] = []
+    groups: list[LogGroup] = []
     events: list[StreamEvent] = []
     config = StreamConfig(serial="emulator-5554", since="now")
     assert_type(_StreamShape(), _StreamShape[LogEntry])
@@ -280,11 +313,12 @@ def check_stream_overloads() -> None:
         _StreamShape(where=Tag("x"), on_event=events.append),
         _StreamShape[LogEntry],
     )
-    assert_type(_StreamShape(group_by=_GroupBy()), _StreamShape[_LogGroup])
+    spec = GroupBy(keys=("pid",), gap_ms=50.0)
+    assert_type(_StreamShape(group_by=spec), _StreamShape[LogGroup])
     assert_type(
-        _StreamShape(config, group_by=_GroupBy(), on_item=groups.append),
-        _StreamShape[_LogGroup],
+        _StreamShape(config, group_by=spec, on_item=groups.append),
+        _StreamShape[LogGroup],
     )
-    _StreamShape(group_by=_GroupBy(), on_item=entries.append)  # ty: ignore[no-matching-overload]
+    _StreamShape(group_by=spec, on_item=entries.append)  # ty: ignore[no-matching-overload]
     _StreamShape(on_item=groups.append)  # ty: ignore[invalid-argument-type]
     _StreamShape(config=config)  # ty: ignore[no-matching-overload]

@@ -1,11 +1,12 @@
 from datetime import UTC, datetime, timedelta
 
-from logpyt.groupers import WindowedLogGrouper
+from logpyt import GroupBy
+from logpyt._core.grouping import Grouper
 from logpyt.models import LogEntry
 
 
-def test_interleaved_groups() -> None:  # noqa: PLR0914 - timing scenario keeps all entries/results in one scope
-    grouper = WindowedLogGrouper(by=["tag"], threshold_ms=100.0)
+def test_interleaved_groups() -> None:
+    grouper = Grouper(GroupBy(keys=("tag",), gap_ms=100.0, mode="windowed"))
     base_time = datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC).replace(tzinfo=None)
 
     # Create interleaved entries
@@ -50,16 +51,16 @@ def test_interleaved_groups() -> None:  # noqa: PLR0914 - timing scenario keeps 
     )
 
     # Process entries
-    res1 = grouper.process(e1)
+    res1 = grouper.add(e1, 0.0)
     assert len(res1) == 0
 
-    res2 = grouper.process(e2)
+    res2 = grouper.add(e2, 0.0)
     assert len(res2) == 0
 
-    res3 = grouper.process(e3)
+    res3 = grouper.add(e3, 0.0)
     assert len(res3) == 0
 
-    res4 = grouper.process(e4)
+    res4 = grouper.add(e4, 0.0)
     assert len(res4) == 0
 
     # Now trigger a timeout for Tag1
@@ -74,29 +75,22 @@ def test_interleaved_groups() -> None:  # noqa: PLR0914 - timing scenario keeps 
         raw="raw5",
     )
 
-    res5 = grouper.process(e5)
-    # Should flush BOTH Tag1 and Tag2 groups because e5 is far ahead of both.
+    res5 = grouper.add(e5, 0.0)
+    # Should flush BOTH Tag1 and Tag2 groups because e5 is far ahead of both,
+    # in expiry order: Tag1 (20 + 100 ms) before Tag2 (30 + 100 ms).
     assert len(res5) == 2
-
-    # Sort to ensure order
-    groups = sorted(res5, key=lambda g: g[0].tag)
-    groups_list: list[list[LogEntry]] = [g for g in groups if isinstance(g, list)]
+    assert {group.reason for group in res5} == {"gap"}
 
     # Tag1 Group
-    assert groups_list[0][0].tag == "Tag1"
-    assert len(groups_list[0]) == 2
-    assert groups_list[0][0].message == "Msg1"
-    assert groups_list[0][1].message == "Msg3"
+    assert res5[0].key == ("Tag1",)
+    assert [entry.message for entry in res5[0]] == ["Msg1", "Msg3"]
 
     # Tag2 Group
-    assert groups_list[1][0].tag == "Tag2"
-    assert len(groups_list[1]) == 2
-    assert groups_list[1][0].message == "Msg2"
-    assert groups_list[1][1].message == "Msg4"
+    assert res5[1].key == ("Tag2",)
+    assert [entry.message for entry in res5[1]] == ["Msg2", "Msg4"]
 
     # Flush remaining (e5)
     res_flush = grouper.flush()
     assert len(res_flush) == 1
-    flush_group = res_flush[0]
-    assert isinstance(flush_group, list)
-    assert flush_group[0].message == "Msg5"
+    assert res_flush[0].reason == "end"
+    assert res_flush[0][0].message == "Msg5"

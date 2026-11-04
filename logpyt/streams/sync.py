@@ -12,6 +12,7 @@ from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, Literal, TextIO
 
 from logpyt import adb
+from logpyt._core.grouping import Grouper
 from logpyt.adb import _CREATE_NO_WINDOW, _check_package_name
 from logpyt.exceptions import (
     LogStreamError,
@@ -20,7 +21,8 @@ from logpyt.exceptions import (
     LogStreamTimeoutError,
 )
 from logpyt.filters import Condition, _require_condition
-from logpyt.groupers import LogGrouper, WindowedLogGrouper
+from logpyt.groupers import GroupBy
+from logpyt.models import LogGroup
 from logpyt.parsers import LogParser, ParseContext, ThreadTimeLogParser
 from logpyt.parsers._fallback import unparsed_entry
 
@@ -30,6 +32,8 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from logpyt.models import LogEntry
+
+__all__ = ["LogStream", "PidMonitor", "StreamHandle"]
 
 # Cap a single readline() so a device that emits output without a newline cannot
 # grow the reader thread's memory without bound (mirrors the async _READ_LIMIT).
@@ -272,14 +276,15 @@ class LogStream:
         stream.join()
         ```
 
-        Concise grouping usage:
+        Grouping usage:
         ```python
-        # Group logs by PID and TID if within 50ms, handling interleaved logs
+        from logpyt import GroupBy
+
+        # Group logs by PID and TID if within 50ms, handling interleaved logs;
+        # the callback then receives LogGroup objects.
         stream = LogStream(
             stdout_callback=my_callback,
-            group_keys=["pid", "tid"],
-            group_interval=50.0,
-            group_mode="windowed"
+            group_by=GroupBy(keys=("pid", "tid"), gap_ms=50.0, mode="windowed"),
         )
         ```
     """
@@ -290,7 +295,7 @@ class LogStream:
         device_id: str | None = None,
         parser: LogParser | None = None,
         filter_by: Condition | None = None,
-        group_by: LogGrouper | None = None,
+        group_by: GroupBy | None = None,
         stdout_callback: LogCallback | None = None,
         stderr_callback: LogCallback | None = None,
         on_start: LifecycleCallback | None = None,
@@ -298,9 +303,6 @@ class LogStream:
         on_state: StateCallback | None = None,
         on_error: ErrorCallback | None = None,
         logcat_args: Sequence[str] | None = None,
-        group_keys: Sequence[str] | None = None,
-        group_interval: float | None = None,
-        group_mode: Literal["consecutive", "windowed"] = "consecutive",
         auto_reconnect: bool = False,  # noqa: FBT001, FBT002 (existing public signature)
         reconnect_delay: float = 1.0,
         max_queue_size: int = 10000,
@@ -321,7 +323,9 @@ class LogStream:
             filter_by: The condition an entry must meet to be delivered. The
                 packages of its `Package` conditions (anywhere in the tree,
                 under `Or` and `Not` too) are resolved to pids.
-            group_by: Grouper to group log entries.
+            group_by: How to group the stdout entries; the stdout callback
+                then receives `LogGroup` objects. The groups still open when
+                stdout ends are delivered with reason "end".
             stdout_callback: Callback for processed stdout entries.
                 Signature: `Callable[[LogEntry, StreamHandle], None]`.
                 The second argument is the `StreamHandle`, which allows controlling
@@ -335,9 +339,6 @@ class LogStream:
             on_state: Hook called when state changes.
             on_error: Hook called when an error occurs.
             logcat_args: Additional arguments for `adb logcat`.
-            group_keys: Shortcut to create a grouper. Fields to group by.
-            group_interval: Shortcut to create a grouper. Time threshold in ms.
-            group_mode: Shortcut to create a grouper. "consecutive" or "windowed".
             auto_reconnect: Whether to automatically reconnect when the process exits.
             reconnect_delay: Delay in seconds before reconnecting.
             max_queue_size: Maximum size of the callback queue. Defaults to 10000.
@@ -371,21 +372,12 @@ class LogStream:
         self.pid_poll_backoff_factor = pid_poll_backoff_factor
         self.pid_max_resolves_per_cycle = pid_max_resolves_per_cycle
 
-        # Handle grouper shortcut
+        if group_by is not None and not isinstance(group_by, GroupBy):
+            msg = f"group_by must be a GroupBy, not {type(group_by).__name__}"
+            raise TypeError(msg)
         self.group_by = group_by
-        if self.group_by is None and group_keys and group_interval is not None:
-            if group_mode == "windowed":
-                self.group_by = WindowedLogGrouper(
-                    by=group_keys,
-                    threshold_ms=group_interval,
-                    emit_mode="group",
-                )
-            else:
-                self.group_by = LogGrouper(
-                    by=group_keys,
-                    threshold_ms=group_interval,
-                    emit_mode="group",
-                )
+        # One grouping state per stream; the stdout reader flushes it at EOF.
+        self._grouper = None if group_by is None else Grouper(group_by)
 
         self.stdout_callback = stdout_callback
         self.stderr_callback = stderr_callback
@@ -399,7 +391,7 @@ class LogStream:
         # Serializes grouper access: stdout and stderr reader threads share one grouper.
         self._grouper_lock = threading.Lock()
         self._callback_queue: queue.Queue[
-            tuple[list[LogEntry | list[LogEntry]], str] | None
+            tuple[Sequence[LogEntry | LogGroup], str] | None
         ] = queue.Queue(maxsize=self.max_queue_size)
         self._pid_monitor: PidMonitor | None = None
         # F5-1: every Package in the condition tree, not only Filter's. F5-3:
@@ -792,9 +784,9 @@ class LogStream:
             if self._process:
                 self._process.terminate()
         finally:
-            if source == "stdout" and self.group_by:
+            if source == "stdout" and self._grouper is not None:
                 with self._grouper_lock:
-                    flushed = self.group_by.flush()
+                    flushed = self._grouper.flush()
                 if flushed:
                     # force so the terminal group is delivered even if the queue
                     # is saturated (matches the shutdown sentinel).
@@ -830,7 +822,7 @@ class LogStream:
 
     def _enqueue_callback_item(
         self,
-        item: tuple[list[LogEntry | list[LogEntry]], str] | None,
+        item: tuple[Sequence[LogEntry | LogGroup], str] | None,
         source: str | None,
         force: bool = False,  # noqa: FBT001, FBT002 (existing public signature)
     ) -> None:
@@ -863,9 +855,9 @@ class LogStream:
             except queue.Full:
                 pass
 
-        if source == "stdout" and self.group_by:
+        if source == "stdout" and self._grouper is not None:
             dropped = (
-                sum(len(x) if isinstance(x, list) else 1 for x in item[0])
+                sum(len(x) if isinstance(x, LogGroup) else 1 for x in item[0])
                 if item is not None
                 else 0
             )
@@ -908,10 +900,10 @@ class LogStream:
         # 3. Group
         # Grouping applies to stdout only (the shared grouper is flushed on stdout
         # EOF); feeding stderr through it would flush/misroute stdout groups.
-        items_to_emit: list[LogEntry | list[LogEntry]]
-        if self.group_by and source == "stdout":
+        items_to_emit: Sequence[LogEntry | LogGroup]
+        if self._grouper is not None and source == "stdout":
             with self._grouper_lock:
-                items_to_emit = self.group_by.process(entry)
+                items_to_emit = self._grouper.add(entry, time.monotonic())
         else:
             items_to_emit = [entry]
 

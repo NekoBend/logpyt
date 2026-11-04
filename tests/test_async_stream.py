@@ -1,12 +1,14 @@
 import asyncio
 import contextlib
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from logpyt.exceptions import LogStreamInternalError, LogStreamTimeoutError
-from logpyt.models import LogEntry
+from logpyt.groupers import GroupBy
+from logpyt.models import LogEntry, LogGroup
 from logpyt.parsers import RawLogParser
 from logpyt.streams.async_stream import AsyncLogStream, AsyncPidMonitor, StreamState
 from tests.conftest import async_wait_until
@@ -888,8 +890,6 @@ async def test_async_stream_groups_stdout_and_flushes_on_eof(
     mock_resolve_adb, mock_create_subprocess, mock_process
 ):
     """AsyncLogStream with group_by groups stdout entries and flushes on EOF."""
-    from logpyt.groupers import WindowedLogGrouper
-
     lines = [b"line1\n", b"line2\n", b""]
     line_iter = iter(lines)
 
@@ -912,16 +912,16 @@ async def test_async_stream_groups_stdout_and_flushes_on_eof(
     stream = AsyncLogStream(
         parser=parser,
         stdout_callback=callback,
-        group_by=WindowedLogGrouper(by=["tag"], threshold_ms=100000.0),
+        group_by=GroupBy(keys=("tag",), gap_ms=100000.0, mode="windowed"),
     )
 
     await stream.start()
     await stream.join(timeout=2.0)
 
     # Both stdout entries share tag "T" within threshold, so the EOF flush emits
-    # them as a single grouped list (grouping is stdout-only and forced on flush).
-    groups = [item for item in dispatched if isinstance(item, list)]
-    assert any(len(g) == 2 for g in groups)
+    # them as a single group (grouping is stdout-only and forced on flush).
+    groups = [item for item in dispatched if isinstance(item, LogGroup)]
+    assert [(len(g), g.reason) for g in groups] == [(2, "end")]
 
 
 @pytest.mark.asyncio
@@ -971,10 +971,22 @@ async def test_grouping_takes_a_divider_after_a_zoned_line(
     mock_resolve_adb, mode
 ) -> None:
     del mock_resolve_adb
-    stream = AsyncLogStream(group_keys=["tag"], group_interval=1000, group_mode=mode)
+    stream = AsyncLogStream(group_by=GroupBy(keys=("tag",), gap_ms=1000, mode=mode))
 
     for line in (ZONED_LINE, DIVIDER, ZONED_LINE):
         await stream._process_line(line, "stdout")
 
-    assert stream.group_by is not None
-    assert stream.group_by.flush()
+    assert stream._grouper is not None
+    assert stream._grouper.flush()
+
+
+def test_async_group_by_takes_only_a_group_by(mock_resolve_adb) -> None:
+    """The 2.x grouper objects and the shortcut keywords are gone (design 2.1)."""
+    del mock_resolve_adb
+    not_a_spec: Any = object()
+    shortcut: dict[str, Any] = {"group_keys": ["tag"], "group_interval": 10.0}
+
+    with pytest.raises(TypeError, match="group_by must be a GroupBy"):
+        AsyncLogStream(group_by=not_a_spec)
+    with pytest.raises(TypeError, match="group_keys"):
+        AsyncLogStream(**shortcut)

@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 from logpyt import adb
+from logpyt._core.grouping import Grouper
 from logpyt.adb import _CREATE_NO_WINDOW, _check_package_name
 from logpyt.exceptions import (
     LogStreamError,
@@ -17,7 +19,7 @@ from logpyt.exceptions import (
     LogStreamTimeoutError,
 )
 from logpyt.filters import Condition, _require_condition
-from logpyt.groupers import LogGrouper, WindowedLogGrouper
+from logpyt.groupers import GroupBy
 from logpyt.parsers import LogParser, ParseContext, ThreadTimeLogParser
 from logpyt.parsers._fallback import unparsed_entry
 
@@ -26,7 +28,9 @@ from .common import StreamState, build_pidof_command
 if TYPE_CHECKING:
     from types import TracebackType
 
-    from logpyt.models import LogEntry
+    from logpyt.models import LogEntry, LogGroup
+
+__all__ = ["AsyncLogStream", "AsyncPidMonitor", "AsyncStreamHandle"]
 
 # Configure module logger
 logger = logging.getLogger(__name__)
@@ -287,7 +291,7 @@ class AsyncLogStream:
         device_id: str | None = None,
         parser: LogParser | None = None,
         filter_by: Condition | None = None,
-        group_by: LogGrouper | None = None,
+        group_by: GroupBy | None = None,
         stdout_callback: AsyncLogCallback | None = None,
         stderr_callback: AsyncLogCallback | None = None,
         on_start: AsyncLifecycleCallback | None = None,
@@ -295,9 +299,6 @@ class AsyncLogStream:
         on_state: AsyncStateCallback | None = None,
         on_error: AsyncErrorCallback | None = None,
         logcat_args: Sequence[str] | None = None,
-        group_keys: Sequence[str] | None = None,
-        group_interval: float | None = None,
-        group_mode: Literal["consecutive", "windowed"] = "consecutive",
         auto_reconnect: bool = False,  # noqa: FBT001, FBT002  existing public signature
         reconnect_delay: float = 1.0,
         pid_poll_interval: float = 5.0,
@@ -317,7 +318,9 @@ class AsyncLogStream:
             filter_by: The condition an entry must meet to be delivered. The
                 packages of its `Package` conditions (anywhere in the tree,
                 under `Or` and `Not` too) are resolved to pids.
-            group_by: Grouper to group log entries.
+            group_by: How to group the stdout entries; the stdout callback
+                then receives `LogGroup` objects. The groups still open when
+                stdout ends are delivered with reason "end".
             stdout_callback: Async callback for processed stdout entries.
             stderr_callback: Async callback for processed stderr entries.
             on_start: Async hook called when stream starts.
@@ -325,9 +328,6 @@ class AsyncLogStream:
             on_state: Async hook called when state changes.
             on_error: Async hook called when an error occurs.
             logcat_args: Additional arguments for `adb logcat`.
-            group_keys: Shortcut to create a grouper. Fields to group by.
-            group_interval: Shortcut to create a grouper. Time threshold in ms.
-            group_mode: Shortcut to create a grouper. "consecutive" or "windowed".
             auto_reconnect: Whether to automatically reconnect when the process exits.
             reconnect_delay: Delay in seconds before reconnecting.
             pid_poll_interval: Interval in seconds for PID monitoring.
@@ -359,21 +359,12 @@ class AsyncLogStream:
         self.callback_queue_policy = callback_queue_policy
         self.pid_max_resolves_per_cycle = pid_max_resolves_per_cycle
 
-        # Handle grouper shortcut
+        if group_by is not None and not isinstance(group_by, GroupBy):
+            msg = f"group_by must be a GroupBy, not {type(group_by).__name__}"
+            raise TypeError(msg)
         self.group_by = group_by
-        if self.group_by is None and group_keys and group_interval is not None:
-            if group_mode == "windowed":
-                self.group_by = WindowedLogGrouper(
-                    by=group_keys,
-                    threshold_ms=group_interval,
-                    emit_mode="group",
-                )
-            else:
-                self.group_by = LogGrouper(
-                    by=group_keys,
-                    threshold_ms=group_interval,
-                    emit_mode="group",
-                )
+        # One grouping state per stream; the stdout reader flushes it at EOF.
+        self._grouper = None if group_by is None else Grouper(group_by)
 
         self.stdout_callback = stdout_callback
         self.stderr_callback = stderr_callback
@@ -421,7 +412,7 @@ class AsyncLogStream:
 
     async def _dispatch_item(
         self,
-        item: LogEntry | list[LogEntry],
+        item: LogEntry | LogGroup,
         source: str,
         callback: AsyncLogCallback,
         force: bool = False,  # noqa: FBT001, FBT002  (internal delivery-guarantee flag)
@@ -825,9 +816,9 @@ class AsyncLogStream:
             self._exceptions.append(e)
             await self._invoke_callback(self.on_error, e)
         finally:
-            if source == "stdout" and self.group_by:
+            if source == "stdout" and self._grouper is not None:
                 # Flush grouper
-                flushed = self.group_by.flush()
+                flushed = self._grouper.flush()
                 if flushed and self.stdout_callback:
                     for item in flushed:
                         try:
@@ -874,12 +865,12 @@ class AsyncLogStream:
 
         # 3. Group
         # Note: Grouping is also CPU-bound but stateful.
-        # LogGrouper is synchronous, which is fine as it's CPU bound and fast.
+        # The grouper is synchronous, which is fine as it's CPU bound and fast.
         # Grouping applies to stdout only (the grouper is flushed on stdout EOF);
         # feeding stderr through the shared grouper would flush/misroute stdout groups.
-        items_to_emit: list[LogEntry | list[LogEntry]]
-        if self.group_by and source == "stdout":
-            items_to_emit = self.group_by.process(entry)
+        items_to_emit: Sequence[LogEntry | LogGroup]
+        if self._grouper is not None and source == "stdout":
+            items_to_emit = self._grouper.add(entry, time.monotonic())
         else:
             items_to_emit = [entry]
 

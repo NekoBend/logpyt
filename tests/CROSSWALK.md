@@ -74,3 +74,5 @@ Rules:
 | tests/test_utils.py::test_wait_for_device_error | tests/test_adb.py::test_wait_for_device_raises_adb_error |
 | tests/test_utils.py::test_wait_for_device_success | tests/test_adb.py::test_wait_for_device_passes_the_serial |
 | tests/test_utils.py::test_wait_for_device_timeout | tests/test_adb.py::test_wait_for_device_timeout_kills_the_child |
+| tests/test_groupers.py::test_grouper_emit_mode_entry | tests/test_grouping.py::test_group_is_a_sequence_of_its_entries |
+| tests/test_windowed_grouper_lazy.py::test_windowed_grouper_emit_mode_entry_flattens_on_flush | tests/test_grouping.py::test_group_is_a_sequence_of_its_entries |

@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from logpyt import (
+    GroupBy,
     LogStream,
     LogStreamError,
     LogStreamKilledError,
@@ -50,7 +51,7 @@ from tests.conftest import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from logpyt.models import LogEntry
+    from logpyt.models import LogEntry, LogGroup
     from logpyt.parsers import ParseContext
     from logpyt.streams import StreamHandle
 
@@ -499,6 +500,39 @@ def test_a_line_longer_than_the_read_cap_is_not_split_into_entries(
         _teardown(stream)
 
     assert [e.tag for e in collector.entries] == ["Tag", "Next"]
+
+
+def _grouped_lines() -> list[str]:
+    """Two pids interleaved, then a line one second later that expires both."""
+    return [
+        threadtime("a1", pid=1, tid=1, time_="03:04:05.000"),
+        threadtime("b1", pid=2, tid=2, time_="03:04:05.001"),
+        threadtime("a2", pid=1, tid=1, time_="03:04:05.002"),
+        threadtime("late", pid=3, tid=3, time_="03:04:06.000"),
+    ]
+
+
+def test_group_by_delivers_log_groups_to_the_callback(fake_adb: FakeAdb) -> None:
+    """With group_by, stdout_callback receives LogGroup objects (design 2.6)."""
+    fake_adb.logcat(run(*(out(line) for line in _grouped_lines()), wait("done")))
+    groups: list[LogGroup] = []
+    stream = LogStream(
+        group_by=GroupBy(keys=("pid",), gap_ms=100.0, mode="windowed"),
+        stdout_callback=lambda group, _handle: groups.append(group),
+    )
+
+    _start(stream)
+    try:
+        wait_until(lambda: len(groups) >= 2, timeout=TIMEOUT)
+    finally:
+        _teardown(stream)
+
+    # Closed by "late" in expiry order: b1 (05.001 + 100 ms) before a2 (05.002).
+    # Whether the kill still delivers the open "late" group is not pinned here.
+    assert [(g.key, [e.message for e in g], g.reason) for g in groups[:2]] == [
+        ((2,), ["b1"], "gap"),
+        ((1,), ["a1", "a2"], "gap"),
+    ]
 
 
 # -- exit status and join() -----------------------------------------------
