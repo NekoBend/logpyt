@@ -71,6 +71,12 @@ if TYPE_CHECKING:
     from types import TracebackType
 
 _FAKE_ADB_SCRIPT = Path(__file__).with_name("fake_adb.py").resolve()
+# The interpreter that runs fake_adb.py. On Windows a venv's sys.executable is
+# a launcher that starts the real python.exe as a second process, so the pid
+# the library sees (the launcher) would differ from the fake's own pid. The
+# fake uses only the standard library under -I, so the base interpreter runs
+# it directly and keeps one process per spawn on every platform.
+_FAKE_PYTHON = getattr(sys, "_base_executable", "") or sys.executable
 
 # Captured before any fixture patches the name: asyncio's Windows children are
 # a subclass of the real Popen, not of the fixture's rewriting subclass.
@@ -509,7 +515,7 @@ class FakeAdb:
             index = self._counters.get(key, 0)
             self._counters[key] = index + 1
         rewritten = [
-            sys.executable,
+            _FAKE_PYTHON,
             "-I",
             str(_FAKE_ADB_SCRIPT),
             "--fake-state",
