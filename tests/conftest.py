@@ -1,23 +1,98 @@
-"""Shared fixtures: a real-subprocess fake adb (see ``tests/fake_adb.py``)."""
+"""Shared fixtures: a real-subprocess fake adb and a per-test hang watchdog.
+
+The child side and the config format are described in ``tests/fake_adb.py``.
+
+``fake_adb`` fixture (a :class:`FakeAdb`)
+    Patches ``subprocess.Popen`` and ``asyncio.create_subprocess_exec`` so
+    that a spawn of ``fake.path`` runs ``tests/fake_adb.py`` instead, and
+    patches ``resolve_adb`` to return ``fake.path``. Configure behavior with
+    ``logcat()`` / ``pidof()`` / ``command()``, observe it with ``calls()``,
+    ``wait_for()`` and ``release()``.
+
+Child registry
+    Every fake adb child is registered, with its ``subprocess.Popen`` or
+    ``asyncio.subprocess.Process``, before the spawn call returns. Use
+    ``children()``, ``live_children()``, ``survivors()`` or
+    ``async_survivors()`` (every platform; no pid probing) to check that the
+    library ended its children. The fixture finalizer releases the spawn gate
+    and then kills and reaps, with bounded waits, every child still alive, so
+    a library that leaks a child cannot leave it running.
+
+Spawn gate (deterministic "during the spawn" interleavings)
+    ``hold_spawn()`` makes the next fake adb spawns block after the child
+    process exists but before ``Popen()`` / ``create_subprocess_exec()``
+    returns it to the library. Wait for the acknowledgement, act, release::
+
+        gate = fake_adb.hold_spawn(command="logcat")
+        stream.start()
+        gate.wait_entered()       # async: await gate.async_wait_entered()
+        stream.kill()             # lands while the library is inside the spawn
+        gate.release()
+
+    ``with fake_adb.hold_spawn() as gate:`` releases on exit, and the fixture
+    finalizer always releases. A sync spawn blocks its calling thread, so the
+    spawn must come from another thread (the library's) than the one that
+    releases. An unreleased gate gives up after its ``timeout`` and fails the
+    test in teardown.
+
+Hang watchdog (autouse)
+    Each test (setup, call and teardown) runs under
+    ``faulthandler.dump_traceback_later(limit, exit=True)``: a test that
+    deadlocks dumps every thread's traceback to the real stderr and ends
+    pytest with exit status 1 instead of hanging CI. The limit is
+    ``WATCHDOG_DEFAULT_LIMIT`` seconds; the ``LOGPYT_TEST_WATCHDOG`` environment
+    variable overrides it, and ``0`` disables it (for a debugger session).
+"""
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import dataclasses
+import errno
+import faulthandler
 import json
+import operator
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from tests.fake_adb import split_command
+
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Iterator, Sequence
+    from types import TracebackType
 
 _FAKE_ADB_SCRIPT = Path(__file__).with_name("fake_adb.py").resolve()
+
+# Captured before any fixture patches the name: asyncio's Windows children are
+# a subclass of the real Popen, not of the fixture's rewriting subclass.
+_REAL_POPEN = subprocess.Popen
+
+# The tests construct streams without ``adb_path`` on purpose, so the default
+# resolution path stays covered; every module that binds ``resolve_adb`` by
+# name is patched. The 3.0.0 rewrite moves resolve_adb to logpyt.adb as the
+# single target (.docs/design-3.0.0.md, PR-08): update this list then.
+RESOLVE_ADB_TARGETS = (
+    "logpyt.utils.resolve_adb",
+    "logpyt.streams.sync.resolve_adb",
+    "logpyt.streams.async_stream.resolve_adb",
+)
+
+WATCHDOG_DEFAULT_LIMIT = 120.0
+WATCHDOG_ENV = "LOGPYT_TEST_WATCHDOG"
+
+_SPAWN_GATE_TIMEOUT = 30.0
+_REAP_TIMEOUT = 10.0
+_RETRY_TIMEOUT = 5.0
+_POLL = 0.005
 
 Step = dict[str, Any]
 Run = dict[str, Any]
@@ -87,8 +162,186 @@ def threadtime(
     return f"{date} {time_} {pid:5d} {tid:5d} {level} {tag}: {message}\n"
 
 
+def _posix_child_running(pid: int) -> bool:
+    """True while our child ``pid`` has not exited. Never reaps it.
+
+    asyncio reaps its own children; a ``waitpid`` from here would steal the
+    exit status and make ``Process.wait()`` report 255. ``WNOWAIT`` leaves the
+    status in place.
+    """
+    if sys.platform == "win32":
+        msg = "POSIX only"
+        raise NotImplementedError(msg)
+    waitid = getattr(os, "waitid", None)
+    if waitid is None:  # no waitid (macOS): a zombie still counts as running
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError):
+            return False
+        return True
+    try:
+        status = waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError:  # already reaped, so it has exited
+        return False
+    return status is None
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class SpawnedChild:
+    """One fake adb child, as the harness saw it spawned.
+
+    ``index`` is the per-command invocation number that selected its run (the
+    ``index`` of its ``calls()`` record), ``args`` the adb arguments the
+    library passed, ``is_async`` whether it came from
+    ``asyncio.create_subprocess_exec``. ``process`` is that asyncio Process
+    (else None) and ``popen`` the Popen behind the child; check liveness with
+    ``alive()``, not ``popen.poll()``, which on POSIX would steal an asyncio
+    child's exit status.
+    """
+
+    pid: int
+    command: str
+    key: str
+    index: int
+    args: tuple[str, ...]
+    is_async: bool
+    popen: subprocess.Popen[Any] = dataclasses.field(repr=False)
+    process: asyncio.subprocess.Process | None = dataclasses.field(
+        repr=False, default=None
+    )
+
+    def alive(self) -> bool:
+        """True until the child has exited (exited-but-unreaped counts as gone).
+
+        Safe to call at any time from any thread: it never takes an exit
+        status away from the library's own ``wait()``.
+        """
+        if self.process is None:
+            return self.popen.poll() is None
+        if self.process.returncode is not None:
+            return False
+        if sys.platform == "win32":  # polling a handle reaps nothing on Windows
+            return self.popen.poll() is None
+        return _posix_child_running(self.pid)
+
+
+@dataclasses.dataclass(frozen=True)
+class _PendingSpawn:
+    command: str
+    key: str
+    index: int
+    seq: int
+    args: tuple[str, ...]
+
+
+class SpawnGate:
+    """Holds fake adb spawns between child creation and the spawn's return.
+
+    Created by ``FakeAdb.hold_spawn()``. While the gate is closed, every
+    matching spawn (``command`` None matches all) registers its child, counts
+    as *entered*, and blocks until ``release()``. A released gate stays open.
+    """
+
+    def __init__(self, fake: FakeAdb, command: str | None, timeout: float) -> None:
+        self.command = command
+        self.timeout = timeout
+        self._fake = fake
+        self._open = threading.Event()
+        self._lock = threading.Lock()
+        self._held: list[SpawnedChild] = []
+
+    @property
+    def released(self) -> bool:
+        """True once ``release()`` ran."""
+        return self._open.is_set()
+
+    @property
+    def entered(self) -> int:
+        """How many spawns have reached the gate (held now or earlier)."""
+        with self._lock:
+            return len(self._held)
+
+    @property
+    def children(self) -> list[SpawnedChild]:
+        """The children whose spawns reached the gate, in arrival order."""
+        with self._lock:
+            return list(self._held)
+
+    def release(self) -> None:
+        """Open the gate: held spawns return, later ones pass straight through."""
+        self._open.set()
+
+    def wait_entered(self, count: int = 1, timeout: float = 10.0) -> list[SpawnedChild]:
+        """Block until ``count`` spawns are held; return the held children.
+
+        Raises TimeoutError when fewer than ``count`` arrive within ``timeout``.
+        """
+        try:
+            wait_until(lambda: self.entered >= count, timeout=timeout)
+        except TimeoutError:
+            raise TimeoutError(self._shortfall(count, timeout)) from None
+        return self.children
+
+    async def async_wait_entered(
+        self, count: int = 1, timeout: float = 10.0
+    ) -> list[SpawnedChild]:
+        """Async variant of ``wait_entered``; lets the event loop run meanwhile."""
+        try:
+            await async_wait_until(lambda: self.entered >= count, timeout=timeout)
+        except TimeoutError:
+            raise TimeoutError(self._shortfall(count, timeout)) from None
+        return self.children
+
+    def _shortfall(self, count: int, timeout: float) -> str:
+        return (
+            f"{self.entered} of {count} fake adb spawns (command={self.command!r})"
+            f" reached the gate within {timeout} s"
+        )
+
+    def __enter__(self) -> SpawnGate:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.release()
+
+    # -- used by the spawn wrappers -----------------------------------------
+
+    def _admit(self, child: SpawnedChild) -> bool:
+        if self.released or (
+            self.command is not None and child.command != self.command
+        ):
+            return False
+        with self._lock:
+            self._held.append(child)
+        return True
+
+    def _timed_out(self, child: SpawnedChild) -> None:
+        self._fake._errors.append(
+            f"spawn gate never released within {self.timeout} s for {child!r}"
+        )
+
+    def _hold(self, child: SpawnedChild) -> None:
+        if self._admit(child) and not self._open.wait(self.timeout):
+            self._timed_out(child)
+
+    async def _async_hold(self, child: SpawnedChild) -> None:
+        if not self._admit(child):
+            return
+        deadline = time.monotonic() + self.timeout
+        while not self._open.is_set():
+            if time.monotonic() > deadline:
+                self._timed_out(child)
+                return
+            await asyncio.sleep(_POLL)
+
+
 class FakeAdb:
-    """Handle returned by the ``fake_adb`` fixture.
+    """Handle returned by the ``fake_adb`` fixture (see the module docstring).
 
     Pass ``fake.path`` as ``adb_path`` (``resolve_adb`` is also patched to
     return it). Configure behavior with ``logcat()`` / ``pidof()`` /
@@ -98,9 +351,17 @@ class FakeAdb:
     def __init__(self, state: Path) -> None:
         self.state = state
         (state / "signals").mkdir(parents=True)
+        (state / "calls").mkdir()
         self.path = str(state / "adb")
         self._config: dict[str, Any] = {}
         self._write_config()
+        self._lock = threading.Lock()
+        self._seq = 0
+        self._counters: dict[str, int] = {}
+        self._children: list[SpawnedChild] = []
+        self._gate: SpawnGate | None = None
+        self._errors: list[str] = []
+        self._closed = False
 
     # -- configuration -------------------------------------------------
 
@@ -122,20 +383,32 @@ class FakeAdb:
     def _write_config(self) -> None:
         tmp = self.state / "config.json.tmp"
         tmp.write_text(json.dumps(self._config), encoding="utf-8")
-        tmp.replace(self.state / "config.json")
+        # Windows refuses the replace while a child is reading the file.
+        deadline = time.monotonic() + _RETRY_TIMEOUT
+        while True:
+            try:
+                tmp.replace(self.state / "config.json")
+            except PermissionError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(_POLL)
+            else:
+                return
 
     # -- observation and synchronization ----------------------------------
 
     def calls(self, command: str | None = None) -> list[dict[str, Any]]:
-        """Recorded invocations, optionally only those of ``command``."""
-        path = self.state / "calls.jsonl"
-        if not path.exists():
-            return []
+        """Invocations that started running, in spawn order.
+
+        Each record is ``{"command", "key", "index", "args", "pid", "seq"}``,
+        written by the child before its first step; optionally only those of
+        ``command``.
+        """
         records = [
-            json.loads(line)
-            for line in path.read_text(encoding="utf-8").splitlines()
-            if line
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in (self.state / "calls").glob("*.json")
         ]
+        records.sort(key=operator.itemgetter("seq"))
         if command is None:
             return records
         return [r for r in records if r["command"] == command]
@@ -152,7 +425,7 @@ class FakeAdb:
             if time.monotonic() > deadline:
                 msg = f"fake adb never signalled {name!r}"
                 raise TimeoutError(msg)
-            time.sleep(0.005)
+            time.sleep(_POLL)
 
     async def async_wait_for(self, name: str, timeout: float = 10.0) -> None:
         """Async variant of ``wait_for``."""
@@ -162,27 +435,174 @@ class FakeAdb:
             if time.monotonic() > deadline:
                 msg = f"fake adb never signalled {name!r}"
                 raise TimeoutError(msg)
-            await asyncio.sleep(0.005)
+            await asyncio.sleep(_POLL)
 
-    # -- spawn rewriting -------------------------------------------------
+    # -- child registry ---------------------------------------------------
 
-    def rewrite(self, args: Sequence[Any]) -> list[Any]:
-        """Turn ``[fake.path, *adb_args]`` into a python invocation."""
+    def children(self, command: str | None = None) -> list[SpawnedChild]:
+        """Every fake adb child spawned so far (optionally of ``command``)."""
+        with self._lock:
+            spawned = list(self._children)
+        return [c for c in spawned if command is None or c.command == command]
+
+    def live_children(self, command: str | None = None) -> list[SpawnedChild]:
+        """The children (optionally of ``command``) that have not exited yet."""
+        return [c for c in self.children(command) if c.alive()]
+
+    def survivors(
+        self, timeout: float = 5.0, command: str | None = None
+    ) -> list[SpawnedChild]:
+        """Wait up to ``timeout`` for the children to exit; return those left.
+
+        ``[]`` means every child (optionally of ``command``) has exited.
+        """
+        with contextlib.suppress(TimeoutError):
+            wait_until(lambda: not self.live_children(command), timeout=timeout)
+        return self.live_children(command)
+
+    async def async_survivors(
+        self, timeout: float = 5.0, command: str | None = None
+    ) -> list[SpawnedChild]:
+        """Async variant of ``survivors``; lets the event loop run meanwhile."""
+        with contextlib.suppress(TimeoutError):
+            await async_wait_until(
+                lambda: not self.live_children(command), timeout=timeout
+            )
+        return self.live_children(command)
+
+    # -- spawn gate -------------------------------------------------------
+
+    def hold_spawn(
+        self, command: str | None = None, *, timeout: float = _SPAWN_GATE_TIMEOUT
+    ) -> SpawnGate:
+        """Hold the next fake adb spawns (of ``command``) until released.
+
+        Only one gate is active; arm a new one after releasing the previous.
+        ``timeout`` bounds how long a spawn stays held when the test never
+        releases; that is reported as a failure at teardown.
+        """
+        if self._gate is not None and not self._gate.released:
+            msg = "release the previous spawn gate before arming another"
+            raise RuntimeError(msg)
+        self._gate = SpawnGate(self, command, timeout)
+        return self._gate
+
+    # -- spawn interception (used by the fixture's wrappers) ---------------
+
+    def _prepare(self, args: Sequence[Any]) -> tuple[list[Any], _PendingSpawn | None]:
+        """Rewrite ``[fake.path, *adb_args]`` into a python invocation.
+
+        Any other argv is returned unchanged with no pending spawn.
+        """
         argv = list(args)
-        if argv and os.fspath(argv[0]) == self.path:
-            return [
-                sys.executable,
-                "-I",
-                str(_FAKE_ADB_SCRIPT),
-                "--fake-state",
-                str(self.state),
-                *argv[1:],
-            ]
-        return argv
+        if not argv or os.fspath(argv[0]) != self.path:
+            return argv, None
+        adb_args = tuple(os.fspath(a) for a in argv[1:])
+        command, key, _rest = split_command(list(adb_args))
+        with self._lock:
+            if self._closed:
+                raise FileNotFoundError(
+                    errno.ENOENT, "the fake_adb fixture is closed", self.path
+                )
+            seq = self._seq
+            self._seq += 1
+            index = self._counters.get(key, 0)
+            self._counters[key] = index + 1
+        rewritten = [
+            sys.executable,
+            "-I",
+            str(_FAKE_ADB_SCRIPT),
+            "--fake-state",
+            str(self.state),
+            "--fake-index",
+            str(index),
+            "--fake-seq",
+            str(seq),
+            "--fake-parent",
+            str(os.getpid()),
+            *argv[1:],
+        ]
+        return rewritten, _PendingSpawn(command, key, index, seq, adb_args)
+
+    def _register(
+        self,
+        pending: _PendingSpawn,
+        popen: subprocess.Popen[Any],
+        process: asyncio.subprocess.Process | None = None,
+    ) -> SpawnedChild:
+        child = SpawnedChild(
+            pid=popen.pid,
+            command=pending.command,
+            key=pending.key,
+            index=pending.index,
+            args=pending.args,
+            is_async=process is not None,
+            popen=popen,
+            process=process,
+        )
+        with self._lock:
+            self._children.append(child)
+        return child
+
+    def _hold(self, child: SpawnedChild) -> None:
+        gate = self._gate
+        if gate is not None:
+            gate._hold(child)
+
+    async def _async_hold(self, child: SpawnedChild) -> None:
+        gate = self._gate
+        if gate is not None:
+            await gate._async_hold(child)
+
+    def close(self) -> None:
+        """Release the gate, then kill and reap every live child (bounded).
+
+        The fixture finalizer calls this; it is idempotent. Later spawns of
+        ``fake.path`` fail with FileNotFoundError, as a missing adb would.
+        Raises AssertionError for harness problems (a gate that timed out, a
+        child that survived kill()), not for children the library leaked.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        if self._gate is not None:
+            self._gate.release()
+        problems = list(self._errors)
+        checked = 0
+        # The registry can still grow: a spawn in flight when the fixture
+        # closed registers its child only once its Popen() returns.
+        while checked < len(self.children()):
+            child = self.children()[checked]
+            checked += 1
+            if not child.alive():
+                continue
+            with contextlib.suppress(OSError):  # it exited meanwhile
+                child.popen.kill()
+            try:
+                child.popen.wait(timeout=_REAP_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                problems.append(f"{child!r} survived kill() for {_REAP_TIMEOUT} s")
+        if problems:
+            raise AssertionError("fake adb harness: " + "; ".join(problems))
+
+
+def _popen_of(process: asyncio.subprocess.Process) -> subprocess.Popen[Any]:
+    """The ``subprocess.Popen`` behind an asyncio child.
+
+    asyncio publishes it as the transport's ``"subprocess"`` extra, but
+    ``Process`` keeps its transport private.
+    """
+    transport = getattr(process, "_transport", None)
+    popen = None if transport is None else transport.get_extra_info("subprocess")
+    if not isinstance(popen, _REAL_POPEN):
+        msg = f"cannot reach the Popen of asyncio child {process.pid}"
+        raise TypeError(msg)
+    return popen
 
 
 def wait_until(
-    predicate: Callable[[], object], timeout: float = 5.0, interval: float = 0.005
+    predicate: Callable[[], object], timeout: float = 5.0, interval: float = _POLL
 ) -> None:
     """Poll ``predicate`` until it is truthy; raise TimeoutError otherwise."""
     deadline = time.monotonic() + timeout
@@ -194,7 +614,7 @@ def wait_until(
 
 
 async def async_wait_until(
-    predicate: Callable[[], object], timeout: float = 5.0, interval: float = 0.005
+    predicate: Callable[[], object], timeout: float = 5.0, interval: float = _POLL
 ) -> None:
     """Async variant of ``wait_until``."""
     deadline = time.monotonic() + timeout
@@ -205,9 +625,66 @@ async def async_wait_until(
         await asyncio.sleep(interval)
 
 
+# -- hang watchdog -----------------------------------------------------------
+
+_watchdog_fd = pytest.StashKey[int]()
+_watchdog_limit = pytest.StashKey[float]()
+
+
+def _parse_watchdog_limit() -> float:
+    raw_limit = os.environ.get(WATCHDOG_ENV, "").strip()
+    if not raw_limit:
+        return WATCHDOG_DEFAULT_LIMIT
+    try:
+        return float(raw_limit)
+    except ValueError:
+        msg = f"{WATCHDOG_ENV} must be a number of seconds, got {raw_limit!r}"
+        raise pytest.UsageError(msg) from None
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Read the watchdog limit and keep a copy of the real stderr for it.
+
+    Output capture is suspended while plugins configure, so fd 2 is the real
+    stderr here; during a test it is a capture file that exit=True discards.
+    """
+    config.stash[_watchdog_limit] = _parse_watchdog_limit()
+    with contextlib.suppress(AttributeError, OSError, ValueError):
+        config.stash[_watchdog_fd] = os.dup(sys.stderr.fileno())
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    """Close the stderr copy taken in ``pytest_configure``."""
+    fd = config.stash.get(_watchdog_fd, None)
+    if fd is not None:
+        faulthandler.cancel_dump_traceback_later()
+        del config.stash[_watchdog_fd]
+        os.close(fd)
+
+
+@pytest.fixture(autouse=True)
+def _hang_watchdog(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Dump all tracebacks and exit if this test runs past the watchdog limit.
+
+    Autouse fixtures are set up first and torn down last, so the limit also
+    covers the other fixtures' setup and teardown (the fake_adb finalizer).
+    """
+    limit = request.config.stash.get(_watchdog_limit, WATCHDOG_DEFAULT_LIMIT)
+    fd = request.config.stash.get(_watchdog_fd, None)
+    if limit <= 0 or fd is None:
+        yield
+        return
+    faulthandler.dump_traceback_later(limit, exit=True, file=fd)
+    yield
+    faulthandler.cancel_dump_traceback_later()
+
+
+# -- fake adb fixture --------------------------------------------------------
+
+
 @pytest.fixture
-def fake_adb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeAdb:
-    """A real-subprocess fake adb; see ``tests/fake_adb.py`` for the format."""
+def fake_adb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeAdb]:
+    """A real-subprocess fake adb; see the module docstring for the API."""
     fake = FakeAdb(tmp_path / "fake-adb")
 
     real_popen = subprocess.Popen
@@ -216,22 +693,33 @@ def fake_adb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeAdb:
     # passes, so their parameters are deliberately untyped (ANN401).
     class _RewritingPopen(real_popen):
         def __init__(self, args: Any, *a: Any, **kw: Any) -> None:  # noqa: ANN401
+            pending = None
             if isinstance(args, (list, tuple)):
-                args = fake.rewrite(args)
+                args, pending = fake._prepare(args)
             super().__init__(args, *a, **kw)
+            if pending is not None:
+                fake._hold(fake._register(pending, self))
 
     real_exec = asyncio.create_subprocess_exec
 
     async def _rewriting_exec(program: Any, *args: Any, **kw: Any) -> Any:  # noqa: ANN401
-        argv = fake.rewrite([program, *args])
-        return await real_exec(*argv, **kw)
+        argv, pending = fake._prepare([program, *args])
+        process = await real_exec(*argv, **kw)
+        if pending is not None:
+            child = fake._register(pending, _popen_of(process), process)
+            try:
+                await fake._async_hold(child)
+            except asyncio.CancelledError:
+                # Cancelled while held: like asyncio's own cancelled spawn,
+                # end the child nobody will receive (the finalizer reaps it).
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                raise
+        return process
 
     monkeypatch.setattr(subprocess, "Popen", _RewritingPopen)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _rewriting_exec)
-    for target in (
-        "logpyt.utils.resolve_adb",
-        "logpyt.streams.sync.resolve_adb",
-        "logpyt.streams.async_stream.resolve_adb",
-    ):
+    for target in RESOLVE_ADB_TARGETS:
         monkeypatch.setattr(target, lambda: fake.path)
-    return fake
+    yield fake
+    fake.close()

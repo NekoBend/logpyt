@@ -7,26 +7,36 @@ fixture answers per invocation (``fake_adb.pidof(pkg, run(...), ...)``).
 These tests pin what a user of the public API relies on, so they must survive
 an internal rewrite: no private attributes, no mocked internals, only the
 ``fake_adb`` fixture from ``tests/conftest.py``. Known 2.0.x bugs are written
-for the correct behavior and marked ``xfail(strict=True)`` with their id from
-``.docs/review-findings-2.0.1.md``.
+for the correct behavior and marked ``xfail(strict=True, raises=AssertionError)``
+with their id from ``.docs/review-findings-2.0.1.md``. A missing precondition
+or a hang is reported with ``pytest.fail`` (or a ``TimeoutError``) instead of an
+assertion, so it fails the test rather than passing for the known bug.
 
 Synchronization. A pidof invocation starts only after the previous one's
 answer has been applied (the library polls one lookup at a time), so a
 ``touch`` in the SECOND pidof run is the signal that the FIRST answer is in
 effect; the fake logcat waits on it before logging lines that must already
-resolve. Where a test must hold a pidof answer until the stream has read some
-lines, it watches a ``ThreadTimeLogParser`` subclass passed through the public
-``parser`` argument (``LogParser`` documents overriding ``parse_stdout``).
-Where a test must show that nothing more is delivered, the fake logcat exits 0
-and the test joins the stream, which delivers everything it read.
+resolve. To know what the stream has read, a test watches a
+``ThreadTimeLogParser`` subclass passed through the public ``parser`` argument
+(``LogParser`` documents overriding ``parse_stdout``). Lines are parsed,
+filtered and queued in order, so once a sentinel line is parsed every earlier
+line has been through the package filter. That sentinel gates the next step:
+a held pidof answer is released only after the stream parsed the startup
+backlog, and the fake logcat stays open (``wait("done")``) until the lines a
+test asserts on were parsed, so the sync reader's EOF defect (F1-1) cannot
+drop them. Only then does logcat exit 0 and the test join the stream, which
+delivers everything it read. Which fake adb children were spawned, and in
+what order, comes from the fixture's registry (``fake_adb.children()``).
+Every lifecycle call and join is bounded.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import shlex
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -52,22 +62,31 @@ from tests.conftest import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
     from pathlib import Path
 
     from logpyt.models import LogEntry
     from logpyt.streams import AsyncStreamHandle, StreamHandle
     from tests.conftest import Step
 
-# Upper bound for every wait and join. A healthy run finishes far sooner; the
-# bound only exists so a regression fails the test instead of hanging CI.
+# Upper bound for every wait, join and lifecycle call. A healthy run finishes far
+# sooner; the bound only exists so a regression fails the test instead of
+# hanging CI.
 TIMEOUT = 10.0
 
-# How long a test waits for something that happens at once or never: the first
-# PID lookup (never under F5-1), or the stream reading lines before any lookup
-# has answered (never once F5-2 is fixed). Only the branch where it never
-# happens pays it; a wrong guess cannot make a test pass, it only shortens the
-# wait.
+# How long a test waits for the first PID lookup, which starts at once or never
+# (never under F5-1). Only the branch where it never happens pays it; a wrong
+# guess cannot make a test pass, it only shortens the wait.
 GRACE = 1.0
+
+# How long the backlog tests wait for the stream to parse logcat's startup
+# backlog once it is in the pipe and the first lookup is in flight (held). A
+# 2.0.0 stream, whose readers run before the lookup is spawned, parses it
+# within milliseconds. A stream that looks the package up before it reads
+# (F5-2's planned fix) never does until the answer, and gives a held lookup up
+# after its own limit (2.0.0's pidof timeout is 5 s; the 3.0.0 design's
+# ``package_hold`` is 2 s), so this must stay below both.
+READ_GRACE = 1.0
 
 # How long a test waits for the stream to look the package up again after the
 # app logged under a pid it does not know. A fixed stream does that within a
@@ -86,6 +105,7 @@ NEW_PID = 4321  # the same app after a restart
 OTHER_PID = 5678  # some other app's process
 
 FILLER = "filler"
+BACKLOG = ["backlog 1", "backlog 2", "backlog 3"]
 
 # Every gate a fake adb may be blocked on; teardown opens all of them so no fake
 # adb child outlives the test waiting for a signal.
@@ -127,6 +147,14 @@ def _restart_once(fake: FakeAdb) -> None:
     )
 
 
+def _logcat_until_parsed(fake: FakeAdb, *steps: Step) -> None:
+    """Logcat runs ``steps``, logs the ``FILLER`` sentinel and stays open until "done".
+
+    Pair it with a ``_ParseWatcher(FILLER)`` and ``_end_logcat_once_parsed``.
+    """
+    fake.logcat(run(*steps, _filler(), wait("done")))
+
+
 def _signalled(fake: FakeAdb, name: str) -> bool:
     """True when a fake adb has already run ``touch(name)``.
 
@@ -136,21 +164,17 @@ def _signalled(fake: FakeAdb, name: str) -> bool:
     return (fake.state / "signals" / name).exists()
 
 
-def _calls(fake: FakeAdb, command: str | None = None) -> list[dict[str, Any]]:
-    """``fake.calls(command)`` for polling while fake adb children may be running.
-
-    A child appends its record while the test may be reading the file; a record
-    caught half-written reads as none yet, and the next poll sees it whole.
-    """
-    try:
-        return fake.calls(command)
-    except ValueError:  # json.JSONDecodeError
-        return []
-
-
 def _repolled(fake: FakeAdb) -> bool:
-    """True once a 3rd pidof has started: a lookup after the backed-off one."""
-    return len(_calls(fake, "pidof")) >= 3
+    """True once a 3rd pidof was spawned: a lookup after the backed-off one."""
+    return len(fake.children("pidof")) >= 3
+
+
+def _first_spawned(fake: FakeAdb) -> str | None:
+    """Whichever of ``"pidof"`` and ``"logcat"`` was spawned first; None if neither."""
+    for child in fake.children():
+        if child.command in {"pidof", "logcat"}:
+            return child.command
+    return None
 
 
 class _ParseWatcher(ThreadTimeLogParser):
@@ -214,6 +238,73 @@ class _AsyncCollector(_Recorded):
         return True
 
 
+# -- bounded calls and preconditions ----------------------------------------------
+
+
+def _bounded[T](call: Callable[[], T], what: str) -> T:
+    """Run a blocking library call on a helper thread, bounded by ``TIMEOUT``.
+
+    The call's own exception is re-raised here. A call that has not returned is
+    reported with ``pytest.fail`` and left on its daemon thread; the
+    ``fake_adb`` finalizer kills the fake adb children it may be waiting on.
+    """
+    returned: list[T] = []
+    raised: list[BaseException] = []
+
+    def target() -> None:
+        try:
+            returned.append(call())
+        except BaseException as exc:  # noqa: BLE001 (re-raised in the test thread)
+            raised.append(exc)
+
+    thread = threading.Thread(target=target, name=f"bounded {what}", daemon=True)
+    thread.start()
+    thread.join(TIMEOUT)
+    if thread.is_alive():
+        pytest.fail(f"{what} did not return within {TIMEOUT} s")
+    if raised:
+        raise raised[0]
+    return returned[0]
+
+
+async def _bounded_async[T](awaitable: Awaitable[T], what: str) -> T:
+    """Await a library call, failing the test if it takes longer than ``TIMEOUT``."""
+    try:
+        return await asyncio.wait_for(awaitable, TIMEOUT)
+    except TimeoutError:
+        pytest.fail(f"{what} did not return within {TIMEOUT} s")
+
+
+async def _parsed_within(watcher: _ParseWatcher, timeout: float) -> bool:
+    """Async counterpart of ``watcher.parsed.wait(timeout)``."""
+    try:
+        await async_wait_until(watcher.parsed.is_set, timeout=timeout)
+    except TimeoutError:
+        return False
+    return True
+
+
+def _require_delivered(collector: _Collector, message: str) -> None:
+    """Fail (never xfail) unless ``message`` is delivered within ``TIMEOUT``."""
+    if not collector.received(message):
+        pytest.fail(f"precondition: {message!r} was not delivered within {TIMEOUT} s")
+
+
+async def _require_delivered_async(collector: _AsyncCollector, message: str) -> None:
+    """Async variant of ``_require_delivered``."""
+    if not await collector.received(message):
+        pytest.fail(f"precondition: {message!r} was not delivered within {TIMEOUT} s")
+
+
+def _not_parsed(watcher: _ParseWatcher) -> str:
+    return (
+        f"precondition: the stream did not parse {watcher.message!r} within {TIMEOUT} s"
+    )
+
+
+# -- stream lifecycle ---------------------------------------------------------------
+
+
 def _backoff_factor(*, backed_off: bool) -> float:
     """Keep polling every ``POLL_INTERVAL``, or back off to ``BACKED_OFF_INTERVAL``
     after the first poll that finds nothing new.
@@ -240,7 +331,7 @@ def _start_sync(
         pid_poll_backoff_factor=_backoff_factor(backed_off=backed_off),
         pid_max_poll_interval=BACKED_OFF_INTERVAL,
     )
-    stream.start()
+    _bounded(stream.start, "start()")
     return stream
 
 
@@ -260,22 +351,57 @@ async def _start_async(
         pid_poll_backoff_factor=_backoff_factor(backed_off=backed_off),
         pid_max_poll_interval=BACKED_OFF_INTERVAL,
     )
-    await stream.start()
+    await _bounded_async(stream.start(), "start()")
     return stream
 
 
+def _join(stream: LogStream) -> None:
+    """Join the stream (bounded); it must end without an error."""
+    _bounded(stream.join, "join()")
+
+
+async def _join_async(stream: AsyncLogStream) -> None:
+    """Async variant of ``_join``."""
+    await _bounded_async(stream.join(), "join()")
+
+
 def _shutdown(fake: FakeAdb, stream: LogStream) -> None:
+    """Open every gate, then stop the stream and join it, both bounded."""
     for gate in _GATES:
         fake.release(gate)
-    stream.stop()
-    stream.join(timeout=TIMEOUT)
+    _bounded(stream.stop, "stop()")
+    _join(stream)
 
 
 async def _shutdown_async(fake: FakeAdb, stream: AsyncLogStream) -> None:
+    """Async variant of ``_shutdown``."""
     for gate in _GATES:
         fake.release(gate)
-    await stream.stop()
-    await stream.join(timeout=TIMEOUT)
+    await _bounded_async(stream.stop(), "stop()")
+    await _join_async(stream)
+
+
+def _end_logcat_once_parsed(fake: FakeAdb, watcher: _ParseWatcher) -> None:
+    """Let the fake logcat exit 0 once the stream has parsed the sentinel line.
+
+    Every line logged before the sentinel has then been read and filtered, so
+    the sync reader's EOF defect (F1-1: it stops at process exit and drops what
+    is still in the pipe) cannot drop one, and the join that follows delivers
+    them all.
+    """
+    if not watcher.parsed.wait(TIMEOUT):
+        pytest.fail(_not_parsed(watcher))
+    fake.release("done")
+
+
+async def _end_logcat_once_parsed_async(fake: FakeAdb, watcher: _ParseWatcher) -> None:
+    """Async variant of ``_end_logcat_once_parsed``."""
+    if not await _parsed_within(watcher, TIMEOUT):
+        pytest.fail(_not_parsed(watcher))
+    fake.release("done")
+
+
+# -- signals the test gives the fake adb ----------------------------------------------
 
 
 def _unblock_if_never_looked_up(fake: FakeAdb) -> None:
@@ -283,21 +409,21 @@ def _unblock_if_never_looked_up(fake: FakeAdb) -> None:
 
     A stream that monitors the package starts its first pidof together with
     logcat and touches "resolved" itself. One that does not (F5-1) never does;
-    once logcat runs and ``GRACE`` passes with no lookup, the test opens the
-    gate so the assertion shows what the stream delivered.
+    once logcat was spawned and ``GRACE`` passes with no lookup, the test opens
+    the gate so the assertion shows what the stream delivered.
     """
-    wait_until(lambda: _calls(fake, "logcat"), timeout=TIMEOUT)
+    wait_until(lambda: fake.children("logcat"), timeout=TIMEOUT)
     try:
-        wait_until(lambda: _calls(fake, "pidof"), timeout=GRACE)
+        wait_until(lambda: fake.children("pidof"), timeout=GRACE)
     except TimeoutError:
         fake.release("resolved")
 
 
 async def _unblock_if_never_looked_up_async(fake: FakeAdb) -> None:
     """Async variant of ``_unblock_if_never_looked_up``."""
-    await async_wait_until(lambda: _calls(fake, "logcat"), timeout=TIMEOUT)
+    await async_wait_until(lambda: fake.children("logcat"), timeout=TIMEOUT)
     try:
-        await async_wait_until(lambda: _calls(fake, "pidof"), timeout=GRACE)
+        await async_wait_until(lambda: fake.children("pidof"), timeout=GRACE)
     except TimeoutError:
         fake.release("resolved")
 
@@ -343,25 +469,27 @@ async def _unblock_after_restart_async(
     fake.release("restarted")
 
 
-async def _wait_parsed_async(watcher: _ParseWatcher) -> None:
-    """Async counterpart of ``watcher.parsed.wait(GRACE)``."""
-    with contextlib.suppress(TimeoutError):
-        await async_wait_until(watcher.parsed.is_set, timeout=GRACE)
+# -- startup backlog (F5-2) ------------------------------------------------------------
 
 
 def _backlog_logcat(fake: FakeAdb) -> None:
-    """Logcat prints the package's backlog at once, then a live line once resolved."""
+    """Logcat prints the package's backlog at once, then a live line once resolved.
+
+    Every pidof waits for "answer", so no lookup answers before the test
+    releases it; the 2nd and later touch "resolved" (the first answer is in
+    effect). Logcat touches "backlog" once the backlog, ``FILLER`` last, is in
+    its pipe.
+    """
     fake.pidof(
         PACKAGE,
         run(wait("answer"), _pid(APP_PID)),
-        run(touch("resolved"), _pid(APP_PID)),
+        run(wait("answer"), touch("resolved"), _pid(APP_PID)),
     )
     fake.logcat(
         run(
-            _line("backlog 1"),
-            _line("backlog 2"),
-            _line("backlog 3"),
+            *(_line(message) for message in BACKLOG),
             _filler(),
+            touch("backlog"),
             wait("resolved"),
             _line("live"),
             wait("done"),
@@ -369,18 +497,56 @@ def _backlog_logcat(fake: FakeAdb) -> None:
     )
 
 
+def _answer_once_backlog_parsed(fake: FakeAdb, watcher: _ParseWatcher) -> bool:
+    """Release the held pidof answers once the stream has parsed logcat's backlog.
+
+    Returns True when the stream parsed the backlog while every lookup was
+    held, which is what F5-2 is about. A stream that looks the package up
+    before it reads cannot do that; it gets the answer, and False is returned,
+    at once when it spawned pidof before logcat (2.0.0 always spawns logcat
+    first), or ``READ_GRACE`` after the backlog was in the pipe with the lookup
+    in flight and still not parsed.
+    """
+    wait_until(lambda: _first_spawned(fake), timeout=TIMEOUT)
+    if _first_spawned(fake) == "pidof":
+        fake.release("answer")
+        return False
+    fake.wait_for("backlog", timeout=TIMEOUT)
+    wait_until(lambda: fake.children("pidof"), timeout=TIMEOUT)
+    raced = watcher.parsed.wait(READ_GRACE)
+    fake.release("answer")
+    return raced
+
+
+async def _answer_once_backlog_parsed_async(
+    fake: FakeAdb, watcher: _ParseWatcher
+) -> bool:
+    """Async variant of ``_answer_once_backlog_parsed``."""
+    await async_wait_until(lambda: _first_spawned(fake), timeout=TIMEOUT)
+    if _first_spawned(fake) == "pidof":
+        fake.release("answer")
+        return False
+    await fake.async_wait_for("backlog", timeout=TIMEOUT)
+    await async_wait_until(lambda: fake.children("pidof"), timeout=TIMEOUT)
+    raced = await _parsed_within(watcher, READ_GRACE)
+    fake.release("answer")
+    return raced
+
+
+# -- app restart (F5-2) ---------------------------------------------------------------
+
+
 def _restart_logcat(fake: FakeAdb) -> None:
-    """The app logs, restarts under ``NEW_PID`` on "restart", and logcat then ends."""
+    """The app logs, restarts under ``NEW_PID`` on "restart"; the sentinel follows."""
     _restart_once(fake)
-    fake.logcat(
-        run(
-            wait("resolved"),
-            _line("before"),
-            wait("restart"),
-            _line("after 1", pid=NEW_PID),
-            wait("restarted"),
-            _line("after 2", pid=NEW_PID),
-        )
+    _logcat_until_parsed(
+        fake,
+        wait("resolved"),
+        _line("before"),
+        wait("restart"),
+        _line("after 1", pid=NEW_PID),
+        wait("restarted"),
+        _line("after 2", pid=NEW_PID),
     )
 
 
@@ -394,23 +560,24 @@ _RESTART_DELIVERIES = (["before", "after 2"], ["before", "after 1", "after 2"])
 UNSAFE_PACKAGE = "com.example;reboot"
 
 
-def _shell_calls(fake: FakeAdb, *, polling: bool = False) -> list[list[str]]:
-    """The argv of every recorded ``adb ... shell ...`` invocation.
+def _shell_calls(fake: FakeAdb) -> list[list[str]]:
+    """The argv of every ``adb ... shell ...`` invocation spawned so far.
 
-    ``polling=True`` tolerates a record caught half-written (see ``_calls``). The
-    final read after shutdown does not, so a torn read cannot hide a call.
+    It reads the fixture's child registry, which holds every spawn, including
+    one killed before it could record its call.
     """
-    calls = _calls(fake) if polling else fake.calls()
-    return [call["args"] for call in calls if "shell" in call["args"]]
+    return [list(child.args) for child in fake.children() if "shell" in child.args]
 
 
 def _device_shell_words(args: list[str]) -> list[str]:
     """How the device's ``sh`` splits the command an ``adb shell`` argv sends.
 
-    adb joins the words after ``shell`` with spaces and does not quote them
-    (recalled from adb's source, not checked against a device: the plan lists it
-    as uncertain, and F5-3 hardens it either way). Shell operators such as
-    ``;`` come back as words of their own.
+    adb hands the words after ``shell`` to the device's ``sh`` joined with
+    spaces and unquoted. OBSERVED on API 24 and API 36
+    (``.docs/device-probes-2026-11-04.md``, "Package / PID"): ``adb shell pidof
+    'com.example.none; echo INJECTED_VIA_SEMICOLON'`` printed the marker, and
+    ``pidof 'system_server zygote64'``, one argv word, returned both pids.
+    Shell operators such as ``;`` come back as words of their own.
     """
     command = " ".join(args[args.index("shell") + 1 :])
     lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
@@ -454,6 +621,7 @@ def test_filter_package_delivers_only_that_packages_lines(fake_adb: FakeAdb) -> 
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="F5-1: PID lookup starts only for Filter; Package() in an "
     "AdvancedFilter never matches a live line",
 )
@@ -464,19 +632,20 @@ def test_advanced_filter_package_condition_delivers_that_packages_lines(
     meta["package"] set, like Filter(package=...) does (F5-1).
     """
     _resolve_steadily(fake_adb)
-    fake_adb.logcat(
-        run(
-            wait("resolved"),
-            _line("mine 1"),
-            _line("theirs", pid=OTHER_PID),
-            _line("mine 2"),
-        )
+    _logcat_until_parsed(
+        fake_adb,
+        wait("resolved"),
+        _line("mine 1"),
+        _line("theirs", pid=OTHER_PID),
+        _line("mine 2"),
     )
+    watcher = _ParseWatcher(FILLER)
     collector = _Collector()
-    stream = _start_sync(AdvancedFilter(Package(PACKAGE)), collector)
+    stream = _start_sync(AdvancedFilter(Package(PACKAGE)), collector, parser=watcher)
     try:
         _unblock_if_never_looked_up(fake_adb)
-        stream.join(timeout=TIMEOUT)  # logcat exits after its last line
+        _end_logcat_once_parsed(fake_adb, watcher)
+        _join(stream)
     finally:
         _shutdown(fake_adb, stream)
 
@@ -485,6 +654,7 @@ def test_advanced_filter_package_condition_delivers_that_packages_lines(
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="F5-1: PID lookup starts only for Filter; the Package() branch of "
     "an AdvancedFilter never matches a live line",
 )
@@ -495,21 +665,22 @@ def test_advanced_filter_package_combination_delivers_the_matching_lines(
     the package's error lines and anyone's matching message, nothing else (F5-1).
     """
     _resolve_steadily(fake_adb)
-    fake_adb.logcat(
-        run(
-            wait("resolved"),
-            _line("mine info", level="I"),
-            _line("mine error", level="E"),
-            _line("theirs error", pid=OTHER_PID, level="E"),
-            _line("theirs CRITICAL", pid=OTHER_PID, level="I"),
-        )
+    _logcat_until_parsed(
+        fake_adb,
+        wait("resolved"),
+        _line("mine info", level="I"),
+        _line("mine error", level="E"),
+        _line("theirs error", pid=OTHER_PID, level="E"),
+        _line("theirs CRITICAL", pid=OTHER_PID, level="I"),
     )
+    watcher = _ParseWatcher(FILLER)
     collector = _Collector()
     condition = (Package(PACKAGE) & Level("E")) | MessageContains("CRITICAL")
-    stream = _start_sync(AdvancedFilter(condition), collector)
+    stream = _start_sync(AdvancedFilter(condition), collector, parser=watcher)
     try:
         _unblock_if_never_looked_up(fake_adb)
-        stream.join(timeout=TIMEOUT)  # logcat exits after its last line
+        _end_logcat_once_parsed(fake_adb, watcher)
+        _join(stream)
     finally:
         _shutdown(fake_adb, stream)
 
@@ -518,6 +689,7 @@ def test_advanced_filter_package_combination_delivers_the_matching_lines(
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="F5-2: lines read before the first PID lookup finishes are dropped "
     "(the startup backlog)",
 )
@@ -525,21 +697,24 @@ def test_backlog_before_the_first_pid_lookup_is_delivered(fake_adb: FakeAdb) -> 
     """The package's lines that logcat prints at once on start (its ring-buffer backlog)
     are delivered even though no PID lookup has finished yet (F5-2).
 
-    The first pidof answer is held until the stream has parsed the backlog, or
-    for ``GRACE`` when a stream resolves before it reads.
+    Every pidof answer is held until the stream has parsed the backlog, so a
+    stream that reads while it looks up always reads the backlog first; one
+    that looks up before reading gets the answer (``_answer_once_backlog_parsed``).
     """
     _backlog_logcat(fake_adb)
     watcher = _ParseWatcher(FILLER)
     collector = _Collector()
     stream = _start_sync(Filter(package=PACKAGE), collector, parser=watcher)
+    raced = False
     try:
-        watcher.parsed.wait(GRACE)
-        fake_adb.release("answer")
-        assert collector.received("live")
+        raced = _answer_once_backlog_parsed(fake_adb, watcher)
+        _require_delivered(collector, "live")
     finally:
         _shutdown(fake_adb, stream)
 
-    assert collector.messages() == ["backlog 1", "backlog 2", "backlog 3", "live"]
+    assert collector.messages() == [*BACKLOG, "live"], (
+        f"backlog parsed while every lookup was held: {raced}"
+    )
 
 
 def test_app_launched_after_start_is_picked_up(fake_adb: FakeAdb) -> None:
@@ -591,6 +766,7 @@ def test_restarted_app_is_followed_to_its_new_pid(fake_adb: FakeAdb) -> None:
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="F5-2: once PID polling has backed off, a restarted app's lines are "
     "dropped until the next scheduled poll",
 )
@@ -604,15 +780,19 @@ def test_restarted_app_is_picked_up_without_waiting_for_a_backed_off_poll(
     kept is open (D-8); only a later one is required.
     """
     _restart_logcat(fake_adb)
+    watcher = _ParseWatcher(FILLER)
     collector = _Collector()
-    stream = _start_sync(Filter(package=PACKAGE), collector, backed_off=True)
+    stream = _start_sync(
+        Filter(package=PACKAGE), collector, parser=watcher, backed_off=True
+    )
     try:
         # "before" follows the 2nd lookup, which found nothing new: from here
         # the next scheduled poll is BACKED_OFF_INTERVAL away.
-        assert collector.received("before")
+        _require_delivered(collector, "before")
         fake_adb.release("restart")
         _unblock_after_restart(fake_adb, collector)
-        stream.join(timeout=TIMEOUT)  # logcat exits after "after 2"
+        _end_logcat_once_parsed(fake_adb, watcher)
+        _join(stream)
     finally:
         _shutdown(fake_adb, stream)
 
@@ -633,13 +813,14 @@ def test_pid_lookup_queries_the_selected_device(fake_adb: FakeAdb) -> None:
     finally:
         _shutdown(fake_adb, stream)
 
-    lookups = [call["args"] for call in fake_adb.calls("pidof")]
+    lookups = [child.args for child in fake_adb.children("pidof")]
     assert lookups
-    assert all(args[:2] == ["-s", serial] for args in lookups), lookups
+    assert all(args[:2] == ("-s", serial) for args in lookups), lookups
 
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="F5-3: the package name reaches the device shell unquoted in "
     "`adb shell pidof <package>`",
 )
@@ -656,7 +837,7 @@ def test_package_name_with_shell_metacharacters_is_not_run_by_the_device(
     except ValueError:
         return  # rejected before anything reached the device
     try:
-        wait_until(lambda: _shell_calls(fake_adb, polling=True), timeout=TIMEOUT)
+        wait_until(lambda: _shell_calls(fake_adb), timeout=TIMEOUT)
     finally:
         _shutdown(fake_adb, stream)
 
@@ -699,6 +880,7 @@ async def test_async_filter_package_delivers_only_that_packages_lines(
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="F5-1: PID lookup starts only for Filter; Package() in an "
     "AdvancedFilter never matches a live line",
 )
@@ -710,19 +892,22 @@ async def test_async_advanced_filter_package_condition_delivers_that_packages_li
     lines, each with meta["package"] set, like Filter(package=...) does (F5-1).
     """
     _resolve_steadily(fake_adb)
-    fake_adb.logcat(
-        run(
-            wait("resolved"),
-            _line("mine 1"),
-            _line("theirs", pid=OTHER_PID),
-            _line("mine 2"),
-        )
+    _logcat_until_parsed(
+        fake_adb,
+        wait("resolved"),
+        _line("mine 1"),
+        _line("theirs", pid=OTHER_PID),
+        _line("mine 2"),
     )
+    watcher = _ParseWatcher(FILLER)
     collector = _AsyncCollector()
-    stream = await _start_async(AdvancedFilter(Package(PACKAGE)), collector)
+    stream = await _start_async(
+        AdvancedFilter(Package(PACKAGE)), collector, parser=watcher
+    )
     try:
         await _unblock_if_never_looked_up_async(fake_adb)
-        await stream.join(timeout=TIMEOUT)  # logcat exits after its last line
+        await _end_logcat_once_parsed_async(fake_adb, watcher)
+        await _join_async(stream)
     finally:
         await _shutdown_async(fake_adb, stream)
 
@@ -731,6 +916,7 @@ async def test_async_advanced_filter_package_condition_delivers_that_packages_li
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="F5-2: lines read before the first PID lookup finishes are dropped "
     "(the startup backlog)",
 )
@@ -745,14 +931,16 @@ async def test_async_backlog_before_the_first_pid_lookup_is_delivered(
     watcher = _ParseWatcher(FILLER)
     collector = _AsyncCollector()
     stream = await _start_async(Filter(package=PACKAGE), collector, parser=watcher)
+    raced = False
     try:
-        await _wait_parsed_async(watcher)
-        fake_adb.release("answer")
-        assert await collector.received("live")
+        raced = await _answer_once_backlog_parsed_async(fake_adb, watcher)
+        await _require_delivered_async(collector, "live")
     finally:
         await _shutdown_async(fake_adb, stream)
 
-    assert collector.messages() == ["backlog 1", "backlog 2", "backlog 3", "live"]
+    assert collector.messages() == [*BACKLOG, "live"], (
+        f"backlog parsed while every lookup was held: {raced}"
+    )
 
 
 @pytest.mark.asyncio
@@ -786,6 +974,7 @@ async def test_async_restarted_app_is_followed_to_its_new_pid(
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="F5-2: once PID polling has backed off, a restarted app's lines are "
     "dropped until the next scheduled poll",
 )
@@ -798,13 +987,17 @@ async def test_async_restarted_app_is_picked_up_without_waiting_for_a_backed_off
     new-pid line is open, D-8).
     """
     _restart_logcat(fake_adb)
+    watcher = _ParseWatcher(FILLER)
     collector = _AsyncCollector()
-    stream = await _start_async(Filter(package=PACKAGE), collector, backed_off=True)
+    stream = await _start_async(
+        Filter(package=PACKAGE), collector, parser=watcher, backed_off=True
+    )
     try:
-        assert await collector.received("before")
+        await _require_delivered_async(collector, "before")
         fake_adb.release("restart")
         await _unblock_after_restart_async(fake_adb, collector)
-        await stream.join(timeout=TIMEOUT)  # logcat exits after "after 2"
+        await _end_logcat_once_parsed_async(fake_adb, watcher)
+        await _join_async(stream)
     finally:
         await _shutdown_async(fake_adb, stream)
 
@@ -813,6 +1006,7 @@ async def test_async_restarted_app_is_picked_up_without_waiting_for_a_backed_off
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="F5-3: the package name reaches the device shell unquoted in "
     "`adb shell pidof <package>`",
 )
@@ -830,9 +1024,7 @@ async def test_async_package_name_with_shell_metacharacters_is_not_run_by_the_de
     except ValueError:
         return  # rejected before anything reached the device
     try:
-        await async_wait_until(
-            lambda: _shell_calls(fake_adb, polling=True), timeout=TIMEOUT
-        )
+        await async_wait_until(lambda: _shell_calls(fake_adb), timeout=TIMEOUT)
     finally:
         await _shutdown_async(fake_adb, stream)
 
