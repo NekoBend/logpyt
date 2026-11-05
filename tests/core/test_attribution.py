@@ -20,6 +20,8 @@ from logpyt import (
     CrashCondition,
     Filter,
     GroupBy,
+    Level,
+    MessageContains,
     MinLevel,
     Package,
     Tag,
@@ -195,9 +197,12 @@ def test_secondary_user_matches_by_app_id() -> None:
     assert (entry.uid, entry.package) == (1_010_065, APP)
 
 
-@pytest.mark.parametrize("uid", [1000, 0, "root", "zzzzz"], ids=str)
+@pytest.mark.parametrize(
+    "uid", [1000, 0, "root", "zzzzz", 10 * 100_000 + 1000, 10 * 100_000], ids=str
+)
 def test_system_uids_are_known_and_never_held(uid: int | str) -> None:
-    """5.8: a system uid (< 10000) or a name that is no uid has no package."""
+    """5.8: a system uid (< 10000, of any user: by app id) or a name that is
+    no uid has no package."""
     harness = _running(Package(APP) | Tag("Sys"))
 
     harness.stdout(line("system", uid=uid, tag="Sys"))
@@ -205,17 +210,47 @@ def test_system_uids_are_known_and_never_held(uid: int | str) -> None:
     assert harness.messages() == ["first", "system"]
     assert harness.core._attribution.held == 0
     assert len(_lookups(harness)) == 1  # nothing asked for a re-lookup
+    assert harness.core.next_deadline() is None
+
+
+@pytest.mark.parametrize("uid", [99_001, "u0_i5", 10 * 100_000 + 90_000], ids=str)
+def test_isolated_uids_are_known_and_never_held(uid: int | str) -> None:
+    """A.14: an isolated process's uid (app id 90000 and above) is no app's
+    own uid, so no lookup can name it: its lines go on at once, without a
+    package and not unattributed, and ask for no lookup."""
+    harness = _running(Package(APP) | Tag("Sys"))
+
+    harness.stdout(line("isolated", uid=uid, tag="Sys") + line("other", uid=uid))
+
+    assert harness.messages() == ["first", "isolated"]
+    assert harness.core._attribution.held == 0
+    assert harness.core.next_deadline() is None
+    assert len(_lookups(harness)) == 1
+    stats = harness.core.stats()
+    assert (stats.filtered, stats.unattributed) == (1, 0)
+    # With APP mapped, such a line asks for no re-lookup either.
+    mapped = _attribution(Package(APP))
+    started = mapped.next_lookup(0.0)
+    assert started is not None
+    mapped.lookup_done(started.ident, LOOKUP_OK)
+    assert mapped.admit(_entry(uid=99_001), 1.0) is not None
+    assert mapped.deadline() is None
 
 
 def test_a_system_uid_package_warns_once_and_over_matches() -> None:
-    """5.8 caveat: a watched package with a system uid gets one WARNING, and
-    every line of that uid is attributed to it."""
+    """5.8 caveat: a watched package with a system uid gets one WARNING, also
+    when later lookups answer that uid again, and every line of that uid is
+    attributed to it."""
     harness = Harness.make(where=Package(APP))
     harness.connecting_spawned()
 
     harness.answer("lookup", lookup(1000))
     harness.stdout(line("system_server", uid=1000, pid=555))
+    harness.stdout(line("third party", uid=10_099))  # asks for APP once more
+    harness.until_deadline()
+    harness.answer("lookup", lookup(1000))
 
+    assert len(_lookups(harness)) == 2
     warnings = [d.message for d in harness.diagnostics if "system uid" in d.message]
     assert warnings == [
         f"package {APP} has the system uid 1000: every line of uid 1000, "
@@ -246,6 +281,9 @@ _SHARED = [
     ("later-and", (Package(OTHER) & Tag("x")) | (Package(APP) & Tag("y")), True),
     ("later-alone", Package(OTHER) | (Package(APP) & Tag("never")), True),
     ("not-later", ~Package(OTHER) | (Package(APP) & Tag("never")), False),
+    # Where(c) matches like c (filters.Where), a Where of a Package too.
+    ("where-later", Where(Package(OTHER)) | (Package(APP) & Tag("never")), True),
+    ("not-where", ~Where(Where(Package(OTHER))) | (Package(APP) & Tag("z")), False),
 ]
 
 
@@ -401,6 +439,160 @@ def test_each_package_waits_its_own_interval() -> None:
     assert entry.package == OTHER
 
 
+def test_the_deadline_is_the_earliest_due_relookup() -> None:
+    """X-3: of two wanted re-lookups the timer fires for the one due first
+    (APP at 100.5, not OTHER at 100.9), before the line's short hold expires."""
+    harness = Harness.make(where=Package(APP) | Package(OTHER), package_hold=0.3)
+    harness.connecting_spawned()  # APP's first lookup at t=100.0
+    harness.send(Tick(), at=100.4)
+    harness.answer("lookup", LOOKUP_ABSENT)  # OTHER's first lookup at t=100.4
+    harness.answer("lookup", LOOKUP_ABSENT)
+    harness.send(Tick(), at=100.42)
+
+    harness.stdout(line("l2"))  # APP's uid: held until 100.72
+
+    assert harness.core.next_deadline() == pytest.approx(100.5)
+    harness.until_deadline()
+    assert harness.request("lookup").argv[-1] == APP
+    harness.answer("lookup", LOOKUP_OK)
+    assert [(item.message, item.package) for item in _entries(harness)] == [("l2", APP)]
+    assert harness.core.stats().unattributed == 0
+
+
+def _slow_rounds(harness: Harness, moved: int | None = None) -> list[str]:
+    """Six rounds of 0.6 s lookups (longer than LOOKUP_INTERVAL) from t=100.5,
+    after the first two; a line from a new app uid comes during each. OTHER
+    answers ``moved`` (None: "not installed"), APP "not installed". Returns
+    the packages of the re-lookups.
+    """
+    harness.stdout(line("n0", uid=11_000, tag="Other"))
+    harness.until_deadline()  # t=100.5: the first re-lookup
+    for index in range(1, 7):
+        harness.stdout(line(f"n{index}", uid=11_000 + index, tag="Other"))
+        harness.advance(0.6)
+        found = harness.request("lookup").argv[-1] == OTHER and moved is not None
+        harness.answer("lookup", lookup(moved, OTHER) if found else LOOKUP_ABSENT)
+    return [command.argv[-1] for command in _lookups(harness)[2:]]
+
+
+def test_slow_relookups_without_a_uid_take_turns() -> None:
+    """X-3 without starvation: with slow lookups and a new app uid during each,
+    both packages (no uid) are due again at every answer. They take turns
+    (the longest since its last lookup first), so the lines that wait for
+    them do not expire."""
+    harness = Harness.make(where=Package(APP) | Package(OTHER))
+    harness.connecting_spawned()
+    harness.answer("lookup", LOOKUP_ABSENT)  # APP
+    harness.answer("lookup", LOOKUP_ABSENT)  # OTHER
+
+    asked = _slow_rounds(harness)
+
+    assert asked == [APP, OTHER, APP, OTHER, APP, OTHER, APP]
+    stats = harness.core.stats()
+    assert (stats.filtered, stats.unattributed) == (5, 0)
+    assert harness.core._attribution.held == 2  # n5, n6: the 7th answer is owed
+
+
+def test_a_slow_mapped_relookup_waits_at_most_package_hold() -> None:
+    """X-3 without starvation: as above with OTHER mapped. Lines wait for APP
+    (no uid) only, so APP goes first; OTHER, passed over since t=100.5, goes
+    first once that is package_hold (2 s) ago, at t=102.9: its reinstall under
+    a new uid is found, and no line expires."""
+    moved = 10_120
+    harness = Harness.make(where=Package(APP) | Package(OTHER))
+    harness.connecting_spawned()
+    harness.answer("lookup", LOOKUP_ABSENT)  # APP
+    harness.answer("lookup", lookup(OTHER_UID, OTHER))
+
+    asked = _slow_rounds(harness, moved)
+
+    assert asked == [APP] * 4 + [OTHER] + [APP] * 2
+    assert harness.core._attribution.uid_packages == {moved: OTHER}
+    stats = harness.core.stats()
+    assert (stats.filtered, stats.unattributed) == (6, 0)
+    assert harness.core._attribution.held == 1  # n6: the 7th answer is owed
+    harness.answer("lookup", LOOKUP_ABSENT)
+    harness.stdout(line("moved", uid=moved))
+    (entry,) = _entries(harness)
+    assert (entry.message, entry.package) == ("moved", OTHER)
+
+
+def test_an_app_installed_during_slow_relookups_keeps_its_launch_lines() -> None:
+    """D-8 (a crash at app launch), X-3: a line from a new app uid (the
+    installer) asks for re-lookups of all three packages; ZZZ (no uid) goes
+    first, but the install comes just after it started: "not installed". The
+    launch lines wait for ZZZ's next re-lookup, which goes before those of the
+    mapped packages (passed over for less than package_hold), so with 0.7 s
+    lookups every launch line is ZZZ's before its hold expires."""
+    zzz, zzz_uid = "com.example.zzz", 10_200
+    harness = Harness.make(where=Package(APP) | Package(OTHER) | Package(zzz))
+    harness.connecting_spawned()
+    harness.answer("lookup", LOOKUP_OK)  # APP
+    harness.answer("lookup", lookup(OTHER_UID, OTHER))
+    harness.answer("lookup", lookup(None, zzz))
+    harness.send(Tick(), at=105.0)
+    harness.stdout(line("installer", uid=10_300))  # ZZZ's re-lookup starts
+    for index in range(11):  # the launch: a line every 0.1 s from t=105.3
+        harness.send(Tick(), at=105.3 + 0.1 * index)
+        if index == 4:  # t=105.7
+            harness.answer("lookup", lookup(None, zzz))  # started before the install
+            assert harness.request("lookup").argv[-1] == zzz
+        harness.stdout(line(f"u{index}", uid=zzz_uid))
+
+    harness.send(Tick(), at=106.4)
+    harness.answer("lookup", lookup(zzz_uid, zzz))
+
+    entries = [(item.message, item.package) for item in _entries(harness)]
+    assert entries == [(f"u{index}", zzz) for index in range(11)]
+    stats = harness.core.stats()
+    assert (stats.filtered, stats.unattributed) == (1, 0)  # the installer's line
+    asked = [command.argv[-1] for command in _lookups(harness)[3:]]
+    assert asked == [zzz, zzz, APP]  # then the mapped packages' re-lookups
+
+
+def test_slow_relookups_of_three_packages_take_turns() -> None:
+    """X-3: of the packages without a uid, the one longest since its last
+    lookup goes first, so with three slow ones none is left out (by name,
+    THIRD would wait for package_hold: APP and OTHER pass each other over in
+    turn)."""
+    third = "com.example.third"
+    harness = Harness.make(
+        where=Package(APP) | Package(OTHER) | Package(third), package_hold=5.0
+    )
+    harness.connecting_spawned()
+    for _ in range(3):
+        harness.answer("lookup", LOOKUP_ABSENT)  # the first lookups, at t=100
+    harness.stdout(line("n0", uid=11_000, tag="Other"))
+    harness.until_deadline()  # t=100.5: the first re-lookup
+
+    for index in range(1, 7):
+        harness.stdout(line(f"n{index}", uid=11_000 + index, tag="Other"))
+        harness.advance(0.6)
+        harness.answer("lookup", LOOKUP_ABSENT)
+
+    asked = [command.argv[-1] for command in _lookups(harness)[3:]]
+    assert asked == [APP, OTHER, third] * 2 + [APP]
+    assert harness.core.stats().unattributed == 0
+
+
+def test_a_uid_seen_before_a_first_lookup_asks_for_no_extra_one() -> None:
+    """A uid first seen while OTHER's first lookup is still to come is settled
+    by that lookup: it asks for APP's re-lookup only."""
+    harness = Harness.make(where=Package(APP) | Package(OTHER), package_hold=1.0)
+    harness.connecting_spawned()  # APP's first lookup in flight
+    harness.advance(1.0)  # its wait expired: intake opens
+    harness.stdout(line("x", uid=10_099))
+    harness.answer("lookup", LOOKUP_ABSENT)  # APP's first lookup
+    harness.answer("lookup", LOOKUP_ABSENT)  # OTHER's, issued after x came
+
+    harness.answer("lookup", LOOKUP_ABSENT)  # APP's re-lookup, due at once
+
+    assert [command.argv[-1] for command in _lookups(harness)] == [APP, OTHER, APP]
+    assert harness.core.next_deadline() is None
+    stats = harness.core.stats()
+    assert (stats.filtered, stats.unattributed) == (1, 0)
+
+
 def test_a_held_line_goes_on_once_its_verdict_no_longer_needs_the_package() -> None:
     """Tri-state after a lookup: APP got another uid, so the line is not APP's;
     its verdict then no longer depends on OTHER, whose lookup has not run."""
@@ -418,6 +610,27 @@ def test_a_held_line_goes_on_once_its_verdict_no_longer_needs_the_package() -> N
     attribution = harness.core._attribution
     assert attribution.held == 0
     assert not attribution.negative(APP_UID)  # it may still be OTHER's
+    assert harness.request("lookup").argv[-1] == OTHER
+    stats = harness.core.stats()
+    assert (stats.unattributed, stats.filtered) == (0, 1)
+
+
+def test_a_held_line_waits_only_for_the_packages_it_may_belong_to() -> None:
+    """APP answered "not installed" after the line came: APP has no uid, but
+    the line is not APP's, so its verdict no longer needs a package (OTHER's
+    And is false for tag y) before OTHER's re-lookup."""
+    harness = Harness.make(where=Package(APP) | (Package(OTHER) & Tag("x")))
+    harness.connecting_spawned()
+    harness.answer("lookup", LOOKUP_ABSENT)  # APP
+    harness.answer("lookup", LOOKUP_ABSENT)  # OTHER
+    harness.stdout(line("held", uid=10_071, tag="y"))
+    assert harness.core._attribution.held == 1
+    harness.until_deadline()
+    assert harness.request("lookup").argv[-1] == APP
+
+    harness.answer("lookup", LOOKUP_ABSENT)
+
+    assert harness.core._attribution.held == 0
     assert harness.request("lookup").argv[-1] == OTHER
     stats = harness.core.stats()
     assert (stats.unattributed, stats.filtered) == (0, 1)
@@ -555,12 +768,8 @@ _TRI_STATE = [
     ("and-waits", Package(APP) & Tag("x"), "x", "held"),
     ("not-waits", ~Package(APP), "x", "held"),
     ("filter-decided", Filter(package=APP, tag="x"), "y", "filtered"),
-    (
-        "crash-text",
-        Package(APP) | CrashCondition(package=APP) | Tag("x"),
-        "x",
-        "delivered",
-    ),
+    # CrashCondition reads the text, not the package (A.17): false here.
+    ("crash-text", Package(APP) & CrashCondition(package=APP), "x", "filtered"),
 ]
 
 
@@ -589,6 +798,70 @@ def test_only_a_verdict_that_needs_the_package_waits(
         assert entry.package is None  # its package was not known then
     # Every line from an unknown app uid asks for the re-lookup.
     assert harness.core.next_deadline() == pytest.approx(100.0 + LOOKUP_INTERVAL)
+
+
+_PURE = [
+    ("tag", Tag("x")),
+    ("level", Level("E")),
+    ("min-level", MinLevel("W")),
+    ("message", MessageContains("never")),
+    ("crash", CrashCondition(package=APP)),
+    ("anr", AnrCondition(package=APP)),
+    ("where-tag", Where(Tag("x"))),
+    ("where-where", Where(Where(Tag("x")))),
+    ("where-package", Where(Package(OTHER))),
+]
+
+
+@pytest.mark.parametrize("leaf", [case[1] for case in _PURE], ids=[c[0] for c in _PURE])
+def test_a_built_in_leaf_decides_past_an_unknown_package(leaf: Condition) -> None:
+    """filters: built-in conditions change nothing, so evaluate calls them past
+    an unknown verdict; false for the line, each decides Package(APP) & leaf
+    at once (a Package, in a Where too, is decided without a call)."""
+    entry = _entry(tag="App")  # level I, message "m"
+    assert leaf(entry) is False
+    condition = Package(APP) & leaf
+
+    verdict = evaluate(
+        condition,
+        entry,
+        unknown=frozenset({APP}),
+        calls={},
+        declared=declared_packages(condition),
+    )
+
+    assert verdict is False
+
+
+def test_every_built_in_leaf_is_covered() -> None:
+    """Each condition evaluate may call past an unknown verdict is in _PURE."""
+    leaves = [attribution_module._unwrap(leaf) for _, leaf in _PURE]
+    covered = {type(leaf).__call__ for leaf in leaves} - {Package.__call__}
+    assert covered == attribution_module._PURE_CALLS
+
+
+def test_a_held_line_runs_a_shared_leaf_once_at_its_release() -> None:
+    """A leaf that plain evaluation calls twice (it appears twice) runs once
+    for a held line, also when nothing ran while its package was unknown, and
+    for a line from an unknown app uid queued behind it."""
+    seen: list[str] = []
+
+    def check(entry: LogEntry) -> bool:
+        seen.append(entry.message)
+        return True
+
+    leaf = Where(check)
+    harness = _running((Package(APP) | leaf) & leaf)
+    seen.clear()
+
+    harness.stdout(line("held", uid=10_099) + line("queued", uid=10_098))
+    assert seen == []
+    assert harness.core._attribution.held == 2
+    harness.until_deadline()
+    harness.answer("lookup", LOOKUP_ABSENT)  # not APP's: the Or needs the leaf
+
+    assert seen == ["held", "queued"]
+    assert harness.messages() == ["first", "held", "queued"]
 
 
 def test_later_lines_queue_behind_a_held_line_in_order() -> None:
@@ -707,26 +980,34 @@ def test_a_failed_lookup_keeps_a_line_first_seen_after_it_started() -> None:
 
 
 def test_a_failed_lookup_keeps_a_line_that_waits_for_another_package() -> None:
-    """A failure gives up only the lines that still wait for that package: l1
-    waits for ZZZ alone once APP answered after it, so it stays (and l2 behind
-    it), although APP's next lookup fails."""
+    """A failure gives up only the lines that still wait for that package: APP
+    has a uid, so l1 waits for ZZZ alone (ZZZ's lookup that ran when l1 came
+    says nothing about it), and it stays, with l2 behind it, although APP's
+    re-lookup fails; ZZZ's next answer releases both."""
     zzz = "com.example.zzz"
     harness = Harness.make(where=Package(APP) | Package(zzz))
     harness.connecting_spawned()
-    harness.answer("lookup", LOOKUP_ABSENT)  # APP, id 1, t=100
+    harness.answer("lookup", lookup(OTHER_UID))  # APP: another uid, id 1, t=100
     harness.answer("lookup", LOOKUP_ABSENT)  # ZZZ, id 2, t=100
-    harness.stdout(line("l1", uid=10_071))
-    harness.until_deadline()  # t=100.5: APP's re-lookup, id 3
-    assert harness.request("lookup").argv[-1] == APP
+    harness.send(Tick(), at=100.5)
+    harness.stdout(line("l0", uid=10_080))
+    assert harness.request("lookup").argv[-1] == zzz  # id 3: no uid, first
+    harness.stdout(line("l1", uid=10_071))  # first seen while id 3 runs
+    harness.send(Tick(), at=100.6)
+    harness.answer("lookup", LOOKUP_ABSENT)  # l0 is no one's; l1 waits for ZZZ
+    assert harness.request("lookup").argv[-1] == APP  # id 4; ZZZ due at 101.0
     harness.stdout(line("l2", uid=10_072))
-    harness.send(Tick(), at=101.0)
-    harness.answer("lookup", LOOKUP_ABSENT)  # APP absent: l1 waits for ZZZ only
-    assert harness.request("lookup").argv[-1] == APP  # due first, alphabetically
 
     harness.answer("lookup", LOOKUP_FAILED)
 
     assert harness.core._attribution.held == 2
     assert harness.core.stats().unattributed == 0
+    harness.until_deadline()  # t=101.0: ZZZ's re-lookup
+    assert harness.request("lookup").argv[-1] == zzz
+    harness.answer("lookup", LOOKUP_ABSENT)
+    assert harness.core._attribution.held == 0
+    stats = harness.core.stats()
+    assert (stats.filtered, stats.unattributed) == (3, 0)
 
 
 def test_held_lines_count_against_the_outbox() -> None:
@@ -1022,8 +1303,25 @@ def test_a_combination_that_overrides_packages_is_one_leaf() -> None:
     assert harness.messages() == ["held"]
 
 
+class _ErrorsOf(Package):
+    """A Package whose ``__call__`` also needs level E: a user leaf (A.17)."""
+
+    def __call__(self, entry: LogEntry, /) -> bool:
+        return entry.level == "E" and super().__call__(entry)
+
+
+class _Strict(And):
+    """An And whose ``__call__`` also needs the tag Strict: a user leaf (A.17)."""
+
+    def __call__(self, entry: LogEntry, /) -> bool:
+        return entry.tag == "Strict" and super().__call__(entry)
+
+
 _EVALUATE = [
     ("package", Package(APP), "x", None),
+    ("package-call", _ErrorsOf(APP), "x", None),
+    ("and-call", _Strict(Package(APP), Tag("x")), "x", None),
+    ("or-and-call", Tag("y") | _Strict(Package(APP), Tag("x")), "x", None),
     ("package-ruled-out", Package(OTHER), "x", False),
     ("or-tag", Package(APP) | Tag("x"), "x", True),
     ("or-unknown", Package(APP) | Tag("x"), "y", None),
@@ -1113,6 +1411,34 @@ def test_held_lines_go_before_the_end_of_their_connection() -> None:
     assert held < change
     assert harness.core.stats().unattributed == 1
     assert harness.core._attribution.held == 0
+
+
+def test_held_lines_join_their_group_before_the_connection_ends() -> None:
+    """3.6 with grouping: at a connection's end the held line goes through
+    grouping before the groups flush, so it ends its group, and that group
+    comes before the change to RECONNECTING."""
+    harness = _running(
+        ~Package(APP),
+        reconnect=Reconnect(delay=5.0),
+        group_by=GroupBy(keys=(), gap_ms=60_000.0, idle_flush_ms=None),
+    )
+    harness.stdout(line("grouped", uid=1000) + line("held"))
+    assert harness.core._attribution.held == 1
+
+    harness.end_connection(1)
+
+    records = _records(harness)
+    groups = [index for index, item in enumerate(records) if isinstance(item, LogGroup)]
+    (index,) = groups
+    group = records[index]
+    assert isinstance(group, LogGroup)
+    assert [entry.message for entry in group] == ["first", "grouped", "held"]
+    change = next(
+        position
+        for position, record in enumerate(records)
+        if isinstance(record, StateChange) and record.new is S.RECONNECTING
+    )
+    assert index < change
 
 
 def test_the_conclusion_releases_held_lines_before_the_groups_flush() -> None:
