@@ -9,7 +9,10 @@ when the drivers run this core.
 
 from __future__ import annotations
 
+import random
 import sys
+from collections import Counter
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -31,6 +34,7 @@ from logpyt._core import attribution as attribution_module
 from logpyt._core.attribution import (
     LOOKUP_INTERVAL,
     UID_CACHE,
+    Answer,
     Attribution,
     declared_packages,
     evaluate,
@@ -47,7 +51,7 @@ from logpyt._core.protocol import (
 )
 from logpyt.config import Reconnect
 from logpyt.exceptions import CallbackError
-from logpyt.filters import And
+from logpyt.filters import And, Not, Or
 from logpyt.models import LogEntry, LogGroup
 from logpyt.parsers import ThreadTimeLogParser
 from logpyt.streams._events import StateChange, StreamState
@@ -66,6 +70,7 @@ from tests.core.harness import (
 )
 
 if TYPE_CHECKING:
+    from logpyt._core.attribution import Lookup
     from logpyt._core.protocol import Record
     from logpyt.adb import _AdbResult
 
@@ -133,11 +138,8 @@ def _attribution(where: Condition, *, hold: float = 2.0) -> Attribution:
 
 
 def test_the_lookup_is_dumpsys_package_per_watched_package() -> None:
-    """A.8: ``shell dumpsys package <pkg>``, one at a time; a process name
-    watches its package (a uid names an app, not a process)."""
-    harness = Harness.make(
-        where=Package(f"{APP}:remote") | Package(OTHER), serial="emulator-5554"
-    )
+    """A.8: ``shell dumpsys package <pkg>``, one at a time, in name order."""
+    harness = Harness.make(where=Package(OTHER) | Package(APP), serial="emulator-5554")
     harness.start()
 
     (first,) = _lookups(harness)
@@ -319,7 +321,8 @@ def test_a_reinstall_under_a_new_uid_is_looked_up_again() -> None:
     """5.8, 9.4: a mapped package reinstalled under another app id. A line from
     the new uid asks for one more lookup and is not held (D-8: every watched
     package is mapped); the answer moves the package, so later lines of the
-    new uid are attributed and the old uid names nothing."""
+    new uid are attributed and the old uid names nothing. The line that went
+    on before the answer was APP's: it counts as unattributed (D2)."""
     new_uid = 10_120
     harness = Harness.make(where=Package(APP) & MinLevel("E"))
     harness.connecting_spawned()
@@ -340,7 +343,14 @@ def test_a_reinstall_under_a_new_uid_is_looked_up_again() -> None:
         ("crash 2", APP),
     ]
     stats = harness.core.stats()
-    assert (stats.filtered, stats.unattributed) == (2, 0)  # crash 1 and old
+    assert (stats.filtered, stats.unattributed) == (2, 1)  # crash 1 and old
+    # The old uid is unknown now: its line waits for APP's next answer, which
+    # names the new uid again, so it was not APP's and is forgotten.
+    assert attribution.unsettled == 1
+    harness.until_deadline()
+    harness.answer("lookup", lookup(new_uid))
+    assert attribution.unsettled == 0
+    assert harness.core.stats().unattributed == 1
 
 
 def test_a_mapped_package_found_uninstalled_has_no_uid_again() -> None:
@@ -667,11 +677,11 @@ def test_stale_lookup_result_ignored() -> None:
     alone = _attribution(Package(APP))
     started = alone.next_lookup(0.0)
     assert started is not None
-    assert alone.lookup_done(started.ident + 1, LOOKUP_OK) == []
+    assert alone.lookup_done(started.ident + 1, LOOKUP_OK) == Answer()
     assert alone.next_lookup(0.0) is None  # still in flight
     assert alone.uid_packages == {}
-    assert alone.lookup_done(started.ident, LOOKUP_ABSENT) == []
-    assert alone.lookup_done(started.ident, LOOKUP_OK) == []  # answered already
+    assert alone.lookup_done(started.ident, LOOKUP_ABSENT) == Answer()
+    assert alone.lookup_done(started.ident, LOOKUP_OK) == Answer()  # answered
     assert alone.uid_packages == {}
     assert alone.ready
 
@@ -1332,7 +1342,8 @@ _EVALUATE = [
     ("filter-empty", Filter(), "x", True),
     ("filter", Filter(package=APP, tag="x"), "y", False),
     ("anr-text", AnrCondition(package=APP) & Package(APP), "x", False),
-    ("process-name", Package(f"{APP}:remote") | Tag("y"), "x", False),
+    # A process name lives in the text conditions only (D1): decided.
+    ("process-text", CrashCondition(package=f"{APP}:remote") | Tag("y"), "x", False),
 ]
 
 
@@ -1527,3 +1538,1659 @@ def test_a_detach_releases_held_lines_and_stops_holding() -> None:
     assert stats.unattributed == 2
     assert stats.undelivered >= 2
     assert harness.core.mode is Mode.STOP
+
+
+# -- watched names are package names (D1) ----------------------------------------------
+
+
+class _Names(Condition):
+    """A user condition whose packages() override returns ``names`` as given."""
+
+    def __init__(self, *names: object) -> None:
+        self.names = names
+
+    def __call__(self, entry: LogEntry, /) -> bool:
+        del entry
+        return True
+
+    def packages(self) -> frozenset[str]:
+        return self.names  # ty: ignore[invalid-return-type]
+
+
+@pytest.mark.parametrize(
+    ("name", "error", "match"),
+    [
+        (f"{APP}:remote", ValueError, rf"names a process.*package name is '{APP}'"),
+        ("a b", ValueError, "is not a package name"),
+        (42, TypeError, "must be a str, not int"),
+    ],
+    ids=["process", "grammar", "not-str"],
+)
+def test_the_core_checks_the_watched_names_at_construction(
+    name: object, error: type[Exception], match: str
+) -> None:
+    """D1: a packages() override may return any string; the core checks each
+    name when it is built (F5-3, no process name: a uid names an app), not
+    at the first lookup inside handle()."""
+    where = Tag("x") | _Names(OTHER, name)
+
+    with pytest.raises(error, match=match) as raised:
+        Harness.make(where=where)
+
+    assert str(raised.value).startswith(f"where.packages() returned {name!r}: ")
+    assert ":<process>" not in str(raised.value)  # D1: the grammar has none
+    with pytest.raises(error, match=match):
+        _attribution(where)
+
+
+class _OneString(Condition):
+    """A user condition whose packages() override returns one str."""
+
+    def __call__(self, entry: LogEntry, /) -> bool:
+        return entry.package == "myapp"
+
+    def packages(self) -> frozenset[str]:
+        return "myapp"  # ty: ignore[invalid-return-type]
+
+
+@pytest.mark.parametrize("at", ["root", "nested"])
+def test_the_core_refuses_a_packages_override_that_returns_a_str(at: str) -> None:
+    """D1: a str from packages() would be read one character at a time (m, y,
+    a, p watched, or '.' refused for a dotted name): it raises TypeError at
+    construction, at the root of where or below it."""
+    where = _OneString() if at == "root" else Tag("x") | _OneString()
+    pattern = r"_OneString\.packages\(\) must return a collection of package names"
+
+    with pytest.raises(TypeError, match=rf"{pattern}, not str"):
+        Harness.make(where=where)
+
+
+# -- a reinstall's lines before its answer (D2) ----------------------------------------
+
+NEW_UID = 10_090  # APP's uid after a reinstall (APP_UID before)
+
+
+def _mapped(where: Condition, *answers: _AdbResult, **fields: Any) -> Harness:  # noqa: ANN401
+    """RUNNING at t=100 after the first lookups answered ``answers`` (default:
+    APP at APP_UID), with one system-uid line read."""
+    harness = Harness.make(where=where, **fields)
+    harness.connecting_spawned()
+    for answer in answers or (LOOKUP_OK,):
+        harness.answer("lookup", answer)
+    harness.stdout(line("first", uid=1000, tag="Sys"))
+    assert harness.core.state is S.RUNNING
+    return harness
+
+
+def test_reinstall_lines_before_the_answer_are_counted() -> None:
+    """D2 (a): APP is mapped, so the lines of its new uid before the re-lookup
+    answers go on at once, filtered and not held (D-8); the answer that
+    names the new uid counts each of them in unattributed, once, and later
+    lines are APP's."""
+    harness = _mapped(Package(APP))
+    attribution = harness.core._attribution
+
+    harness.stdout(b"".join(line(f"n{i}", uid=NEW_UID) for i in range(3)))
+    harness.send(Tick(), at=100.2)
+    harness.stdout(line("n3", uid=NEW_UID) + line("n4", uid=NEW_UID + 100_000))
+
+    assert attribution.held == 0
+    assert harness.messages() == []
+    assert (harness.core.stats().filtered, harness.core.stats().unattributed) == (6, 0)
+    assert attribution.unsettled == 5
+    harness.until_deadline()  # t=100.5: APP's re-lookup
+    harness.answer("lookup", lookup(NEW_UID))
+    harness.stdout(line("after", uid=NEW_UID))
+
+    stats = harness.core.stats()
+    assert stats.unattributed == 5
+    assert "unattributed" in stats.incomplete
+    assert attribution.unsettled == 0
+    assert [(item.message, item.package) for item in _entries(harness)] == [
+        ("after", APP)
+    ]
+    assert attribution.deadline() is None  # no line asks for a lookup
+    harness.stdout(line("again", uid=NEW_UID))
+    assert harness.core.stats().unattributed == 5
+
+
+def test_another_apps_new_uid_is_not_counted() -> None:
+    """D2: the answer says APP kept its uid, so the lines of the new uid were
+    another app's: their verdict was right, they are forgotten."""
+    harness = _mapped(Package(APP))
+    harness.stdout(line("a", uid=NEW_UID) + line("b", uid=NEW_UID))
+    harness.until_deadline()
+
+    harness.answer("lookup", LOOKUP_OK)
+
+    assert harness.core._attribution.unsettled == 0
+    assert harness.core._attribution.negative(NEW_UID)
+    assert (harness.core.stats().filtered, harness.core.stats().unattributed) == (3, 0)
+
+
+def test_only_lines_whose_verdict_depends_on_the_package_are_counted() -> None:
+    """D2, tri-state: Package(APP) | Tag("x") is true for tag x without the
+    package (delivered, package=None, never counted); a tag y line was
+    filtered for want of it and is counted."""
+    harness = _mapped(Package(APP) | Tag("x"))
+    harness.stdout(line("x1", uid=NEW_UID, tag="x") + line("y1", uid=NEW_UID, tag="y"))
+    assert harness.core._attribution.unsettled == 1
+    harness.until_deadline()
+
+    harness.answer("lookup", lookup(NEW_UID))
+
+    assert [(item.message, item.package) for item in _entries(harness)] == [
+        ("x1", None)
+    ]
+    assert harness.core.stats().unattributed == 1
+
+
+def test_two_watched_packages_count_the_lines_of_the_one_found() -> None:
+    """D2 with APP and OTHER mapped: a tag t line of the new uid depends on
+    OTHER only (Package(OTHER) & Tag("t")), a tag p line on APP only. APP's
+    answer names the new uid: the tag p lines count, the tag t line waits for
+    OTHER's answer, which names OTHER's own uid: it is forgotten."""
+    where = (Package(APP) & Tag("p")) | (Package(OTHER) & Tag("t"))
+    harness = _mapped(where, LOOKUP_OK, lookup(OTHER_UID, OTHER))
+    attribution = harness.core._attribution
+    harness.stdout(
+        line("p1", uid=NEW_UID, tag="p")
+        + line("t1", uid=NEW_UID, tag="t")
+        + line("p2", uid=NEW_UID, tag="p")
+    )
+    harness.until_deadline()
+    assert harness.request("lookup").argv[-1] == APP
+
+    harness.answer("lookup", lookup(NEW_UID))
+    assert harness.core.stats().unattributed == 2
+    assert attribution.unsettled == 1  # t1
+    assert harness.request("lookup").argv[-1] == OTHER
+    harness.answer("lookup", lookup(OTHER_UID, OTHER))
+
+    assert harness.core.stats().unattributed == 2
+    assert attribution.unsettled == 0
+
+
+def test_a_shared_uid_counts_each_line_once() -> None:
+    """D2 with a sharedUserId: APP and OTHER both answer the new uid. A line
+    that depends on both counts at APP's answer only; one that depends on
+    OTHER only counts at OTHER's answer."""
+    either = Package(APP) | Package(OTHER)
+    where = (
+        (Package(APP) & Tag("p")) | (Package(OTHER) & Tag("t")) | (either & Tag("b"))
+    )
+    harness = _mapped(where, LOOKUP_OK, lookup(OTHER_UID, OTHER))
+    attribution = harness.core._attribution
+    harness.stdout(
+        line("b1", uid=NEW_UID, tag="b")
+        + line("p1", uid=NEW_UID, tag="p")
+        + line("t1", uid=NEW_UID, tag="t")
+    )
+    harness.until_deadline()
+    assert harness.request("lookup").argv[-1] == APP
+
+    harness.answer("lookup", lookup(NEW_UID))
+    assert harness.core.stats().unattributed == 2  # b1 and p1
+    assert harness.request("lookup").argv[-1] == OTHER
+    harness.answer("lookup", lookup(NEW_UID, OTHER))
+
+    assert harness.core.stats().unattributed == 3  # t1
+    assert attribution.unsettled == 0
+    assert attribution.uid_packages == {NEW_UID: APP}
+
+
+ZZZ = "com.example.zzz"  # a watched package that is not installed
+
+
+def test_a_held_line_released_while_a_mapped_package_is_owed_is_counted() -> None:
+    """D2: a line of APP's new uid waits for ZZZ (no uid); ZZZ's answer
+    releases it while APP's re-lookup is still owed, so it goes on without
+    its package and counts when APP's answer names the new uid."""
+    harness = _mapped(Package(APP) | Package(ZZZ), LOOKUP_OK, lookup(None, ZZZ))
+    harness.stdout(line("x1", uid=NEW_UID))
+    assert harness.core._attribution.held == 1
+    harness.until_deadline()
+    assert harness.request("lookup").argv[-1] == ZZZ
+
+    harness.answer("lookup", lookup(None, ZZZ))
+    assert harness.core._attribution.held == 0
+    assert harness.core.stats().unattributed == 0
+    assert harness.request("lookup").argv[-1] == APP
+    harness.answer("lookup", lookup(NEW_UID))
+
+    assert (harness.core.stats().filtered, harness.core.stats().unattributed) == (2, 1)
+
+
+def _queued_behind_a_held_line() -> Harness:
+    """x1 of APP's new uid was held for ZZZ and went on (owed: APP); then y1 of
+    another app is held for ZZZ, and x2 of the new uid, which now owes APP's
+    answer only, queues behind it. APP's re-lookup is in flight."""
+    harness = _mapped(Package(APP) | Package(ZZZ), LOOKUP_OK, lookup(None, ZZZ))
+    harness.stdout(line("x1", uid=NEW_UID))
+    harness.until_deadline()
+    harness.answer("lookup", lookup(None, ZZZ))  # x1 goes on, owed APP
+    assert harness.request("lookup").argv[-1] == APP
+    harness.stdout(line("y1", uid=10_099) + line("x2", uid=NEW_UID))
+    attribution = harness.core._attribution
+    assert attribution.held == 2
+    assert attribution._queue[1].seen == attribution_module._KNOWN  # x2: no hold
+    return harness
+
+
+def test_a_queued_line_is_counted_when_the_answer_comes_later() -> None:
+    """D2: x2 is evaluated at the head with what is known then (APP still
+    owed): it is recorded, and counts with x1 when APP's answer names the new
+    uid. APP's failed re-lookup on the way keeps both for the next answer."""
+    harness = _queued_behind_a_held_line()
+    attribution = harness.core._attribution
+
+    harness.answer("lookup", LOOKUP_FAILED)
+    assert attribution.unsettled == 1
+    harness.until_deadline()
+    assert harness.request("lookup").argv[-1] == ZZZ
+    harness.answer("lookup", lookup(None, ZZZ))  # y1, then x2 go on
+    assert attribution.held == 0
+    assert harness.core.stats().unattributed == 0
+    assert attribution.unsettled == 3  # x1, x2, and y1 (it owes APP's too)
+    assert harness.request("lookup").argv[-1] == APP
+    harness.answer("lookup", lookup(NEW_UID))
+
+    stats = harness.core.stats()
+    assert (stats.filtered, stats.unattributed) == (4, 2)  # x1 and x2
+    assert attribution.unsettled == 0
+
+
+def test_a_queued_line_whose_uid_was_named_meanwhile_gets_its_package() -> None:
+    """D2: APP's answer names the new uid while x2 waits behind y1. x2 is
+    evaluated at the head with what is known then: it goes on as APP's,
+    matched and not counted; x1 counts at the answer."""
+    harness = _queued_behind_a_held_line()
+
+    harness.answer("lookup", lookup(NEW_UID))
+    assert harness.core.stats().unattributed == 1  # x1
+    assert harness.core._attribution.held == 2
+    harness.until_deadline()
+    harness.answer("lookup", lookup(None, ZZZ))  # y1, then x2 go on
+
+    assert [(item.message, item.package) for item in _entries(harness)] == [("x2", APP)]
+    stats = harness.core.stats()
+    assert (stats.filtered, stats.unattributed) == (3, 1)
+    assert harness.core._attribution.unsettled == 1  # y1 waits for APP's next
+    harness.answer("lookup", lookup(NEW_UID))
+    assert harness.core._attribution.unsettled == 0
+    assert harness.core.stats().unattributed == 1
+
+
+def test_a_queued_line_whose_uid_turned_negative_is_plain() -> None:
+    """D2: APP's answer keeps APP's uid while x2 waits behind y1, so no
+    watched package owns the new uid: at the head x2 is resolved again (its
+    app id goes into the negative cache) and takes a plain verdict; nothing
+    waits for it, and x1 is forgotten."""
+    harness = _queued_behind_a_held_line()
+    attribution = harness.core._attribution
+
+    harness.answer("lookup", LOOKUP_OK)
+    assert attribution.unsettled == 0  # x1: its verdict was right
+    harness.until_deadline()
+    harness.answer("lookup", lookup(None, ZZZ))  # y1, then x2 go on
+
+    assert attribution.held == 0
+    assert attribution._seen[NEW_UID] is None  # resolved again at the head
+    assert _entries(harness) == []
+    stats = harness.core.stats()
+    assert (stats.filtered, stats.unattributed) == (4, 0)
+    assert attribution.unsettled == 1  # y1 waits for APP's next answer
+
+
+@pytest.mark.parametrize("leaf", ["package", "reads"])
+def test_a_queued_line_on_a_uid_shared_meanwhile(leaf: str) -> None:
+    """D2: APP and OTHER both answer the new uid (a sharedUserId) while x2 waits
+    behind y1. At the head x2 takes its package, the first owner: its Package
+    leaves match both owners, and a leaf that reads entry.package sees APP.
+    It is matched and not counted (only x1 is)."""
+    reads = _OfApp()
+    first = Package(APP) if leaf == "package" else reads
+    where = first | (Package(OTHER) & Tag("nomatch")) | Package(ZZZ)
+    harness = _mapped(where, LOOKUP_OK, lookup(OTHER_UID, OTHER), lookup(None, ZZZ))
+    harness.stdout(line("x1", uid=NEW_UID))
+    harness.until_deadline()
+    assert harness.request("lookup").argv[-1] == ZZZ
+    harness.answer("lookup", lookup(None, ZZZ))  # x1 goes on, owed APP and OTHER
+    harness.stdout(line("y1", uid=10_099) + line("x2", uid=NEW_UID))
+    assert harness.core._attribution.held == 2
+    assert harness.request("lookup").argv[-1] == APP
+
+    harness.answer("lookup", lookup(NEW_UID))
+    harness.answer("lookup", lookup(NEW_UID, OTHER))
+    assert harness.core._attribution.uid_packages == {NEW_UID: APP}
+    assert harness.core.stats().unattributed == 1  # x1
+    harness.until_deadline()
+    harness.answer("lookup", lookup(None, ZZZ))  # y1, then x2 go on
+
+    assert harness.core._attribution.held == 0
+    assert [(item.message, item.package) for item in _entries(harness)] == [("x2", APP)]
+    assert harness.core.stats().unattributed == 1
+    if leaf == "reads":
+        assert ("x2", APP) in reads.calls
+
+
+def test_a_line_counted_at_its_release_is_not_counted_again() -> None:
+    """D2 never counts a line twice: x1 waited for ZZZ until its hold expired
+    (unattributed then), so APP's later answer naming its uid adds nothing."""
+    harness = _mapped(
+        Package(APP) | Package(ZZZ), LOOKUP_OK, lookup(None, ZZZ), package_hold=0.4
+    )
+    harness.stdout(line("x1", uid=NEW_UID))
+    harness.until_deadline()  # t=100.4: the hold expired
+    assert harness.core.stats().unattributed == 1
+    harness.until_deadline()  # t=100.5: ZZZ's re-lookup
+    harness.answer("lookup", lookup(None, ZZZ))
+    harness.answer("lookup", lookup(NEW_UID))
+
+    assert harness.core.stats().unattributed == 1
+    assert harness.core._attribution.unsettled == 0
+
+
+def test_lines_under_force_are_counted_when_the_answer_comes() -> None:
+    """D2 with a detached consumer (force): the new uid's lines go on (and are
+    discarded and counted as undelivered); APP's answer still counts them."""
+    harness = _mapped(Package(APP) | Tag("App"))
+    harness.detach()
+    assert harness.core.mode is Mode.STOP
+    harness.stdout(line("x1", uid=NEW_UID, tag="y") + line("x2", uid=NEW_UID, tag="y"))
+    assert harness.core._attribution.unsettled == 2
+    harness.until_deadline()
+
+    harness.answer("lookup", lookup(NEW_UID))
+
+    assert harness.core.stats().unattributed == 2
+
+
+@pytest.mark.parametrize("end", ["stop", "kill"])
+def test_lines_waiting_at_the_end_are_not_counted(end: str) -> None:
+    """D2 caveat: the run concludes before the re-lookup answers; the waiting
+    lines are dropped uncounted (`close`, for a stop and a kill alike)."""
+    harness = _mapped(Package(APP))
+    harness.stdout(line("x1", uid=NEW_UID))
+    assert harness.core._attribution.unsettled == 1
+
+    harness.send(StopRequest() if end == "stop" else KillRequest())
+    harness.end_connection(0)
+
+    assert harness.core._attribution.unsettled == 0
+    assert harness.core.stats().unattributed == 0
+    assert harness.core.state is (S.STOPPING if end == "stop" else S.KILLED)
+
+
+def _first_mapped(where: Condition, *answers: _AdbResult) -> Attribution:
+    """An `Attribution` at t=0 whose first lookups answered ``answers`` in name
+    order (default: APP at APP_UID)."""
+    attribution = _attribution(where)
+    for answer in answers or (LOOKUP_OK,):
+        started = attribution.next_lookup(0.0)
+        assert started is not None
+        assert started.first
+        attribution.lookup_done(started.ident, answer)
+    assert attribution.ready
+    return attribution
+
+
+def _answer_next(
+    attribution: Attribution, now: float, result: _AdbResult, package: str = APP
+) -> Answer:
+    """Run the next lookup at ``now`` (of ``package``) and take ``result``."""
+    started = attribution.next_lookup(now)
+    assert started is not None
+    assert started.package == package
+    return attribution.lookup_done(started.ident, result)
+
+
+def test_an_evicted_app_id_drops_its_lines() -> None:
+    """5.10: the lines of an app id go with it when the LRU evicts it; the
+    answer that names it then counts nothing."""
+    attribution = _first_mapped(Package(APP))
+    verdict = attribution.admit(_entry(uid=NEW_UID), 1.0)
+    assert verdict is not None
+    assert not verdict.matched
+    for uid in range(20_000, 20_000 + UID_CACHE):
+        attribution.admit(_entry(uid=uid, tag="x"), 1.0)
+    assert NEW_UID not in attribution._seen
+    assert NEW_UID not in attribution._owing
+    assert len(attribution._owing) <= UID_CACHE - len(attribution.uid_packages)
+
+    answer = _answer_next(attribution, 1.0, lookup(NEW_UID))
+
+    assert answer == Answer((), 0)
+    assert attribution.unsettled == 0  # the others were not APP's either
+
+
+@pytest.mark.parametrize("how", ["discard", "close"])
+def test_discard_and_close_drop_the_lines(how: str) -> None:
+    """D2: `discard` (a kill or failure) and `close` (the conclusion) drop the
+    lines that wait for an answer, uncounted."""
+    attribution = _first_mapped(Package(APP))
+    attribution.admit(_entry(uid=NEW_UID), 1.0)
+    started = attribution.next_lookup(1.0)
+    assert started is not None
+    assert attribution.unsettled == 1
+
+    if how == "discard":
+        assert attribution.discard() == 0
+    else:
+        attribution.close()
+
+    assert attribution.unsettled == 0
+    assert attribution.lookup_done(started.ident, lookup(NEW_UID)).unattributed == 0
+
+
+def test_a_failed_relookup_keeps_the_lines_for_the_next_answer() -> None:
+    """D2: a failure settles nothing; the next answer that names the uid
+    counts the line."""
+    attribution = _first_mapped(Package(APP))
+    attribution.admit(_entry(uid=NEW_UID), 1.0)
+
+    failed = _answer_next(attribution, 1.0, LOOKUP_FAILED)
+    assert failed.unattributed == 0
+    assert len(failed.warnings) == 1
+    assert attribution.unsettled == 1
+    attribution.admit(_entry(uid=NEW_UID), 1.5)  # asks for the next re-lookup
+    answer = _answer_next(attribution, 2.0, lookup(NEW_UID))
+
+    assert answer.unattributed == 2
+    assert attribution.unsettled == 0
+
+
+def test_an_answer_in_flight_when_the_uid_came_still_counts_it() -> None:
+    """D2: an answer issued before the new uid's first line settles nothing
+    about it when it names another uid, but one that names the new uid
+    counts its lines whenever it was issued."""
+    attribution = _first_mapped(Package(APP))
+    attribution.admit(_entry(uid=10_099), 1.0)
+    in_flight = attribution.next_lookup(1.0)
+    assert in_flight is not None
+    attribution.admit(_entry(uid=NEW_UID), 1.1)  # first seen while it runs
+
+    answer = attribution.lookup_done(in_flight.ident, lookup(NEW_UID))
+
+    assert answer.unattributed == 1
+    assert attribution.unsettled == 0  # 10099: the answer was issued after it
+
+
+def test_an_answer_in_flight_when_the_uid_came_strikes_nothing() -> None:
+    """D2, X-3: an answer issued before the new uid's first line that names
+    APP's old uid says nothing about the new uid: its line waits on, and the
+    next answer that names the new uid counts both of its lines."""
+    attribution = _first_mapped(Package(APP))
+    attribution.admit(_entry("o1", uid=10_099), 1.0)
+    in_flight = attribution.next_lookup(1.0)
+    assert in_flight is not None
+    attribution.admit(_entry("n1", uid=NEW_UID), 1.1)
+    assert attribution.unsettled == 2
+
+    answer = attribution.lookup_done(in_flight.ident, LOOKUP_OK)
+
+    assert answer.unattributed == 0
+    assert attribution.unsettled == 1  # o1 was another app's; n1 waits on
+    attribution.admit(_entry("n2", uid=NEW_UID), 1.6)
+    assert _answer_next(attribution, 1.6, lookup(NEW_UID)).unattributed == 2
+    assert attribution.unsettled == 0
+
+
+def test_an_answer_strikes_its_package_and_keeps_the_others() -> None:
+    """D2: a line that depends on APP and OTHER (~Package([APP, OTHER])
+    matched it). APP's answer keeps APP's uid: APP is struck, the line waits
+    for OTHER, whose answer names the new uid and counts it."""
+    where = ~Package([APP, OTHER])
+    attribution = _first_mapped(where, LOOKUP_OK, lookup(OTHER_UID, OTHER))
+    verdict = attribution.admit(_entry("b1", uid=NEW_UID), 1.0)
+    assert verdict is not None
+    assert verdict.matched
+    assert attribution.unsettled == 1
+
+    assert _answer_next(attribution, 1.0, LOOKUP_OK).unattributed == 0
+    assert attribution.unsettled == 1
+    answer = _answer_next(attribution, 1.0, lookup(NEW_UID, OTHER), OTHER)
+
+    assert answer.unattributed == 1
+    assert attribution.unsettled == 0
+
+
+def test_an_app_id_the_map_lets_go_drops_its_lines() -> None:
+    """D2, 5.10: APP moves to the new uid (the map takes it out of the LRU),
+    then on to another one. The new uid is then in neither: its line that
+    waited for OTHER is dropped, and OTHER's answer naming it counts 0."""
+    where = (Package(APP) & Tag("p")) | (Package(OTHER) & Tag("t"))
+    attribution = _first_mapped(where, LOOKUP_OK, lookup(OTHER_UID, OTHER))
+    attribution.admit(_entry("t1", uid=NEW_UID, tag="t"), 1.0)  # owes OTHER
+    assert attribution.unsettled == 1
+    assert _answer_next(attribution, 1.0, lookup(NEW_UID)).unattributed == 0
+    assert attribution.unsettled == 1
+    assert _answer_next(attribution, 1.0, LOOKUP_FAILED, OTHER).unattributed == 0
+    attribution.admit(_entry("o1", uid=10_099), 2.0)
+
+    assert _answer_next(attribution, 2.0, lookup(10_098)).unattributed == 0
+
+    assert NEW_UID not in attribution.uid_packages
+    assert NEW_UID not in attribution._seen
+    assert attribution.unsettled == 0
+    attribution.admit(_entry("o2", uid=10_097), 2.6)
+    assert _answer_next(attribution, 2.6, lookup(NEW_UID, OTHER), OTHER) == Answer()
+
+
+def test_a_line_decided_while_a_package_has_no_uid_is_recorded() -> None:
+    """D2: ZZZ has no uid, so the hold's verdict takes it as unknown; a tag y
+    line is decided without it (false) and goes on at once. It still owes
+    APP's answer: ZZZ's answer settles nothing for it, APP's naming the new
+    uid counts it."""
+    where = Package(APP) | (Package(ZZZ) & Tag("z"))
+    attribution = _first_mapped(where, LOOKUP_OK, lookup(None, ZZZ))
+    verdict = attribution.admit(_entry("y1", uid=NEW_UID, tag="y"), 1.0)
+    assert verdict is not None
+    assert (verdict.matched, verdict.unattributed) == (False, False)
+    assert attribution.held == 0
+    assert attribution.unsettled == 1
+
+    assert _answer_next(attribution, 1.0, lookup(None, ZZZ), ZZZ) == Answer()
+    answer = _answer_next(attribution, 1.0, lookup(NEW_UID))
+
+    assert answer.unattributed == 1
+    assert attribution.unsettled == 0
+
+
+class _Fn:
+    """A function for Where(fn) that records each call; true for tag x."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str | None]] = []
+
+    def __call__(self, entry: LogEntry) -> bool:
+        self.calls.append((entry.message, entry.package))
+        return entry.tag == "x"
+
+
+class _OfApp(Condition):
+    """A user leaf that reads entry.package, names APP, and records each call."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str | None]] = []
+
+    def __call__(self, entry: LogEntry, /) -> bool:
+        self.calls.append((entry.message, entry.package))
+        return entry.package == APP
+
+    def packages(self) -> frozenset[str]:
+        return frozenset({APP})
+
+
+_ONCE: list[tuple[str, Any, int]] = [
+    # (id, condition from a Where(fn) and an APP leaf, lines x1/y1 counted)
+    ("package-first", lambda a, b: Package(APP) & a, 2),  # a is left uncalled
+    ("leaf-first", lambda a, b: a & Package(APP), 1),
+    ("shared-leaf", lambda a, b: (Package(APP) | a) & a, 0),
+    ("named", lambda a, b: b | Tag("z"), 2),
+    ("named-after", lambda a, b: (a & Tag("x")) | b, 1),
+    ("guarded", lambda a, b: (Package(APP) | a) & (b | a), 1),
+    ("decided", lambda a, b: Tag("x") | (Package(APP) & a), 1),
+]
+
+
+@pytest.mark.parametrize(
+    ("build", "counted"), [case[1:] for case in _ONCE], ids=[c[0] for c in _ONCE]
+)
+def test_lines_that_go_on_call_each_leaf_once_and_only_where_plain_would(
+    build: Any,  # noqa: ANN401  (a builder of the condition)
+    counted: int,
+) -> None:
+    """D2, leaf calls: the verdict and what it depends on together call a user
+    leaf (a Where(fn), a condition naming APP) at most once per line, and only
+    where a plain where(entry) with package=None calls it."""
+    plain_a, plain_b = _Fn(), _OfApp()
+    plain = build(Where(plain_a), plain_b)
+    leaf_a, leaf_b = _Fn(), _OfApp()
+    harness = _mapped(build(Where(leaf_a), leaf_b))
+    leaf_a.calls.clear()
+    leaf_b.calls.clear()
+    messages = [("x1", "x"), ("y1", "y")]
+
+    harness.stdout(b"".join(line(text, uid=NEW_UID, tag=tag) for text, tag in messages))
+    harness.until_deadline()
+    harness.answer("lookup", lookup(NEW_UID))
+
+    assert harness.core._attribution.held == 0
+    for text, tag in messages:
+        plain(_entry(text, uid=NEW_UID, tag=tag))
+    for leaf, reference in ((leaf_a, plain_a), (leaf_b, plain_b)):
+        assert len(leaf.calls) == len(set(leaf.calls))  # once per line
+        assert set(leaf.calls) <= set(reference.calls)  # only where plain would
+    assert harness.core.stats().unattributed == counted
+
+
+class _Raises:
+    """A function for Where(fn) that records each call and raises for one line."""
+
+    def __init__(self, message: str, *, value: bool = False) -> None:
+        self.message = message
+        self.value = value
+        self.calls: list[str] = []
+
+    def __call__(self, entry: LogEntry) -> bool:
+        self.calls.append(entry.message)
+        if entry.message == self.message:
+            msg = f"raised for {entry.message}"
+            raise RuntimeError(msg)
+        return self.value
+
+
+def test_what_a_held_line_depends_on_calls_no_leaf_its_verdict_did_not() -> None:
+    """D2: the hold's walk reaches the shared F past an unknown verdict first
+    (uncalled) and calls it later, unguarded. What the line depends on reuses
+    F's verdict there, so its walk reaches G unguarded: G is unknown, not
+    called (it raises for n1), and the line goes on as before."""
+    f = _Fn()
+    g = _Raises("n1")
+    shared = Where(f)
+    first = Or(Package(ZZZ), shared)
+    where = Or(And(first, Where(g), Tag("nope")), shared, Package(APP))
+    harness = _mapped(where, LOOKUP_OK, lookup(None, ZZZ))
+    f.calls.clear()
+
+    harness.stdout(line("n1", uid=NEW_UID, tag="x"))
+
+    assert harness.core.state is S.RUNNING
+    assert (f.calls, g.calls) == ([("n1", None)], [])
+    assert [(item.message, item.package) for item in _entries(harness)] == [
+        ("n1", None)
+    ]
+    assert harness.core._attribution.unsettled == 0  # true without APP
+
+
+def test_a_queued_line_on_a_shared_uid_takes_its_owners() -> None:
+    """D2: APP and OTHER answer x1's uid while x1 waits behind y0. At the head
+    x1 takes its package (APP, the first owner), and its verdict is true by
+    Package(APP), so h is not called for it."""
+    h = _Raises("x1")
+    where = Or(Package(ZZZ), Package(APP), Where(h), Package(OTHER))
+    attribution = _first_mapped(
+        where, LOOKUP_OK, lookup(OTHER_UID, OTHER), lookup(None, ZZZ)
+    )
+    assert attribution.admit(_entry("x0", uid=NEW_UID), 1.0) is None
+    assert _answer_next(attribution, 1.0, lookup(None, ZZZ), ZZZ).unattributed == 0
+    assert attribution.release(1.0) is not None  # x0, owed APP and OTHER
+    assert attribution.admit(_entry("y0", uid=10_095), 1.1) is None
+    assert attribution.admit(_entry("x1", uid=NEW_UID), 1.2) is None
+    assert _answer_next(attribution, 1.2, lookup(NEW_UID)).unattributed == 1  # x0
+    _answer_next(attribution, 1.2, lookup(NEW_UID, OTHER), OTHER)
+    h.calls.clear()
+
+    assert attribution.release(1.3, force=True) is not None  # y0
+    verdict = attribution.release(1.3, force=True)
+
+    assert verdict is not None
+    assert (verdict.entry.message, verdict.entry.package) == ("x1", APP)
+    assert (verdict.matched, verdict.unattributed) == (True, False)
+    assert h.calls == ["y0"]
+    assert attribution.unsettled == 0
+
+
+def test_a_queued_line_on_a_mapped_uid_owes_no_answer() -> None:
+    """D2: APP and OTHER answer x2's uid while it waits; THIRD, still owed, may
+    share it too. At the head x2 takes its package and the owners known then,
+    like any line of a mapped uid: its verdict is false and nothing waits for
+    THIRD's answer, which names the uid and counts x1 only (it went on
+    without its package and depends on THIRD)."""
+    where = (
+        Package(ZZZ) | (Package(THIRD) & Tag("t")) | (Package([APP, OTHER]) & Tag("n"))
+    )
+    answers = (LOOKUP_OK, lookup(OTHER_UID, OTHER), lookup(10_080, THIRD))
+    attribution = _first_mapped(where, *answers, lookup(None, ZZZ))
+    assert attribution.admit(_entry("x1", uid=NEW_UID, tag="t"), 1.0) is None
+    _answer_next(attribution, 1.0, lookup(None, ZZZ), ZZZ)
+    assert attribution.release(1.0) is not None  # x1 depends on THIRD
+    assert attribution.admit(_entry("y0", uid=10_095), 1.1) is None
+    assert attribution.admit(_entry("x2", uid=NEW_UID, tag="t"), 1.2) is None
+    assert _answer_next(attribution, 1.2, lookup(NEW_UID)) == Answer()
+    _answer_next(attribution, 1.2, lookup(NEW_UID, OTHER), OTHER)
+    third = attribution.next_lookup(1.2)
+    assert third is not None
+    assert third.package == THIRD
+    released = attribution.release(3.1)  # y0's hold expired
+    assert released is not None
+    assert released.unattributed
+
+    verdict = attribution.release(3.1)
+
+    assert verdict is not None
+    assert (verdict.entry.message, verdict.entry.package) == ("x2", APP)
+    assert (verdict.matched, verdict.unattributed) == (False, False)
+    assert attribution.unsettled == 1  # x1
+    answer = attribution.lookup_done(third.ident, lookup(NEW_UID, THIRD))
+    assert answer.unattributed == 1
+
+
+def _grown_while_held(where: Condition) -> tuple[Attribution, Lookup]:
+    """x1 of the new uid waits for ZZZ (no uid); APP's re-lookup, issued before
+    x1's uid was first seen, answers that APP is not installed, so APP may own
+    it too (the held line's packages without a uid grow); ZZZ's next answer
+    leaves APP alone. Returns the attribution at t=2.0 and the lookup of APP
+    asked for next (not run yet)."""
+    attribution = _first_mapped(where, LOOKUP_OK, lookup(None, ZZZ))
+    assert attribution.admit(_entry("y0", uid=10_099, tag="z"), 1.0) is not None
+    _answer_next(attribution, 1.0, lookup(None, ZZZ), ZZZ)
+    in_flight = attribution.next_lookup(1.05)
+    assert in_flight is not None
+    assert in_flight.package == APP
+    assert attribution.admit(_entry("x1", uid=NEW_UID, tag="x"), 1.1) is None
+    attribution.lookup_done(in_flight.ident, LOOKUP_ABSENT)
+    seen = attribution._seen[NEW_UID]
+    assert seen is not None
+    assert attribution._candidates(seen) == {APP, ZZZ}
+    assert attribution.release(1.2) is None
+    _answer_next(attribution, 2.0, lookup(None, ZZZ), ZZZ)
+    assert attribution._candidates(seen) == {APP}
+    relookup = attribution.next_lookup(2.0)
+    assert relookup is not None
+    assert relookup.package == APP
+    return attribution, relookup
+
+
+def test_a_held_lines_stale_call_records_its_package() -> None:
+    """D2: x1 called the APP leaf while APP was mapped (package=None, false),
+    before APP grew into its packages without a uid. That stale call decides
+    x1 once ZZZ answers: it goes on as before, filtered and not counted, but
+    records APP, so APP's answer that names its uid counts it. No leaf is
+    called twice."""
+    leaf = _OfApp()
+    attribution, relookup = _grown_while_held(leaf | Package(ZZZ) | Tag("z"))
+    assert leaf.calls == [("y0", None), ("x1", None)]
+
+    verdict = attribution.release(2.0)
+
+    assert verdict is not None
+    assert (verdict.entry.message, verdict.entry.package) == ("x1", None)
+    assert (verdict.matched, verdict.unattributed) == (False, False)
+    assert attribution.held == 0
+    assert attribution.unsettled == 1
+    answer = attribution.lookup_done(relookup.ident, lookup(NEW_UID))
+    assert answer.unattributed == 1
+    assert leaf.calls == [("y0", None), ("x1", None)]
+
+
+def test_a_held_line_without_a_stale_call_records_nothing() -> None:
+    """D2: as above, but Tag("y") decides x1's And before the APP leaf, so x1
+    never called it: x1 is decided with APP unknown, records nothing, and
+    APP's answer that names its uid counts nothing (x1 is not APP's match
+    either)."""
+    leaf = _OfApp()
+    where = (Tag("y") & leaf) | Package(ZZZ) | Tag("z")
+    attribution, relookup = _grown_while_held(where)
+
+    verdict = attribution.release(2.0)
+
+    assert verdict is not None
+    assert (verdict.entry.message, verdict.matched) == ("x1", False)
+    assert attribution.unsettled == 0
+    assert attribution.lookup_done(relookup.ident, lookup(NEW_UID)) == Answer()
+    assert leaf.calls == []
+
+
+def _taken_while_held(where: Condition, *, grown: bool) -> Attribution:
+    """x1 of the new uid waits for ZZZ (no uid) and calls the APP leaves that
+    it reaches with package=None; then APP's answer maps the new uid while
+    x1 still waits. ``grown``: APP's earlier re-lookup said it is not
+    installed, so x1 waited for APP too (`_grown_while_held`); else APP was
+    mapped elsewhere all along (ZZZ's answer, issued before x1 came, settles
+    nothing for it). Returns the attribution at t=2.0 (x1 not released)."""
+    if grown:
+        attribution, relookup = _grown_while_held(where)
+    else:
+        attribution = _first_mapped(where, LOOKUP_OK, lookup(None, ZZZ))
+        assert attribution.admit(_entry("y0", uid=10_099, tag="z"), 0.6) is not None
+        in_flight = attribution.next_lookup(0.6)
+        assert in_flight is not None
+        assert in_flight.package == ZZZ
+        assert attribution.admit(_entry("x1", uid=NEW_UID, tag="x"), 0.7) is None
+        attribution.lookup_done(in_flight.ident, lookup(None, ZZZ))
+        assert attribution.release(0.8) is None
+        relookup = attribution.next_lookup(0.8)  # ZZZ is not due again yet
+        assert relookup is not None
+        assert relookup.package == APP
+    assert attribution.lookup_done(relookup.ident, lookup(NEW_UID)) == Answer()
+    assert attribution.uid_packages == {NEW_UID: APP}
+    return attribution
+
+
+@pytest.mark.parametrize("app", ["mapped", "grown"])
+def test_a_held_line_that_takes_its_package_counts_a_stale_call(app: str) -> None:
+    """D2: x1 called the APP leaf with package=None while APP was mapped
+    elsewhere (false), then APP's answer named its uid while it waited. At
+    its release x1 is APP's and reuses that call, which decides its verdict:
+    false, where plain where(entry) is true. It goes on with that verdict
+    (no leaf is called twice) and counts as unattributed."""
+    leaf = _OfApp()
+    never = _Raises("none")
+    where = leaf | (Package(APP) & Where(never)) | Package(ZZZ) | Tag("z")
+    attribution = _taken_while_held(where, grown=app == "grown")
+
+    verdict = attribution.release(2.0)
+
+    assert verdict is not None
+    assert (verdict.entry.message, verdict.entry.package) == ("x1", APP)
+    assert (verdict.matched, verdict.unattributed) == (False, True)
+    assert (leaf.calls, never.calls) == ([("y0", None), ("x1", None)], ["x1"])
+    assert attribution.unsettled == 0
+    assert where(verdict.entry)
+
+
+@pytest.mark.parametrize("decider", ["package", "fresh"])
+def test_a_held_line_that_takes_its_package_without_needing_a_stale_call(
+    decider: str,
+) -> None:
+    """D2: as above, but the verdict at the release is true whatever the
+    stale APP call says: Package(APP) decides it, or a second APP leaf that
+    the hold left uncalled (past the unknown ZZZ) and the release calls with
+    the package. x1 goes on matched and is not counted."""
+    leaf, second = _OfApp(), _OfApp()
+    last = Package(APP) if decider == "package" else second
+    attribution = _taken_while_held(leaf | Package(ZZZ) | last | Tag("z"), grown=False)
+
+    verdict = attribution.release(2.0)
+
+    assert verdict is not None
+    assert (verdict.entry.message, verdict.entry.package) == ("x1", APP)
+    assert (verdict.matched, verdict.unattributed) == (True, False)
+    assert leaf.calls == [("y0", None), ("x1", None)]
+    assert second.calls == ([("x1", APP)] if decider == "fresh" else [])
+
+
+def test_a_queued_line_from_the_negative_cache_matches_no_owner() -> None:
+    """D2 caveat: x1 of an app id in the negative cache queues behind y0;
+    meanwhile APP and OTHER both answer that app id (a sharedUserId). At the
+    head x1 is not resolved again: it goes on with package=None, and its
+    Package leaves match no owner, so its verdict is plain where(entry)'s."""
+    where = Package(APP) | Package(OTHER) | (Tag("w") & Package(ZZZ))
+    answers = (LOOKUP_OK, lookup(OTHER_UID, OTHER), lookup(None, ZZZ))
+    attribution = _first_mapped(where, *answers)
+    assert attribution.admit(_entry("x0", uid=NEW_UID, tag="q"), 1.0) is not None
+    for package, answer in zip(
+        (ZZZ, APP, OTHER), (answers[2], *answers[:2]), strict=True
+    ):
+        _answer_next(attribution, 1.0, answer, package)
+    assert attribution.negative(NEW_UID)
+    assert attribution.admit(_entry("y0", uid=10_099, tag="w"), 2.0) is None
+    assert attribution.admit(_entry("x1", uid=NEW_UID, tag="w"), 2.0) is None
+    _answer_next(attribution, 2.6, lookup(None, ZZZ), ZZZ)
+    _answer_next(attribution, 2.6, lookup(NEW_UID), APP)
+    _answer_next(attribution, 2.6, lookup(NEW_UID, OTHER), OTHER)
+    assert attribution._shared == {NEW_UID: {APP, OTHER}}
+    released = attribution.release(2.6)
+    assert released is not None
+    assert released.entry.message == "y0"
+
+    verdict = attribution.release(2.6)
+
+    assert verdict is not None
+    assert (verdict.entry.message, verdict.entry.package) == ("x1", None)
+    assert (verdict.matched, verdict.unattributed) == (False, False)
+    assert not where(verdict.entry)
+
+
+def test_a_stale_package_is_asked_about_not_taken_as_unknown() -> None:
+    """D2: x waits for ZZZ; APP grows into its packages without a uid (its
+    re-lookup, issued before x's uid was first seen, says APP is not
+    installed) after x called the APP leaf. When ZZZ answers, that stale
+    call decides x (true). APP is asked about like OTHER (mapped, owed),
+    not taken as unknown: x depends on APP alone, as OTHER matters only
+    while APP is unknown. So OTHER's answer that names x's uid counts
+    nothing (as OTHER's, x matches too); APP's answer would count it."""
+    where = _Names(APP) & (~Package(OTHER) | ~Package(APP)) & ~Package(ZZZ)
+    answers = (LOOKUP_OK, lookup(OTHER_UID, OTHER), lookup(None, ZZZ))
+    attribution = _first_mapped(where, *answers)
+    assert attribution.admit(_entry("y", uid=10_099), 0.5) is None
+    assert attribution.release(0.5, force=True) is not None
+    _answer_next(attribution, 0.9, lookup(None, ZZZ), ZZZ)
+    in_flight = attribution.next_lookup(1.0)
+    assert in_flight is not None
+    assert in_flight.package == APP
+    assert attribution.admit(_entry("x", uid=NEW_UID), 1.1) is None
+    attribution.lookup_done(in_flight.ident, LOOKUP_ABSENT)
+    assert attribution.release(1.2) is None
+    _answer_next(attribution, 2.0, lookup(None, ZZZ), ZZZ)
+
+    verdict = attribution.release(2.0)
+
+    assert verdict is not None
+    assert (verdict.entry.package, verdict.matched, verdict.unattributed) == (
+        None,
+        True,
+        False,
+    )
+    assert attribution._owing[NEW_UID].lines == {frozenset({APP}): 1}
+    assert where(verdict.entry.model_copy(update={"package": OTHER}))
+    assert _answer_next(attribution, 2.5, LOOKUP_FAILED).unattributed == 0
+    assert _answer_next(attribution, 3.0, lookup(NEW_UID, OTHER), OTHER) == Answer()
+    assert attribution.unsettled == 1  # APP's answer settles x
+
+
+def test_an_e1_line_whose_app_id_was_evicted_goes_on_and_records() -> None:
+    """D2, E1: x2 of APP's new uid (only APP owed it an answer when it came)
+    queues behind y1; while it waits, the LRU evicts its app id. At the head
+    the app id is seen anew and owes APP and ZZZ (no uid) an answer, but x2
+    still goes on at once, before its hold could expire, and records both:
+    APP's answer that names the uid counts it."""
+    attribution = _first_mapped(
+        Package(APP) | Package(ZZZ), LOOKUP_OK, lookup(None, ZZZ)
+    )
+    assert attribution.admit(_entry("x1", uid=NEW_UID), 1.0) is None
+    _answer_next(attribution, 1.0, lookup(None, ZZZ), ZZZ)
+    assert attribution.release(1.0) is not None  # x1, owed APP
+    in_flight = attribution.next_lookup(1.0)
+    assert in_flight is not None
+    assert in_flight.package == APP
+    assert attribution.admit(_entry("y1", uid=10_099), 1.1) is None
+    assert attribution.admit(_entry("x2", uid=NEW_UID), 1.2) is None
+    assert attribution._queue[1].seen == attribution_module._KNOWN
+    for uid in range(20_000, 20_000 + UID_CACHE):
+        attribution.admit(_entry("f", uid=uid, tag="f"), 1.3)
+    assert NEW_UID not in attribution._seen
+    attribution.lookup_done(in_flight.ident, LOOKUP_OK)  # issued before x2 came
+    _answer_next(attribution, 1.6, lookup(None, ZZZ), ZZZ)
+    released = attribution.release(1.6)
+    assert released is not None
+    assert released.entry.message == "y1"
+
+    verdict = attribution.release(1.6)  # x2's hold would expire at 3.2
+
+    assert verdict is not None
+    assert (verdict.entry.message, verdict.entry.package) == ("x2", None)
+    assert (verdict.matched, verdict.unattributed) == (False, False)
+    assert attribution._owing[NEW_UID].lines == {frozenset({APP, ZZZ}): 1}
+    assert _answer_next(attribution, 2.0, lookup(NEW_UID)).unattributed == 1
+
+
+def test_a_line_admitted_after_close_records_nothing() -> None:
+    """D2: once the run concluded (`close`) no answer comes, so a line that
+    goes on without its package records nothing (the core admits no line
+    after it closed the attribution)."""
+    attribution = _first_mapped(Package(APP))
+    attribution.close()
+
+    verdict = attribution.admit(_entry(uid=NEW_UID), 1.0)
+
+    assert verdict is not None
+    assert (verdict.matched, verdict.unattributed) == (False, False)
+    assert attribution.unsettled == 0
+    assert attribution.next_lookup(1.0) is None
+
+
+# -- what a line that went on depends on: a randomized property test (D2) --------------
+
+THIRD = "com.example.third"
+_WATCHED = (APP, OTHER, THIRD)
+_TAGS = ("x", "y", "z")
+
+
+class _TableLeaf(Condition):
+    """A user leaf that keeps the packages() contract: it reads entry.package
+    only to tell its own ``names`` apart. Its verdict is a random table; each
+    call is logged."""
+
+    def __init__(
+        self, rng: random.Random, names: frozenset[str], log: list[int]
+    ) -> None:
+        self.names = names
+        self.log = log
+        self.table = {
+            (tag, package): rng.random() < 0.5
+            for tag in _TAGS
+            for package in (None, *sorted(names))
+        }
+
+    def value(self, entry: LogEntry) -> bool:
+        package = entry.package if entry.package in self.names else None
+        return self.table[entry.tag, package]
+
+    def __call__(self, entry: LogEntry, /) -> bool:
+        self.log.append(id(self))
+        return self.value(entry)
+
+    def packages(self) -> frozenset[str]:
+        return self.names
+
+
+def _random_tree(rng: random.Random, log: list[int]) -> Condition:
+    """A random condition over Package, Tag and user leaves, with Not, Where
+    of a condition and shared subtrees."""
+    made: list[Condition] = []
+
+    def leaf() -> Condition:
+        pick = rng.random()
+        if pick < 0.35:
+            names = rng.sample(_WATCHED, rng.randint(1, 2))
+            node: Condition = Package(names)
+        elif pick < 0.55:
+            node = Tag(rng.choice(_TAGS))
+        else:
+            count = rng.choice([0, 0, 1, 1, 2])
+            node = _TableLeaf(rng, frozenset(rng.sample(_WATCHED, count)), log)
+        return Where(node) if rng.random() < 0.15 else node
+
+    def tree(depth: int) -> Condition:
+        if made and rng.random() < 0.15:
+            return rng.choice(made)  # a shared subtree
+        if depth == 0 or rng.random() < 0.3:
+            node = leaf()
+        elif rng.random() < 0.15:
+            node = ~tree(depth - 1)
+        else:
+            children = [tree(depth - 1) for _ in range(rng.randint(2, 3))]
+            node = And(*children) if rng.random() < 0.5 else Or(*children)
+            if rng.random() < 0.1:
+                node = Where(node)
+        made.append(node)
+        return node
+
+    return tree(4)
+
+
+def _oracle(
+    node: Condition,
+    entry: LogEntry,
+    unknown: frozenset[str],
+    reopened: frozenset[str],
+    known: dict[int, bool],
+    calls: set[int] | None,
+    *,
+    guarded: bool = False,
+) -> bool | None:
+    """The tri-state verdict, recursively and from the leaves' tables: a
+    `Package` meeting ``unknown`` is unknown; a user leaf naming a reopened
+    package is unknown; else its earlier verdict (``known``, by the id of the
+    leaf as evaluate keys it: a Where of a leaf is one leaf) is used; else it
+    is unknown when it names an unknown package, is reached past an unknown
+    verdict, or ``calls`` is None (what a line depends on calls nothing);
+    else it is called (its id goes into ``calls``, its verdict into
+    ``known``)."""
+    key = node
+    while isinstance(node, Where) and isinstance(node.fn, Condition):
+        combination = isinstance(node.fn, (And, Or, Not, Where))
+        node = node.fn
+        if combination:
+            key = node
+    context = (entry, unknown, reopened, known, calls)
+    if isinstance(node, Package):
+        value = None if not node.values.isdisjoint(unknown) else node(entry)
+    elif isinstance(node, Tag):
+        value = node(entry)
+    elif isinstance(node, Not):
+        inner = _oracle(node.condition, *context, guarded=guarded)
+        value = None if inner is None else not inner
+    elif isinstance(node, (And, Or)):
+        decisive = isinstance(node, Or)
+        value = not decisive
+        for child in node.conditions:
+            verdict = _oracle(child, *context, guarded=guarded or value is None)
+            if verdict is decisive:
+                value = decisive
+                break
+            if verdict is None:
+                value = None
+    else:
+        assert isinstance(node, _TableLeaf)
+        value = _oracle_leaf(node, id(key), *context, guarded=guarded)
+    return value
+
+
+def _oracle_leaf(
+    leaf: _TableLeaf,
+    key: int,
+    entry: LogEntry,
+    unknown: frozenset[str],
+    reopened: frozenset[str],
+    known: dict[int, bool],
+    calls: set[int] | None,
+    *,
+    guarded: bool,
+) -> bool | None:
+    """A user leaf's verdict in `_oracle`."""
+    if not leaf.names.isdisjoint(reopened):
+        return None
+    if key not in known:
+        if calls is None or guarded or not leaf.names.isdisjoint(unknown):
+            return None
+        calls.add(id(leaf))
+        known[key] = leaf.value(entry)
+    return known[key]
+
+
+@pytest.mark.parametrize("mode", ["at-once", "decided-held", "grown-held"])
+def test_what_a_line_depends_on_matches_a_brute_force_oracle(mode: str) -> None:
+    """D2: for random conditions and lines, `Attribution._depends` gives, for
+    each watched package still owed, the tri-state answer of an independent
+    recursive oracle (one package unknown at a time, so the shortcut of
+    asking all first is checked too). It is sound: a package left out, or
+    taken as unknown by the verdict, cannot change the verdict (the plain
+    verdict with that package agrees). And the verdict and the dependence
+    call each user leaf at most once, only where a plain where(entry) with
+    package=None calls it (the dependence calls none).
+
+    ``at-once``: the verdict is `_decided` (nothing unknown); ``decided-held``:
+    it was decided with the packages without a uid (``asked``) unknown;
+    ``grown-held``: as ``decided-held``, but the line was held first with
+    fewer packages without a uid, and the leaves it called then may name a
+    package that became one later (`_stale`: asked about, not unknown)."""
+    rng = random.Random(f"d2-{mode}")  # noqa: S311  (a test, not cryptography)
+    kinds = Counter(_dependence_trial(rng, mode, trial) for trial in range(2500))
+    if mode == "grown-held":
+        # A stale call often decides the verdict, and the line then depends
+        # on the package it names.
+        assert min(kinds["stale"], kinds["none"]) >= 50, kinds
+    else:
+        # Each outcome is common, a strict subset of several packages too.
+        assert min(kinds["none"], kinds["all"], kinds["some"]) >= 100, kinds
+
+
+@dataclass(slots=True)
+class _Trial:
+    """One line of the property test below: its condition and the verdicts of
+    the leaves it called (``log`` records each call)."""
+
+    root: Condition
+    entry: LogEntry
+    attribution: Attribution
+    declared: dict[int, frozenset[str]]
+    log: list[int]
+    calls: dict[int, bool] = field(default_factory=dict)
+
+
+def _dependence_trial(rng: random.Random, mode: str, number: int) -> str:
+    """One trial of the property test above; returns what the line depends
+    on: "none", "all" of the packages asked about, "some", "stale" (one that
+    a stale call names), "held" (it waits), or "went on" (``grown-held``: it
+    was decided before its packages without a uid grew)."""
+    trial, first = _trial_line(rng, mode, number)
+    plain_verdict = trial.root(trial.entry)  # package=None
+    plain = set(trial.log)
+    trial.log.clear()
+    unknowns = _trial_unknowns(rng, mode, trial, first)
+    if unknowns is None:
+        return "went on"
+    asked, names = unknowns
+    verdict = _trial_verdict(mode, trial, asked, plain)
+    if verdict is None:
+        return "held"  # such a line waits; it does not go on
+    assert verdict is plain_verdict
+    return _trial_depends(trial, asked, names, verdict, grown=mode == "grown-held")
+
+
+def _trial_line(
+    rng: random.Random, mode: str, number: int
+) -> tuple[_Trial, frozenset[str]]:
+    """A trial's condition and line; for ``grown-held`` also the package
+    without a uid when the line was held first, and often a user leaf it
+    then calls first, naming mapped packages, whose call goes stale when one
+    of them joins (it does not decide the junction alone)."""
+    log: list[int] = []
+    root = _random_tree(rng, log)
+    entry = _entry(f"t{number}", uid=NEW_UID, tag=rng.choice(_TAGS))
+    first: frozenset[str] = frozenset()
+    if mode == "grown-held":
+        first = frozenset(rng.sample(_WATCHED, 1))
+        if rng.random() < 0.7:
+            names = frozenset(_some(rng, sorted(set(_WATCHED) - first)))
+            leaf = _TableLeaf(rng, names, log)
+            junction = And if rng.random() < 0.5 else Or
+            leaf.table[entry.tag, None] = junction is And
+            root = junction(leaf, root)
+    attribution = Attribution(root, adb_path=ADB, serial=None, package_hold=2.0)
+    declared = attribution._declared = declared_packages(root)
+    return _Trial(root, entry, attribution, declared, log), first
+
+
+def _trial_unknowns(
+    rng: random.Random, mode: str, trial: _Trial, first: frozenset[str]
+) -> tuple[frozenset[str], frozenset[str]] | None:
+    """A trial's packages without a uid that its verdict takes as unknown,
+    and the mapped packages still owed (to ask about); None for a
+    ``grown-held`` line decided while held first."""
+    if mode != "grown-held":
+        asked: frozenset[str] = frozenset()
+        if mode == "decided-held":
+            asked = frozenset(rng.sample(_WATCHED, rng.randint(1, 2)))
+        return asked, frozenset(_some(rng, sorted(set(_WATCHED) - asked)))
+    root, entry, calls, declared = trial.root, trial.entry, trial.calls, trial.declared
+    if evaluate(root, entry, unknown=first, calls=calls, declared=declared) is not None:
+        return None
+    # Mapped packages joined, mostly ones that a leaf it called names; the
+    # first one mostly answered.
+    named = set().union(*(declared[key] for key in calls)) - first
+    joined = named if named and rng.random() < 0.8 else set(_WATCHED) - first
+    asked = frozenset(_some(rng, sorted(joined)))
+    if rng.random() < 0.25:
+        asked |= first
+    rest = sorted(set(_WATCHED) - asked)
+    return asked, frozenset(rng.sample(rest, rng.randint(0, len(rest))))
+
+
+def _trial_verdict(
+    mode: str, trial: _Trial, asked: frozenset[str], plain: set[int]
+) -> bool | None:
+    """The trial line's verdict, with ``asked`` unknown (`_decided` if none),
+    and the check of its calls: each user leaf at most once, only where plain
+    evaluation calls it, and in one evaluation exactly the oracle's."""
+    root, entry, calls, declared = trial.root, trial.entry, trial.calls, trial.declared
+    log = trial.log
+    expected: set[int] = set()
+    if asked:
+        verdict = evaluate(root, entry, unknown=asked, calls=calls, declared=declared)
+        if verdict is None:
+            return None
+        if mode == "decided-held":
+            _oracle(root, entry, asked, frozenset(), {}, expected)
+    else:
+        verdict = attribution_module._decided(root, entry, calls, declared)
+        expected = plain
+    assert len(log) == len(set(log)), "a user leaf was called twice"
+    assert set(log) <= plain
+    if mode != "grown-held":  # ``grown-held`` evaluated twice
+        assert set(log) == expected
+    log.clear()
+    return verdict
+
+
+def _trial_depends(
+    trial: _Trial,
+    asked: frozenset[str],
+    names: frozenset[str],
+    verdict: bool,  # noqa: FBT001  (the verdict, not a switch)
+    *,
+    grown: bool,
+) -> str:
+    """What the trial line depends on (`Attribution._depends`), against the
+    oracle, and that it is sound for every package asked about or unknown.
+    The packages of ``asked`` that a stale call names are asked about, as
+    `Attribution._judge` does; there are none unless ``grown``."""
+    root, entry, calls = trial.root, trial.entry, trial.calls
+    before = dict(calls)
+    stale = attribution_module._stale(calls, asked, trial.declared)
+    assert grown or not stale  # one evaluation calls no leaf naming an unknown
+    asked -= stale
+    names |= stale
+
+    depends = trial.attribution._depends(entry, calls, names, asked)
+
+    assert trial.log == [], "the dependence called a user leaf"
+    assert depends == _oracle_depends(root, entry, names, asked, before), root
+    for name in (names | asked) - depends:
+        attributed = entry.model_copy(update={"package": name})
+        assert _plain_value(root, attributed) is verdict, (root, name)
+    if not depends.isdisjoint(stale):
+        return "stale"
+    return "none" if not depends else "all" if depends == names else "some"
+
+
+def _some(rng: random.Random, population: list[str]) -> list[str]:
+    """One or more of ``population``, at random."""
+    return rng.sample(population, rng.randint(1, len(population)))
+
+
+def _oracle_depends(
+    root: Condition,
+    entry: LogEntry,
+    names: frozenset[str],
+    asked: frozenset[str],
+    known: dict[int, bool],
+) -> frozenset[str]:
+    """The packages of ``names`` that `_oracle` finds the verdict depends on,
+    each asked alone, with no new call: a leaf not called yet is unknown."""
+    found: set[str] = set()
+    for name in sorted(names):
+        reopened = frozenset({name})
+        if _oracle(root, entry, asked | reopened, reopened, dict(known), None) is None:
+            found.add(name)
+    return frozenset(found)
+
+
+def _plain_value(
+    node: Condition, entry: LogEntry, owners: frozenset[str] = frozenset()
+) -> bool:
+    """``node(entry)`` from the leaves' tables, without logging a call; with
+    ``owners`` (a line attributed to them), a `Package` matches any of them."""
+    while isinstance(node, Where) and isinstance(node.fn, Condition):
+        node = node.fn
+    if isinstance(node, _TableLeaf):
+        return node.value(entry)
+    if isinstance(node, Not):
+        return not _plain_value(node.condition, entry, owners)
+    if isinstance(node, And):
+        return all(_plain_value(child, entry, owners) for child in node.conditions)
+    if isinstance(node, Or):
+        return any(_plain_value(child, entry, owners) for child in node.conditions)
+    if owners and isinstance(node, Package):
+        return not node.values.isdisjoint(owners)
+    return node(entry)
+
+
+# -- lines that go on, through admit and release: a randomized driver (D2) -------------
+
+# App ids that no watched package has at first, and uids that one may have.
+_STRANGERS = (10_030, 10_031, 10_032, 10_033, 10_034, 10_035)
+_HOMES = (10_010, 10_020)
+
+
+def test_random_runs_attribute_each_line_as_it_goes_on() -> None:
+    """D2, E1, through `admit` and `release`: random lines (from unknown app
+    ids, often behind a held line from one that only mapped packages still
+    owe an answer, from mapped uids and a system uid), lookup answers (not
+    installed, the uid of a line that waits, another unknown app id, a
+    mapped uid, a failure) and ticks, with random conditions (half of them
+    with a user leaf first that names a mapped package, whose calls go stale
+    when that package moves while a line waits). A line that only mapped
+    packages owed when it came (an E1 line) is never held; each line that
+    goes on is checked as `_Run.went_on` says, and each answer counts what
+    the records say (`_Run._settle`).
+
+    The machine's random runs (tests/core/test_machine.py) reach neither E1
+    lines nor stale calls; these do (a held line that a stale call decides
+    is rare here: the oracle's ``grown-held`` mode above covers it). The
+    floors are about half of what the seeds reach today: E1 lines that a
+    lookup mapped while they waited, that record what they depend on, and
+    whose app id went into the negative cache; held lines that took their
+    package but count, as their verdict depends on a stale call; and lines
+    that recorded what they depend on."""
+    reach: Counter[str] = Counter()
+    for seed in range(400):
+        run = _Run(seed)
+        run.run(steps=150)
+        reach.update(run.reach)
+    floors = {"E1 attributed": 17, "E1 recorded": 26, "E1 negative": 60}
+    floors |= {"stale call counted": 5, "recorded": 2000}
+    assert {name: reach[name] for name in floors} == {
+        name: max(reach[name], floor) for name, floor in floors.items()
+    }, reach
+
+
+class _Run:
+    """One random run of an `Attribution` for the test above."""
+
+    def __init__(self, seed: int) -> None:
+        rng = self.rng = random.Random(f"run-{seed}")  # noqa: S311  (a test)
+        self.log: list[int] = []
+        root = _random_tree(rng, self.log)
+        self.first = {name: rng.choice([*_HOMES, None]) for name in _WATCHED}
+        if rng.random() < 0.5:
+            # A user leaf first that names a mapped package and, with
+            # package=None, does not decide the junction; another package
+            # has no uid, so lines wait while the leaf's calls go stale.
+            mapped, unmapped = rng.sample(_WATCHED, 2)
+            self.first |= {mapped: rng.choice(_HOMES), unmapped: None}
+            leaf = _TableLeaf(rng, frozenset({mapped}), self.log)
+            junction = And if rng.random() < 0.5 else Or
+            for tag in _TAGS:
+                leaf.table[tag, None] = junction is And
+            root = junction(leaf, root)
+        # Every package is watched; Tag("never") keeps that from deciding.
+        self.root = Or(root, And(Tag("never"), Package(list(_WATCHED))))
+        self.attribution = _attribution(self.root)
+        self.leaves, self.keys = _table_leaves(self.root)
+        self.now = 0.0
+        self.flight: Lookup | None = None
+        self.count = 0
+        self.e1: set[str] = set()  # the E1 lines that wait
+        self.since: dict[str, int] = {}  # a line that waits -> `_Held.since`
+        self.waited: dict[str, set[int]] = {}  # -> the leaves it called meanwhile
+        # A line that recorded what it depends on -> its app id, the app id's
+        # seen, and the packages; as `_settle` should keep them.
+        self.records: dict[str, tuple[int, int, set[str]]] = {}
+        self.reach: Counter[str] = Counter()
+
+    def run(self, steps: int) -> None:
+        self.lookup()
+        while self.flight is not None and self.flight.first:
+            self.answer()
+        for _ in range(steps):
+            pick = self.rng.random()
+            if pick < 0.45:
+                self.line()
+            elif pick < 0.75:
+                self.answer()
+            elif pick < 0.97:
+                self.now += self.rng.choice([0.05, 0.2, 0.6, 1.5])
+                self.attribution.expire(self.now)
+                self.lookup()
+                self.release()
+            else:
+                self.release(force=True)
+        self.release(force=True)
+
+    def lookup(self) -> None:
+        if self.flight is None:
+            self.flight = self.attribution.next_lookup(self.now)
+
+    def line(self) -> None:
+        rng = self.rng
+        attribution = self.attribution
+        # Often, behind a held line, one from an app id that only mapped
+        # packages still owe an answer: an E1 line.
+        e1 = [
+            app
+            for app, seen in attribution._seen.items()
+            if seen is not None
+            and attribution._owed(seen)
+            and not attribution._candidates(seen)
+        ]
+        if e1 and attribution.held and rng.random() < 0.5:
+            uid = rng.choice(e1)
+        elif rng.random() < 0.65:
+            uid = rng.choice(_STRANGERS) + (100_000 if rng.random() < 0.1 else 0)
+        else:
+            uid = rng.choice([*_HOMES, 1000])
+        self.count += 1
+        entry = _entry(f"n{self.count}", uid=uid, tag=rng.choice(_TAGS))
+        before = self._owing(uid)
+        mark = len(self.log)
+        verdict = attribution.admit(entry, self.now)
+        called = set(self.log[mark:])
+        if verdict is None:
+            waiting = attribution._queue[-1]
+            self.since[entry.message] = waiting.since
+            self.waited[entry.message] = called
+            if waiting.seen == attribution_module._KNOWN != waiting.since:
+                self.e1.add(entry.message)
+                self.reach["E1 lines"] += 1
+            self.reach["held lines"] += 1
+            return
+        state = attribution._seen.get(uid % 100_000)
+        since = attribution_module._KNOWN if state is None else state
+        self.went_on(verdict, since, set(), called, before)
+
+    def release(self, *, force: bool = False) -> None:
+        attribution = self.attribution
+        while attribution.held:
+            head = attribution._queue[0].entry
+            before = self._owing(head.uid)
+            mark = len(self.log)
+            verdict = attribution.release(self.now, force=force)
+            called = set(self.log[mark:])
+            if verdict is None:
+                assert head.message not in self.e1, "an E1 line waits"
+                self.waited[head.message] |= called
+                return
+            earlier = self.waited.pop(head.message)
+            self.went_on(verdict, self.since.pop(head.message), earlier, called, before)
+
+    def went_on(
+        self,
+        verdict: attribution_module.Verdict,
+        since: int,
+        earlier: set[int],
+        called: set[int],
+        before: Counter[frozenset[str]],
+    ) -> None:
+        """A line goes on. With ``package=None``, its verdict is plain where
+        (also on a uid that watched packages came to share while it waited),
+        and it records what the oracle finds it depends on (`_expected`). A
+        line from an unknown app uid that a lookup mapped takes its package;
+        an attributed line records nothing, and its verdict is plain where
+        with the uid's owners, unless it counts: then a leaf that names its
+        package was called while it waited (``earlier``), with
+        package=None."""
+        entry = verdict.entry
+        assert entry.uid is not None
+        app = entry.uid % 100_000
+        e1 = entry.message in self.e1
+        attribution = self.attribution
+        record = self._owing(entry.uid) - before
+        if entry.package is None:
+            assert verdict.matched is _plain_value(self.root, entry)
+            if since != attribution_module._KNOWN:
+                assert app not in attribution.uid_packages
+            depends = self._expected(verdict, since, earlier | called, e1=e1)
+            assert record == Counter({depends: 1} if depends else {}), self.root
+            if depends:
+                self.records[entry.message] = (
+                    app,
+                    attribution._owing[app].seen,
+                    set(depends),
+                )
+                self.reach["recorded"] += 1
+                self.reach["E1 recorded"] += e1
+            elif e1 and attribution._seen.get(app) is None:
+                self.reach["E1 negative"] += 1
+            return
+        assert not record
+        if since != attribution_module._KNOWN:
+            assert entry.package == attribution.uid_packages[app]
+        owners = attribution._shared.get(app, frozenset({entry.package}))
+        stale = any(entry.package in self.leaves[key].names for key in earlier)
+        if verdict.unattributed:
+            assert stale, self.root
+            self.reach["stale call counted"] += 1
+        else:
+            assert verdict.matched is _plain_value(self.root, entry, owners), self.root
+        if e1:
+            assert not verdict.unattributed
+            self.reach["E1 attributed"] += 1
+
+    def _expected(
+        self,
+        verdict: attribution_module.Verdict,
+        since: int,
+        called: set[int],
+        *,
+        e1: bool,
+    ) -> frozenset[str]:
+        """What a line that goes on with package=None should record: nothing
+        when it is counted already or came from a known uid; else the owed
+        packages, but those its verdict took as unknown (packages without a
+        uid, for a line that may wait, but those a leaf it called names),
+        that `_oracle_depends` finds it depends on, with no new call."""
+        entry = verdict.entry
+        attribution = self.attribution
+        assert entry.uid is not None
+        seen = attribution._seen.get(entry.uid % 100_000)
+        if verdict.unattributed or since == attribution_module._KNOWN or seen is None:
+            return frozenset()
+        answered = attribution._answered
+        owed = frozenset(name for name in _WATCHED if answered.get(name, 0) <= seen)
+        asked: frozenset[str] = frozenset()
+        if not e1:
+            asked = owed - attribution._uid_of.keys()
+            asked -= set().union(*(self.leaves[key].names for key in called))
+        known = {self.keys[key]: self.leaves[key].value(entry) for key in called}
+        return _oracle_depends(self.root, entry, owed - asked, asked, known)
+
+    def answer(self) -> None:
+        flight, self.flight = self.flight, None
+        if flight is None:
+            return
+        pick = self.rng.random()
+        uid: int | None
+        if flight.first:
+            uid = self.first[flight.package]
+        elif pick < 0.05:
+            answer = self.attribution.lookup_done(flight.ident, LOOKUP_FAILED)
+            assert answer.unattributed == 0
+            self.lookup()
+            self.release()
+            return
+        elif pick < 0.35:
+            uid = None
+        elif pick < 0.6 and self.attribution.held:
+            # The uid of a line that waits (for a mapped package mostly the
+            # head's): a reinstall found meanwhile.
+            queue = self.attribution._queue
+            mapped = flight.package in self.attribution._uid_of
+            uid = (queue[0] if mapped else self.rng.choice(queue)).entry.uid
+        else:
+            uid = self.rng.choice(_STRANGERS if pick < 0.8 else _HOMES)
+        answer = self.attribution.lookup_done(flight.ident, lookup(uid, flight.package))
+        assert answer.unattributed == self._settle(flight, uid)
+        self.lookup()
+        self.release()
+
+    def _settle(self, flight: Lookup, uid: int | None) -> int:
+        """Settle the records as the module docs say; return how many the
+        answer counts. The records of an app id the map let go are dropped,
+        and the rest must be the attribution's."""
+        counted = 0
+        named = None if uid is None else uid % 100_000
+        for message, (app, seen, names) in list(self.records.items()):
+            if flight.package not in names:
+                continue
+            if app == named:
+                counted += 1
+                del self.records[message]
+            elif flight.ident > seen:
+                names.discard(flight.package)
+                if not names:
+                    del self.records[message]
+        attribution = self.attribution
+        owing = attribution._owing
+        for message, (app, _, _) in list(self.records.items()):
+            if app not in owing:  # neither in the map nor in the LRU any more
+                assert app not in attribution._seen
+                assert app not in attribution.uid_packages
+                del self.records[message]
+        mine = Counter(
+            (app, frozenset(names)) for app, _, names in self.records.values()
+        )
+        theirs = Counter(
+            {
+                (app, names): count
+                for app, lines in owing.items()
+                for names, count in lines.lines.items()
+            }
+        )
+        assert mine == theirs
+        return counted
+
+    def _owing(self, uid: int | None) -> Counter[frozenset[str]]:
+        owing = self.attribution._owing.get(-1 if uid is None else uid % 100_000)
+        return Counter() if owing is None else Counter(owing.lines)
+
+
+def _table_leaves(
+    root: Condition,
+) -> tuple[dict[int, _TableLeaf], dict[int, int]]:
+    """The user leaves of ``root`` by id, and the id that `evaluate` keys
+    each by (a Where of a leaf is one leaf)."""
+    leaves: dict[int, _TableLeaf] = {}
+    keys: dict[int, int] = {}
+    pending: list[Condition] = [root]
+    walked: set[int] = set()
+    while pending:
+        node = pending.pop()
+        if id(node) in walked:
+            continue
+        walked.add(id(node))
+        inner = node.fn if isinstance(node, Where) else node
+        if isinstance(inner, _TableLeaf):
+            leaves[id(inner)] = inner
+            keys[id(inner)] = id(node)
+        elif isinstance(node, (And, Or)):
+            pending.extend(node.conditions)
+        elif isinstance(node, Not):
+            pending.append(node.condition)
+        elif isinstance(node, Where) and isinstance(node.fn, Condition):
+            pending.append(node.fn)
+    return leaves, keys

@@ -17,8 +17,8 @@ from typing import TYPE_CHECKING, overload
 
 from ._core.framing import DEFAULT_MAX_LINE_BYTES, MIN_MAX_LINE_BYTES, Framer
 from ._core.pipeline import Pipeline
-from .adb import _check_package_name
-from .filters import _require_condition
+from .adb import _check_package
+from .filters import _attributed_packages, _require_condition
 from .groupers import GroupBy
 from .parsers import ParseContext, ThreadTimeLogParser
 
@@ -120,9 +120,10 @@ def read_file(
             the file's modification time (or the host clock when the
             modification time is not a valid local datetime).
         uid_packages: uid -> package name, for lines with a ``-v uid`` column;
-            a key is a full uid or an app id (uid modulo 100000). Required
-            when ``where`` names packages (`Condition.packages`): without it
-            no line could carry a package.
+            a key is a full uid or an app id (uid modulo 100000). A uid names
+            an app, so a value is a package name, not a process name
+            (``<package>:<process>``). Required when ``where`` names packages
+            (`Condition.packages`): without it no line could carry a package.
         max_line_bytes: The longest line kept whole, in bytes; >= 4096.
 
     Returns:
@@ -132,11 +133,16 @@ def read_file(
         TypeError: An argument has the wrong type: ``where`` is not a
             `Condition` (wrap a function in `Where`), ``group_by`` not a
             `GroupBy`, ``parser`` is a class or has no ``parse`` method, a
-            ``uid_packages`` key is not an int.
+            ``uid_packages`` key is not an int, a ``uid_packages`` value or a
+            name ``where.packages()`` returns is not a str, or a
+            ``packages()`` override returns one str (or bytes) instead of a
+            collection of names.
         ValueError: ``where`` names packages and ``uid_packages`` is None
             (F5-4); ``year`` is outside 1..9999; a ``uid_packages`` key is
-            negative or a value is not a package name; ``max_line_bytes`` is
-            below 4096; ``path`` contains a NUL character.
+            negative; a ``uid_packages`` value or a name ``where.packages()``
+            returns is not a package name, a process name included;
+            ``max_line_bytes`` is below 4096; ``path`` contains a NUL
+            character.
         OSError: From the first ``next()``: the file cannot be opened or read.
 
     Exceptions raised by a custom parser or condition propagate unchanged and
@@ -303,7 +309,8 @@ def _check_uid_packages(value: Mapping[int, str] | None) -> dict[int, str] | Non
     Raises:
         TypeError: ``value`` is not a mapping, a key is not an int (a bool is
             not), or a value is not a str.
-        ValueError: A key is negative, or a value is not a package name.
+        ValueError: A key is negative, or a value is not a package name (a
+            process name is not one: a uid names an app).
 
     """
     if value is None:
@@ -322,7 +329,11 @@ def _check_uid_packages(value: Mapping[int, str] | None) -> dict[int, str] | Non
         if uid < 0:
             msg = f"uid_packages keys must be uids >= 0, not {uid}"
             raise ValueError(msg)
-        checked[uid] = _check_package_name(package)
+        try:
+            checked[uid] = _check_package(package)
+        except (TypeError, ValueError) as exc:
+            msg = f"uid_packages[{uid}] is {package!r}: {exc}"
+            raise type(exc)(msg) from None
     return checked
 
 
@@ -351,12 +362,14 @@ def _check_package_condition(where: Condition, uids: Mapping[int, str] | None) -
     error, because ``~Package(name)`` or an `Or` still selects lines.
 
     Raises:
-        ValueError: ``uids`` is None and ``where.packages()`` is not empty.
+        ValueError: ``uids`` is None and ``where.packages()`` is not empty, or
+            a name it returns is not a package name, a process name included.
+        TypeError: A name ``where.packages()`` returns is not a str, or a
+            ``packages()`` override returns one str (or bytes) instead of a
+            collection of names.
 
     """
-    # An override at the root may return any iterable; the walk normalises
-    # only the overrides below the root.
-    names = frozenset(where.packages())
+    names = _attributed_packages(where)
     if not names:
         return
     if uids is not None:

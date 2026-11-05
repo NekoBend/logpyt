@@ -32,9 +32,13 @@ recurse.
 stream attributes the packages of `Condition.packages`: every `Package` in the
 tree, under `Or`, `Not` and a `Where` that wraps a condition too (F5-1), and
 for a condition anywhere in the tree whose class overrides ``packages()``, what
-that override returns. A log file carries no attribution of its own:
-`logpyt.read_file` attributes its lines only from a ``uid_packages`` map, and
-refuses a condition whose ``packages()`` is not empty without one (F5-4).
+that override returns. Attribution maps a line's uid to its app, so these are
+package names: `Package` refuses a process name (``<package>:<process>``),
+which no attributed line would carry; `CrashCondition` and `AnrCondition` take
+one, as they read the process from the line's text. A log file carries no
+attribution of its own: `logpyt.read_file` attributes its lines only from a
+``uid_packages`` map, and refuses a condition whose ``packages()`` is not
+empty without one (F5-4).
 """
 
 from __future__ import annotations
@@ -45,7 +49,7 @@ from contextvars import ContextVar
 from functools import lru_cache
 from typing import TYPE_CHECKING, Final
 
-from .adb import _check_package_name
+from .adb import _check_package, _check_package_name
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -67,6 +71,12 @@ __all__ = [
     "Tag",
     "Where",
 ]
+
+# Ends the error for a process name that a condition is given as a package name.
+_PROCESS_HINT: Final = (
+    "; a package condition takes that name, and CrashCondition(package=) and "
+    "AnrCondition(package=) match the crash and ANR lines of a process"
+)
 
 # The levels from the lowest priority to the highest.
 _LEVELS: Final[tuple[LogLevel, ...]] = ("V", "D", "I", "W", "E", "F")
@@ -152,13 +162,18 @@ class Condition(ABC):
         So does a condition wrapped in `Where`; a plain function is opaque.
 
         Override it in a condition of your own that matches on
-        ``entry.package``, or that wraps conditions this walk cannot see. For
-        a condition below this one whose class overrides ``packages()``, the
-        walk takes what the override returns and does not look inside that
-        condition; an override may call ``super().packages()`` for the walk of
-        its own tree. In one call, a condition that several parents share is
-        walked once, and an override is asked once however many parents share
-        it, also when overrides that call ``super().packages()`` nest.
+        ``entry.package``, or that wraps conditions this walk cannot see. The
+        names are package names, as `Package` takes them: a stream and
+        `logpyt.read_file` refuse anything else, a process name
+        (``<package>:<process>``) included, when they start. An override
+        returns a collection of names; one str (or bytes) raises TypeError, as
+        it would be read one character at a time. For a condition below this
+        one whose class overrides ``packages()``, the walk takes what the
+        override returns and does not look inside that condition; an override
+        may call ``super().packages()`` for the walk of its own tree. In one
+        call, a condition that several parents share is walked once, and an
+        override is asked once however many parents share it, also when
+        overrides that call ``super().packages()`` nest.
         """
         asked = _ASKED.get()
         token = None
@@ -185,7 +200,7 @@ class Condition(ABC):
                 if node is not self and type(node).packages is not Condition.packages:
                     answer = asked.get(id(node))
                     if answer is None:
-                        answer = (node, frozenset(node.packages()))
+                        answer = (node, frozenset(_packages_of(node)))
                         asked[id(node)] = answer
                     names.update(answer[1])
                 elif isinstance(node, Package):
@@ -353,7 +368,10 @@ class Package(Condition):
 
     It reads ``LogEntry.package``, which package attribution sets; an entry
     without one never matches. A stream attributes every package that a
-    `Package` in its condition names (`Condition.packages`).
+    `Package` in its condition names (`Condition.packages`). Attribution maps
+    a line's uid to its app, so ``LogEntry.package`` is always a package name,
+    never a process name; `CrashCondition` and `AnrCondition` with
+    ``package=`` match the crash and ANR lines of one process.
     """
 
     __slots__ = ("values",)
@@ -364,17 +382,21 @@ class Package(Condition):
         """Match one package (a str) or any of a collection of packages.
 
         A name is dot-separated segments of ASCII letters, digits and ``_``,
-        each starting with a letter, optionally followed by ``:<process>``
-        (F5-3): such a name reaches ``adb shell`` and the device shell parses it.
+        each starting with a letter (F5-3): such a name reaches ``adb shell``
+        and the device shell parses it. A process name
+        (``<package>:<process>``) raises: no attributed line carries one, so
+        it would match nothing.
 
         Raises:
             ValueError: ``values`` is an empty collection or holds a string that
-                is not a package name.
+                is not a package name, a process name included.
             TypeError: A value is not a str.
 
         """
         names = _strings(values, "Package")
-        self.values = frozenset(_check_package_name(name) for name in names)
+        self.values = frozenset(
+            _check_package(name, hint=_PROCESS_HINT) for name in names
+        )
 
     def __call__(self, entry: LogEntry, /) -> bool:
         """Return whether the entry is attributed to one of the packages."""
@@ -776,6 +798,50 @@ def _require_condition(value: object, what: str) -> Condition:
             msg += "; wrap a function in Where(fn)"
         raise TypeError(msg)
     return value
+
+
+def _packages_of(node: Condition) -> Iterable[str]:
+    """What ``node.packages()`` returns, refused when it is one string.
+
+    An override may return any iterable of names, but a str (or bytes) would be
+    read one character at a time.
+
+    Raises:
+        TypeError: It returned a str or bytes.
+
+    """
+    names = node.packages()
+    if isinstance(names, (str, bytes)):
+        msg = (
+            f"{type(node).__name__}.packages() must return a collection of "
+            f"package names, not {type(names).__name__}"
+        )
+        raise TypeError(msg)
+    return names
+
+
+def _attributed_packages(where: Condition) -> frozenset[str]:
+    """The packages a stream or `logpyt.read_file` attributes for ``where``.
+
+    Its ``packages()``, each checked as `Package` checks a name, so that a bad
+    name from an override fails at the start: a uid names an app, so a
+    process name (``<package>:<process>``) is refused too. An override at the
+    root may return any iterable of names, but not a str.
+
+    Raises:
+        ValueError: A name is not a package name (F5-3) or names a process.
+        TypeError: A name is not a str, or an override returned a str (or
+            bytes) instead of a collection of names.
+
+    """
+    names: set[str] = set()
+    for name in _packages_of(where):
+        try:
+            names.add(_check_package(name, hint=_PROCESS_HINT))
+        except (TypeError, ValueError) as exc:
+            msg = f"where.packages() returned {name!r}: {exc}"
+            raise type(exc)(msg) from None
+    return frozenset(names)
 
 
 def _flatten(

@@ -108,11 +108,12 @@ _READ_CHUNK = 65536
 
 _SDK_VARIABLES = ("ANDROID_HOME", "ANDROID_SDK_ROOT")
 
-# Design 2.7 (F5-3): a package name with an optional ":process" suffix. ASCII only
-# and matched whole, so no character the device shell interprets can pass.
-_PACKAGE_NAME = re.compile(
-    r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*(?::[A-Za-z0-9_.]+)?"
-)
+# Design 2.7 (F5-3): a package name, and one with an optional ":process" suffix.
+# ASCII only and matched whole, so no character the device shell interprets can
+# pass.
+_PLAIN_NAME = r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*"
+_PLAIN_PACKAGE_NAME = re.compile(_PLAIN_NAME)
+_PACKAGE_NAME = re.compile(_PLAIN_NAME + r"(?::[A-Za-z0-9_.]+)?")
 
 # The tag of the start and flush markers (design section 5.6); logpyt.config
 # reserves it in logcat_args.
@@ -1110,6 +1111,42 @@ def _check_package_name(name: str) -> str:
     return name
 
 
+def _check_package(name: str, *, hint: str = "") -> str:
+    """Return ``name`` if it is a package name, without ``:<process>``.
+
+    Package attribution maps a line's uid to its app, and an app has one
+    package name, so `logpyt.filters.Package`, the names a stream attributes,
+    ``read_file``'s ``uid_packages`` values and the uid lookup take package
+    names only: the grammar of `_check_package_name` without the process part.
+
+    Args:
+        name: The name.
+        hint: Added to the message for a process name: what the caller offers
+            for one instead.
+
+    Raises:
+        ValueError: ``name`` is not a package name, or names a process.
+        TypeError: ``name`` is not a str.
+    """
+    if not isinstance(name, str):
+        msg = f"a package name must be a str, not {type(name).__name__}"
+        raise TypeError(msg)
+    if _PLAIN_PACKAGE_NAME.fullmatch(name):
+        return name
+    if _PACKAGE_NAME.fullmatch(name):
+        package = name.partition(":")[0]
+        msg = (
+            f"{name!r} names a process, not a package: a uid maps to an app, "
+            f"so the package name is {package!r}{hint}"
+        )
+        raise ValueError(msg)
+    msg = (
+        f"{name!r} is not a package name: dot-separated segments of ASCII "
+        "letters, digits and '_', each starting with a letter"
+    )
+    raise ValueError(msg)
+
+
 def _pidof_argv(adb_path: str, serial: str | None, name: str) -> tuple[str, ...]:
     """``adb shell pidof <name>``: the pids of a package or process name.
 
@@ -1153,17 +1190,12 @@ def _package_uid_argv(
     filter on 36. It takes the package name, not a process name.
 
     Raises:
-        ValueError: ``package`` fails `_check_package_name` or names a process
-            (``<package>:<process>``), or ``serial`` is empty.
+        ValueError: ``package`` fails `_check_package`, or ``serial`` is empty.
+        TypeError: ``package`` is not a str.
     """
-    _check_package_name(package)
-    if ":" in package:
-        msg = (
-            f"{package!r} names a process; the uid lookup takes its package "
-            f"name {package.partition(':')[0]!r}"
-        )
-        raise ValueError(msg)
-    return _adb_argv(adb_path, serial, "shell", "dumpsys", "package", package)
+    return _adb_argv(
+        adb_path, serial, "shell", "dumpsys", "package", _check_package(package)
+    )
 
 
 def _parse_package_uid(result: _AdbResult, package: str) -> int | None:

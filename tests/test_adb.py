@@ -1414,6 +1414,25 @@ def test_package_name_check_accepts_package_and_process_names(name: str) -> None
     )
 
 
+@pytest.mark.parametrize("name", ["android", "com.example.app", "A_b.c9"])
+def test_plain_package_check_accepts_package_names(name: str) -> None:
+    assert adb._check_package(name) == name
+
+
+def test_plain_package_check_rejects_a_process_name() -> None:
+    """D1: one check for every name attribution takes (Package, the watched
+    names, uid_packages, the uid lookup): the grammar, and no process."""
+    with pytest.raises(ValueError, match=r"names a process.*'com\.example\.app'$"):
+        adb._check_package("com.example.app:remote")
+    with pytest.raises(ValueError, match=r"names a process.*'com\.example'; take"):
+        adb._check_package("com.example:remote.sub_1", hint="; take")
+    with pytest.raises(ValueError, match="not a package name") as raised:
+        adb._check_package("com.example.app:")
+    assert "process" not in str(raised.value)  # its grammar has no ':<process>'
+    with pytest.raises(TypeError, match="must be a str"):
+        adb._check_package(42)  # ty: ignore[invalid-argument-type]
+
+
 def test_package_uid_argv_rejects_a_process_name() -> None:
     with pytest.raises(ValueError, match=r"'com\.example\.app'"):
         adb._package_uid_argv("adb", None, "com.example.app:remote")

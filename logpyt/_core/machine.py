@@ -10,8 +10,10 @@ and carries out the commands it returns (`logpyt._core.protocol`).
 Package attribution is the policy of `logpyt._core.attribution` (design
 5.8): the uid lookups, the ordered hold and the tri-state evaluation of
 ``where``; the core runs its lookups, fires its deadline and accounts for the
-lines it holds. The start and resume positions are a minimal policy behind a
-small interface that PR-14 replaces (`logpyt._core.resume`).
+lines it holds, and counts in ``unattributed`` the lines that went on before a
+lookup answer named their package (a reinstall under a new uid). The start and
+resume positions are a minimal policy behind a small interface that PR-14
+replaces (`logpyt._core.resume`).
 
 Facts the code relies on:
 
@@ -231,7 +233,12 @@ class StreamCore:
 
     Raises:
         ValueError: ``group_by.max_group_size`` exceeds ``buffer_entries``
-            (design 2.8).
+            (design 2.8), or a name ``where.packages()`` returns is not a
+            package name (F5-3), a process name (``<package>:<process>``)
+            included: attribution maps a uid to an app.
+        TypeError: A name ``where.packages()`` returns is not a str, or a
+            ``packages()`` override returns one str (or bytes) instead of a
+            collection of names.
 
     """
 
@@ -785,10 +792,17 @@ class StreamCore:
     def _lookup_done(
         self, request: _Request, result: _AdbResult | Exception, now: float
     ) -> None:
-        """lookup done: update the uid map, open intake, release held lines."""
+        """lookup done: update the uid map, open intake, release held lines.
+
+        The lines that went on without the package the answer names, and
+        whose verdict depended on it, count as unattributed now (design 4.4,
+        5.8).
+        """
         assert request.lookup is not None  # noqa: S101  (set by _next_lookup)
-        for warning in self._attribution.lookup_done(request.lookup, result):
+        answer = self._attribution.lookup_done(request.lookup, result)
+        for warning in answer.warnings:
             self._out.append(Diagnostic(logging.WARNING, warning))
+        self._tally.unattributed += answer.unattributed
         self._attribution_changed(now)
 
     def _attribution_changed(self, now: float) -> None:
