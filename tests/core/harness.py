@@ -102,9 +102,20 @@ MARKER_OK = result()
 MARKER_FAILED = result(1, stderr="error: device offline\n")
 STATE_DEVICE = result(stdout="device\n")
 STATE_OFFLINE = result(1, stderr="error: device offline\n")
-LOOKUP_OK = result(
-    stdout=f"Packages:\n  Package [{APP}] (1a2b):\n    userId={APP_UID}\n"
-)
+
+
+def lookup(uid: int | None, package: str = APP, *, key: str = "userId") -> _AdbResult:
+    """A ``dumpsys package`` answer: ``package`` installed with ``uid``, or absent.
+
+    ``key`` is ``userId`` (API 24) or ``appId`` (API 36, design A.8).
+    """
+    if uid is None:
+        return result(stdout="Packages:\n")
+    return result(stdout=f"Packages:\n  Package [{package}] (1a2b):\n    {key}={uid}\n")
+
+
+LOOKUP_OK = lookup(APP_UID)
+LOOKUP_ABSENT = lookup(None)  # the package is not installed
 LOOKUP_FAILED = result(1, stderr="error: device offline\n")
 
 
@@ -169,7 +180,16 @@ class Harness:
         out = self.core.handle(event, self.now)
         self.run(out)
         assert self.core.unaccounted_lines() == 0
+        self.check_hold()
         return out
+
+    def check_hold(self) -> None:
+        """The hold's counts match its lines, and Admission counts them (5.10)."""
+        attribution = self.core._attribution
+        admission = self.core._admission
+        assert attribution.held_bytes == sum(held.nbytes for held in attribution._queue)
+        assert admission.held_entries == attribution.held
+        assert admission._held_bytes == attribution.held_bytes
 
     def advance(self, seconds: float) -> list[Command]:
         """Move the clock and send a Tick."""

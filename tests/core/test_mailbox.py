@@ -93,6 +93,24 @@ def test_admission_reopens_at_half_of_both() -> None:
     assert admission.open
 
 
+def test_admission_counts_held_lines_against_the_capacity() -> None:
+    """Design 5.10: lines held for attribution count like queued items, and
+    the totals are set, not added, so a line that moves from the hold to the
+    outbox never counts twice."""
+    admission = Admission(buffer_entries=4, buffer_bytes=100)
+    admission.admit(1, 10)
+
+    admission.hold(3, 30)
+    assert not admission.open
+    assert (admission.queued_entries, admission.held_entries) == (1, 3)
+    admission.hold(2, 20)  # 3 in all: above half
+    assert not admission.open
+    admission.hold(1, 10)  # 2 in all: at half
+    assert admission.open
+    admission.hold(0, 90)  # bytes count too: 10 queued + 90 held
+    assert not admission.open
+
+
 def test_admission_ignores_an_older_report() -> None:
     """Counts are cumulative: a stale report never moves the fill back up."""
     admission = Admission(buffer_entries=2, buffer_bytes=100)

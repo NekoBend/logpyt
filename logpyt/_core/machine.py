@@ -7,9 +7,11 @@ and the statistics. A driver (PR-12 threads, PR-13 asyncio) runs adb and the
 consumer, feeds every event to `StreamCore.handle` with the monotonic time,
 and carries out the commands it returns (`logpyt._core.protocol`).
 
-Two parts of the policy are minimal here, behind small interfaces that later
-PRs replace: package attribution (`logpyt._core.attribution`, PR-11) and the
-start and resume positions (`logpyt._core.resume`, PR-14).
+Package attribution is the policy of `logpyt._core.attribution` (design
+5.8): the uid lookups, the ordered hold and the tri-state evaluation of
+``where``; the core runs its lookups, fires its deadline and accounts for the
+lines it holds. The start and resume positions are a minimal policy behind a
+small interface that PR-14 replaces (`logpyt._core.resume`).
 
 Facts the code relies on:
 
@@ -36,11 +38,16 @@ Facts the code relies on:
   timers disarmed) and waits in STOPPING(drain), which reads nothing, emits
   nothing and arms no timer; only the terminal `StateChange` and `Finished`
   wait for the consumer. KILLED and FAILED runs never wait.
+- Lines held for attribution count against the outbox (design 5.10). They
+  go on before the end of their connection (design 3.6: entries come before
+  the change to RECONNECTING), when a consumer detaches, and when the run
+  concludes, before the groups are flushed (design A.21); a kill or a failed
+  run discards and counts them instead.
 - Line conservation: every framed stdout line is delivered (admitted to the
   outbox, as an entry or a group member), filtered, discarded and counted in
   ``undelivered``, counted in ``before_start`` (or by PR-14 in
-  ``deduplicated``/``below_cursor``), or still held in an open group.
-  `StreamCore.unaccounted_lines` is that balance; it is always 0.
+  ``deduplicated``/``below_cursor``), or still held for attribution or in an
+  open group. `StreamCore.unaccounted_lines` is that balance; it is always 0.
 """
 
 from __future__ import annotations
@@ -110,6 +117,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
     from logpyt._core.argv import Position
+    from logpyt._core.attribution import Verdict
     from logpyt._core.framing import FramedLine
     from logpyt._core.protocol import (
         Command,
@@ -172,6 +180,7 @@ class _Request:
     argv: tuple[str, ...]
     connection: int | None = None
     token: str | None = None  # the marker a marker command writes
+    lookup: int | None = None  # the attribution's id of a lookup
 
 
 @dataclass(slots=True, eq=False)
@@ -195,7 +204,8 @@ class _Connection:
     stop_grace: float | None = None
     last_activity: float = 0.0
     killed: bool = False  # Kill(c) was issued
-    stalled: bool = False
+    # Why the stall ended it: held lines alone kept the outbox full, or not.
+    stalled: Literal["consumer", "attribution"] | None = None
     # Why the core ended it: a read timeout or a failed state check.
     cause: tuple[Literal["timeout", "device"], str] | None = None
 
@@ -250,7 +260,7 @@ class StreamCore:
         self._new_marker = new_marker
         self._parser = ThreadTimeLogParser()
         self._attribution = Attribution(
-            () if where is None else where.packages(),
+            where,
             adb_path=adb_path,
             serial=config.serial,
             package_hold=config.package_hold,
@@ -540,7 +550,7 @@ class StreamCore:
         """IDLE start: CONNECTING, the clock read, the lookup of watched packages."""
         self._attribution.begin(now)
         self._begin_attempt(now)
-        self._next_lookup()
+        self._next_lookup(now)
 
     def _stop(self, flush: float | None, now: float) -> None:
         state = self._state
@@ -634,7 +644,14 @@ class StreamCore:
             return  # the detach's counts showed every record handled (A.21)
         if self._mode is Mode.DRAIN:
             self._end()
-        elif state is S.CONNECTING:
+            return
+        # Nobody will take the held lines: they go on now and are discarded
+        # and counted by the outbox's rule (design 3.5).
+        self._release_held(now, force=True)
+        state = self._state
+        if state in TERMINAL:
+            return  # where raised on a released line: the run failed
+        if state is S.CONNECTING:
             self._stop_connecting(now)
         elif state is S.RECONNECTING:
             self._finish()
@@ -670,15 +687,17 @@ class StreamCore:
         *,
         connection: int | None = None,
         token: str | None = None,
+        lookup: int | None = None,
     ) -> None:
         request = next(self._request_ids)
-        self._requests[request] = _Request(kind, argv, connection, token)
+        self._requests[request] = _Request(kind, argv, connection, token, lookup)
         self._out.append(RunCommand(request, kind, argv, COMMAND_TIMEOUT))
 
-    def _next_lookup(self) -> None:
-        argv = self._attribution.next_lookup()
-        if argv is not None:
-            self._run("lookup", argv)
+    def _next_lookup(self, now: float) -> None:
+        """Run the lookup the attribution asks for now, if any (one at a time)."""
+        lookup = self._attribution.next_lookup(now)
+        if lookup is not None:
+            self._run("lookup", lookup.argv, lookup=lookup.ident)
 
     def _command_done(
         self, request: int, result: _AdbResult | Exception, now: float
@@ -689,7 +708,7 @@ class StreamCore:
         conn = self._conn
         match pending.kind:
             case "lookup":
-                self._lookup_done(result)
+                self._lookup_done(pending, result, now)
             case "flush_marker":
                 self._flush_marker_done(result, now)
             case "clock" | "start_marker" | "state":
@@ -763,13 +782,27 @@ class StreamCore:
         conn.cause = ("device", f"device not available: {reason}")
         self._kill_child()
 
-    def _lookup_done(self, result: _AdbResult | Exception) -> None:
+    def _lookup_done(
+        self, request: _Request, result: _AdbResult | Exception, now: float
+    ) -> None:
         """lookup done: update the uid map, open intake, release held lines."""
-        warning = self._attribution.lookup_done(result)
-        if warning is not None:
+        assert request.lookup is not None  # noqa: S101  (set by _next_lookup)
+        for warning in self._attribution.lookup_done(request.lookup, result):
             self._out.append(Diagnostic(logging.WARNING, warning))
-        self._next_lookup()
-        self._release_held()
+        self._attribution_changed(now)
+
+    def _attribution_changed(self, now: float) -> None:
+        """After a lookup result or the attribution's deadline (design 3.2 rows).
+
+        The next lookup starts and the held lines that may go on do; in
+        STOPPING(kill or fail) held lines and open groups are discarded and
+        counted instead, and no lookup starts.
+        """
+        if self._dropping():
+            self._discard_pending()
+            return
+        self._next_lookup(now)
+        self._release_held(now)
 
     def _flush_marker_done(self, result: _AdbResult | Exception, now: float) -> None:
         """STOPPING(flush) flush marker done; a failure stops without the marker."""
@@ -788,15 +821,8 @@ class StreamCore:
         self._number += 1
         conn = _Connection(
             id=self._number,
-            pipeline=Pipeline(
-                self._parser,
-                self._parse_context(),
-                uid_packages=(
-                    self._attribution.uid_packages
-                    if self._attribution.watching
-                    else None
-                ),
-            ),
+            # The attribution sets each line's package (design 5.8).
+            pipeline=Pipeline(self._parser, self._parse_context()),
             stderr_tail=deque(maxlen=self._config.stderr_tail),
             framers={pipe: Framer(self._config.max_line_bytes) for pipe in _PIPES},
         )
@@ -864,7 +890,7 @@ class StreamCore:
         )
         cause.__cause__ = error
         self._conn = None
-        self._attempt_ended(cause, stalled=False, retry=not could_not_start)
+        self._attempt_ended(cause, stalled=None, retry=not could_not_start)
 
     def _spawn_failed(self, error: OSError, now: float) -> None:
         """spawn_failed: CONNECTING ends FAILED, never retried (A-12).
@@ -898,14 +924,20 @@ class StreamCore:
         conn = self._conn
         assert conn is not None  # noqa: S101  (only a live connection ends)
         self._conn = None  # retired (G1)
+        if self._state is not S.STOPPING:
+            # Its held lines go before the change to RECONNECTING (design 3.6):
+            # what is still unknown is evaluated without a package.
+            self._release_held(now, force=True)
+            if self._state in TERMINAL:
+                return  # where raised on a released line: the run failed
         if self._state is S.STOPPING:
             self._stopping_ended(now)
             return
         self._flush_groups()
-        if conn.stalled:
-            self._attempt_ended(None, stalled=True, retry=True)
+        if conn.stalled is not None:
+            self._attempt_ended(None, stalled=conn.stalled, retry=True)
             return
-        self._attempt_ended(self._end_cause(conn), stalled=False, retry=True)
+        self._attempt_ended(self._end_cause(conn), stalled=None, retry=True)
 
     def _end_cause(self, conn: _Connection) -> StreamError:
         """The error of a connection that ended unrequested (design 3.2)."""
@@ -932,7 +964,7 @@ class StreamCore:
         self,
         cause: StreamError | None,
         *,
-        stalled: bool,
+        stalled: Literal["consumer", "attribution"] | None,
         retry: bool,
     ) -> None:
         """RECONNECTING with attempts left or after a stall; else FAILED."""
@@ -941,15 +973,21 @@ class StreamCore:
         left = reconnect is not None and (
             reconnect.max_attempts is None or self._attempts < reconnect.max_attempts
         )
-        if stalled or (retry and left):
+        if stalled is not None or (retry and left):
             self._set_state(S.RECONNECTING, error=cause)
-            if stalled:
+            if stalled is not None:
                 self._resume_on_intake = True
+                why = (
+                    "lines waited for package attribution (held lines count "
+                    "against the outbox); it resumes once they have gone on"
+                    if stalled == "attribution"
+                    else "the consumer fell behind; it resumes when the consumer "
+                    "catches up"
+                )
                 self._out.append(
                     Diagnostic(
                         logging.INFO,
-                        f"logcat connection {number} was disconnected because the "
-                        "consumer fell behind; it resumes when the consumer catches up",
+                        f"logcat connection {number} was disconnected because {why}",
                     )
                 )
             else:
@@ -990,12 +1028,17 @@ class StreamCore:
         that has not handled every record waits in STOPPING(drain); the state
         changes to STOPPING only when it was not STOPPING already.
         """
-        # PR-11: lines held for attribution are released (or discarded and
-        # counted) here too, before the drain check (design A.21).
+        # Lines held for attribution are released (or discarded and counted)
+        # first: they go through where and grouping before the groups are
+        # flushed and before the drain check (design A.21).
+        self._conclude_held()
+        if self._state in TERMINAL:
+            return  # where raised on a released line: that failure ended it
         self._flush_groups()
         self._out += self._stderr_log.pending()
         self._conn = None
         self._requests.clear()
+        self._attribution.close()
         self._backoff_at = self._stable_at = None
         self._flush = None
         if self._bp_since is not None:
@@ -1120,6 +1163,13 @@ class StreamCore:
         for line in lines:
             self._tally.lines += 1
             self._stdout_line(line, now)
+        if (
+            self._attribution.watching
+            and self._state not in TERMINAL
+            and not self._dropping()
+        ):
+            # A line from an unknown app uid asks for a re-lookup (design 5.8).
+            self._next_lookup(now)
 
     def _stdout_line(self, line: FramedLine, now: float) -> None:
         conn = self._conn
@@ -1160,8 +1210,7 @@ class StreamCore:
             if self._mode is Mode.FLUSH:
                 self._end_flush(now)
             return
-        for ready in self._attribution.admit(entry):
-            self._evaluate(ready, now)
+        self._accept(entry, now)
 
     def _before_start(
         self, conn: _Connection, marker: str, line: FramedLine, now: float
@@ -1187,23 +1236,53 @@ class StreamCore:
         if self._state is S.CONNECTING and not conn.killed:
             self._enter_running(now)
 
-    def _evaluate(self, entry: LogEntry, now: float) -> None:
-        """``where``, then grouping, then the outbox."""
-        if self._dropping():
-            self._drop(1, "the run failed")
-            return
-        if self._attribution.unattributed(entry):
-            self._tally.unattributed += 1
-        where = self._where
-        if where is not None:
+    def _accept(self, entry: LogEntry, now: float) -> None:
+        """A line for ``where``: attributed (and maybe held) first when packages
+        are watched (design 5.8).
+        """
+        attribution = self._attribution
+        if attribution.watching:
             try:
-                matched = where(entry)
+                verdict = attribution.admit(entry, now, force=self._detached)
             except Exception as exc:  # noqa: BLE001  (fail fast: CallbackError)
                 self._stage_failed("where", exc)
                 return
-            if not matched:
-                self._tally.filtered += 1
+            if verdict is None:
+                self._held_changed()
                 return
+            self._take(verdict, now)
+            return
+        where = self._where
+        matched = True
+        if where is not None:
+            try:
+                matched = bool(where(entry))
+            except Exception as exc:  # noqa: BLE001  (fail fast: CallbackError)
+                self._stage_failed("where", exc)
+                return
+        self._judged(entry, now, matched=matched, unattributed=False)
+
+    def _take(self, verdict: Verdict, now: float) -> None:
+        """A line the attribution let go on, with its verdict."""
+        self._judged(
+            verdict.entry,
+            now,
+            matched=verdict.matched,
+            unattributed=verdict.unattributed,
+        )
+
+    def _judged(
+        self, entry: LogEntry, now: float, *, matched: bool, unattributed: bool
+    ) -> None:
+        """After ``where``: grouping, then the outbox."""
+        if self._dropping():
+            self._drop(1, "the run failed")
+            return
+        if unattributed:
+            self._tally.unattributed += 1
+        if not matched:
+            self._tally.filtered += 1
+            return
         grouper = self._grouper
         if grouper is None:
             self._emit(entry)
@@ -1242,18 +1321,59 @@ class StreamCore:
         for group in groups:
             self._emit(group)
 
-    def _release_held(self) -> None:
-        """Lines whose attribution was waited for go on (PR-11), or are discarded."""
+    def _release_held(self, now: float, *, force: bool = False) -> None:
+        """Held lines that may go on do, in order; or they are discarded.
+
+        ``force``: every held line goes on, what is still unknown evaluated
+        without a package (a connection end, a detach, the conclusion). In
+        STOPPING(kill or fail), and once where raised on a released line,
+        held lines and open groups are discarded and counted.
+        """
+        attribution = self._attribution
+        while attribution.held and self._state not in TERMINAL and not self._dropping():
+            try:
+                verdict = attribution.release(now, force=force)
+            except Exception as exc:  # noqa: BLE001  (fail fast: CallbackError)
+                self._held_changed()
+                self._stage_failed("where", exc)
+                break
+            # Before the line reaches the outbox, so that it never counts twice.
+            self._held_changed()
+            if verdict is None:
+                return
+            self._take(verdict, now)
         if self._dropping():
             self._discard_pending()
-            return
-        for entry in self._attribution.release():
-            self._evaluate(entry, self._now)
 
     def _discard_pending(self) -> None:
         """STOPPING(kill or fail): held lines and open groups are discarded, counted."""
         self._drop(self._attribution.discard(), "the run ended")
+        self._held_changed()
         self._flush_groups()
+
+    def _conclude_held(self) -> None:
+        """The conclusion's part of the hold (design A.21).
+
+        Held lines go on, evaluated without a package where it is still
+        unknown, unless the run was killed or failed: then they are discarded
+        and counted.
+        """
+        attribution = self._attribution
+        if attribution.held and not (
+            self._dropping() or self._kill_requested or self._outcome is not None
+        ):
+            self._release_held(self._now, force=True)
+            if self._state in TERMINAL:
+                return
+        if attribution.held:
+            reason = "kill()" if self._kill_requested else "the run failed"
+            self._drop(attribution.discard(), reason)
+            self._held_changed()
+
+    def _held_changed(self) -> None:
+        """Held lines count against the outbox (design 5.10)."""
+        attribution = self._attribution
+        self._admission.hold(attribution.held, attribution.held_bytes)
 
     def _stderr_line(self, text: str, now: float) -> None:
         """Log an adb stderr line, at most 10 per second (design 5.9); keep the tail."""
@@ -1443,8 +1563,8 @@ class StreamCore:
                 self._tally.flush_timeout = True
                 self._end_flush(now)
             case "hold":
-                self._attribution.expire()
-                self._release_held()
+                self._attribution.expire(now)
+                self._attribution_changed(now)
             case "idle":
                 assert self._grouper is not None  # noqa: S101  (idle needs groups)
                 if self._dropping():
@@ -1512,7 +1632,9 @@ class StreamCore:
             self._tally.flush_failed = True
             self._end_flush(now)
             return
-        conn.stalled = True
+        # Held lines count against the outbox (design 5.10), so they alone can
+        # keep intake closed: the INFO at the connection's end says which.
+        conn.stalled = "attribution" if self._admission.held_back() else "consumer"
         self._tally.stall_resumes += 1
         self._kill_child()
 

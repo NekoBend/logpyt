@@ -26,9 +26,11 @@ the wake-ups.
   count lets the core end a STOPPED run only once every record it emitted
   was handled, never merely taken (design A.21).
 - `Admission`: the engine's copy of the outbox fill, counted from what the core
-  delivered and what the consumer side reported in `ConsumerProgress`. Intake
-  closes when the outbox is full (``buffer_entries`` entries or
-  ``buffer_bytes`` bytes) and reopens at the low-water mark, half of both (G6).
+  delivered and what the consumer side reported in `ConsumerProgress`, plus the
+  lines the core holds for package attribution (design 5.10: held lines count
+  against the outbox). Intake closes when the outbox is full
+  (``buffer_entries`` entries or ``buffer_bytes`` bytes) and reopens at the
+  low-water mark, half of both (G6).
 - `ControlInbox`: the requests and results that reach the engine outside the
   data pipes. Each kind of request keeps one record at most, so a flood of
   ``stop()`` calls or progress reports cannot grow it (design 6.5: no unbounded
@@ -93,7 +95,9 @@ class Admission:
 
     The engine adds what it delivers (`admit`); the consumer side reports what
     left the outbox (`release`, cumulative). The queued amount is the
-    difference, so no count is shared between threads.
+    difference, so no count is shared between threads. Lines that the core
+    holds for package attribution count against the capacity too (`hold`,
+    design 5.10): they are on their way to the outbox.
 
     Args:
         buffer_entries: Capacity in entries, >= 1.
@@ -106,6 +110,8 @@ class Admission:
         "_admitted_entries",
         "_buffer_bytes",
         "_buffer_entries",
+        "_held_bytes",
+        "_held_entries",
         "_open",
         "_removed_bytes",
         "_removed_entries",
@@ -118,6 +124,8 @@ class Admission:
         self._admitted_bytes = 0
         self._removed_entries = 0
         self._removed_bytes = 0
+        self._held_entries = 0
+        self._held_bytes = 0
         self._open = True
 
     @property
@@ -140,17 +148,37 @@ class Admission:
         """Bytes delivered and not yet reported as taken or discarded."""
         return self._admitted_bytes - self._removed_bytes
 
+    @property
+    def held_entries(self) -> int:
+        """Lines held for package attribution, as last reported by `hold`."""
+        return self._held_entries
+
     def full(self) -> bool:
-        """Whether the queued items reach the capacity, in entries or bytes."""
+        """Whether the queued items and held lines reach the capacity, in entries
+        or bytes.
+        """
         return (
-            self.queued_entries >= self._buffer_entries
-            or self.queued_bytes >= self._buffer_bytes
+            self.queued_entries + self._held_entries >= self._buffer_entries
+            or self.queued_bytes + self._held_bytes >= self._buffer_bytes
         )
 
     def low(self) -> bool:
-        """Whether the queued items are at or below half of both capacities."""
+        """Whether the queued items and held lines are at or below half of both
+        capacities.
+        """
         return (
-            2 * self.queued_entries <= self._buffer_entries
+            2 * (self.queued_entries + self._held_entries) <= self._buffer_entries
+            and 2 * (self.queued_bytes + self._held_bytes) <= self._buffer_bytes
+        )
+
+    def held_back(self) -> bool:
+        """Whether held lines are what keeps the outbox from its low-water mark:
+        some are held, and the queued items alone are at or below half of both
+        capacities.
+        """
+        return (
+            self._held_entries > 0
+            and 2 * self.queued_entries <= self._buffer_entries
             and 2 * self.queued_bytes <= self._buffer_bytes
         )
 
@@ -170,6 +198,20 @@ class Admission:
         self._removed_entries = max(self._removed_entries, counts.removed_entries)
         self._removed_bytes = max(self._removed_bytes, counts.removed_bytes)
         if not self._open and self.low():
+            self._open = True
+
+    def hold(self, entries: int, nbytes: int) -> None:
+        """Set the lines held for attribution; close when full, reopen when low.
+
+        The core reports the totals after every change of its hold and before
+        it delivers a line that left the hold, so a line never counts twice.
+        """
+        self._held_entries = entries
+        self._held_bytes = nbytes
+        if self._open:
+            if self.full():
+                self._open = False
+        elif self.low():
             self._open = True
 
 
