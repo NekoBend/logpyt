@@ -22,16 +22,17 @@ from __future__ import annotations
 import contextlib
 import functools
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
 from logpyt import adb
 from logpyt.config import StreamConfig
-from logpyt.streams import LogStream
+from logpyt.streams import LogStream, sync
+from tests.conftest import wait_until
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Sequence
 
 # The drivers every conformance test runs for (PR-13 adds "async").
 DRIVERS = ("sync",)
@@ -193,6 +194,67 @@ class SyncDriver:
 
         monkeypatch.setattr(adb, "_spawn_adb", spawn)
         return tried
+
+    def consumer_identity(self) -> object:
+        """What identifies the consumer context the caller runs in: its thread.
+
+        The `threading.Thread` object, not its ident, which the OS hands out
+        again once a thread ended (design A.23). A caller keeps the objects,
+        so two contexts never share one.
+        """
+        return threading.current_thread()
+
+    def wait_concluded(self, stream: LogStream[Any]) -> None:
+        """Wait until the run concluded: terminal, or waiting in the drain (A.21).
+
+        adb's end alone does not show that the core has handled it; this
+        waits for what the engine published (`StreamCore.concluded`).
+        """
+        wait_until(lambda: stream._run.concluded, timeout=TIMEOUT)
+
+    def break_reader(self, monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+        """Make the stdout reader of every connection raise ``error`` (a logpyt
+        bug) at its second read; the first read returns what adb wrote.
+        """
+        real = cast("Callable[..., None]", sync._Run._read)
+
+        class Broken:
+            def __init__(self, pipe: Any) -> None:  # noqa: ANN401
+                self._pipe = pipe
+                self._reads = 0
+
+            def read(self, size: int) -> bytes:
+                self._reads += 1
+                if self._reads == 2:
+                    raise error
+                return self._pipe.read(size)
+
+            def close(self) -> None:
+                self._pipe.close()
+
+        def read(run: Any, connection: int, name: str, pipe: Any) -> None:  # noqa: ANN401
+            real(run, connection, name, Broken(pipe) if name == "stdout" else pipe)
+
+        monkeypatch.setattr(sync._Run, "_read", read)
+
+    def hold_after_delivery(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        hold: Callable[[Sequence[object]], None],
+    ) -> None:
+        """Call ``hold(records)`` right after the driver handed records to its
+        consumer side, before it goes on (as a preemption there would): a test
+        holds the engine to check what a consumer reads meanwhile. The records
+        that end the run go out with the outcome and are not held.
+        """
+        real = cast("Callable[..., bool]", sync._Run._deliver)
+
+        def deliver(run: Any, records: tuple[object, ...]) -> bool:  # noqa: ANN401
+            changed = real(run, records)
+            hold(records)
+            return changed
+
+        monkeypatch.setattr(sync._Run, "_deliver", deliver)
 
 
 type Driver = SyncDriver

@@ -9,6 +9,7 @@ import errno
 import gc
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING
 
 import pytest
@@ -209,8 +210,11 @@ def test_missing_adb_fails_at_the_clock_read(driver: Driver, tmp_path: Path) -> 
 def test_join_timeout_raises_timeout_error_while_the_consumer_is_busy(
     driver: Driver, fake_adb: FakeAdb
 ) -> None:
-    """join(timeout) expires with the builtin TimeoutError; the run goes on and
-    ends once the consumer finished (D-3, design A.21).
+    """join(timeout) expires with the builtin TimeoutError, on time; the run
+    goes on and ends once the consumer finished (D-3, design A.21).
+
+    "On time" has a bound generous for a loaded CI runner that still fails a
+    timeout honored late.
     """
     fake_adb.logcat(run(out(logcat_line("a")), wait("never")))
     busy = threading.Event()
@@ -226,13 +230,16 @@ def test_join_timeout_raises_timeout_error_while_the_consumer_is_busy(
     try:
         assert busy.wait(TIMEOUT)
         driver.stop(stream)
+        began = time.monotonic()
         with pytest.raises(TimeoutError) as info:
             driver.join(stream, timeout=0.05)
+        took = time.monotonic() - began
     finally:
         release.set()
     driver.join(stream)
 
     assert not isinstance(info.value, StreamError)
+    assert took < 1.0
     assert stream.state is S.STOPPED
 
 
@@ -496,12 +503,14 @@ def test_engine_crash_raises_from_every_wait(
 ) -> None:
     """A logpyt bug that escapes the core ends the run visibly: join() raises
     that same exception every time, so does assert_complete(), the engine
-    logs it at ERROR, and no adb is left. ``exit``: a BaseException (here
-    SystemExit) that is not an Exception, which the engine catches too.
+    logs it at ERROR, and no adb is left once join() returned (it is killed
+    and reaped first). ``exit``: a BaseException (here SystemExit) that is
+    not an Exception, which the engine catches too.
 
     No driver invents a state (design 5.2): ``state`` stays the last one the
     core published, here CONNECTING, since the crash comes with the first
-    output.
+    output. ``stats`` names the reason ``failed`` (design 4.4: a fixture that
+    checks only ``stats.complete`` saves the log of a failed capture).
     """
     caplog.set_level(logging.ERROR, logger="logpyt.stream")
     fake_adb.logcat(run(out(logcat_line("a")), wait("never")))
@@ -519,10 +528,13 @@ def test_engine_crash_raises_from_every_wait(
     stream = driver.open(config())
     driver.start(stream)
 
-    for _ in range(2):
-        with pytest.raises(type(error)) as info:
-            driver.join(stream)
-        assert info.value is error
+    with pytest.raises(type(error)) as info:
+        driver.join(stream)
+    assert fake_adb.live_children() == []  # checked at once: no wait
+    assert info.value is error
+    with pytest.raises(type(error)) as info:
+        driver.join(stream)
+    assert info.value is error
     with pytest.raises(type(error)) as info:
         stream.assert_complete()
     assert info.value is error
@@ -533,5 +545,46 @@ def test_engine_crash_raises_from_every_wait(
     ]
     assert logged[0].exc_info is not None
     assert logged[0].exc_info[1] is error
-    assert fake_adb.survivors() == []
     assert stream.state is S.CONNECTING
+    assert stream.stats.incomplete == ("failed",)
+    assert not stream.stats.complete
+
+
+def test_reader_crash_raises_from_every_wait(
+    driver: Driver,
+    fake_adb: FakeAdb,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A logpyt bug in a pipe reader ends the run like an engine crash (design
+    A.23): join() raises that same exception every time, so does
+    assert_complete(), it is logged at ERROR once, and no adb is left once
+    join() returned. Before, the reader ended silently, the run went on
+    without its stdout, and a stop() ended it STOPPED and complete. ``stats``
+    names the reason ``failed`` (design 4.4).
+    """
+    caplog.set_level(logging.ERROR, logger="logpyt.stream")
+    fake_adb.logcat(run(out(logcat_line("a")), wait("never")))
+    error = RuntimeError("a reader bug")
+    driver.break_reader(monkeypatch, error)
+    stream = driver.open(config())
+    driver.start(stream)
+
+    with pytest.raises(RuntimeError) as info:
+        driver.join(stream)
+    assert fake_adb.live_children() == []  # checked at once: no wait
+    assert info.value is error
+    with pytest.raises(RuntimeError) as info:
+        driver.join(stream)
+    assert info.value is error
+    with pytest.raises(RuntimeError) as info:
+        stream.assert_complete()
+    assert info.value is error
+
+    logged = [r for r in caplog.records if r.name == "logpyt.stream" and r.exc_info]
+    assert len(logged) == 1, [r.getMessage() for r in logged]
+    assert logged[0].exc_info is not None
+    assert logged[0].exc_info[1] is error
+    stats = stream.stats
+    assert stats.incomplete == ("failed",)
+    assert not stats.complete

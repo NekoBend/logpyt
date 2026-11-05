@@ -8,8 +8,11 @@ KeyboardInterrupt only when it next runs Python code, so a wait that never
 woke up would hold it back on Linux too. Scenario (a) of design 2.11: the
 interrupt propagates unchanged and with-exit kills adb (design 3.4), within
 1 s of the interrupt. An interrupt that lands in the with-block exit's own
-wait kills too, so neither adb nor ``on_item`` outlives the with-block
-(design 9.2: no adb child remains).
+wait kills too: no adb child remains once the with-block was left (design
+9.2), and a killed run starts no new ``on_item`` call after it; one that was
+running finishes, since the exit waits at most 1 s. A run that had already
+ended FAILED is not killed (design A.23): the items it left are still
+delivered after the with-block (A.21).
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 import logpyt
+from logpyt.exceptions import StreamError
 from logpyt.streams._events import StreamState
 from tests.conformance.conftest import TIMEOUT, Driver, config
 from tests.conftest import (
@@ -240,3 +244,52 @@ def test_ctrl_c_in_the_with_exit_kills(
         assert info.value.__context__ is error
     assert calls == ["m0"]
     assert "killed" in stream.stats.incomplete
+
+
+def test_ctrl_c_in_the_exit_of_a_failed_run(
+    driver: Driver, fake_adb: FakeAdb, interrupter: _Interrupter
+) -> None:
+    """Ctrl+C in the with-block exit of a run that already ended FAILED, while
+    on_item is stuck with items behind it: the kill does nothing (kill()
+    after the end, design A.23), so the run stays FAILED, KeyboardInterrupt
+    leaves the block once the exit's 1 s wait is over, no adb is left, and
+    the items the run left are delivered after the block (A.21).
+    """
+    count = 5
+    fake_adb.logcat(run(lines(count, logcat_line("m{i}")), exit_code=1))
+    busy = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+
+    def on_item(entry: LogEntry) -> None:
+        calls.append(entry.message)
+        busy.set()
+        release.wait(TIMEOUT)
+
+    stream = driver.open(config(), on_item=on_item)
+
+    def run_body() -> None:
+        with driver.session(stream):
+            assert busy.wait(TIMEOUT)
+            wait_until(lambda: stream.outcome is not None, timeout=TIMEOUT)
+            interrupter.armed.set()
+
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            run_body()
+        ended_at = time.monotonic()
+        # Checked while on_item is still stuck in its first call.
+        assert stream.state is StreamState.FAILED
+        assert calls == ["m0"]
+        assert fake_adb.survivors() == []
+    finally:
+        interrupter.join()
+        release.set()
+    with pytest.raises(StreamError) as info:
+        driver.join(stream)
+
+    assert info.value is stream.outcome
+    assert interrupter.sent_at is not None, "the main thread never waited"
+    assert ended_at - interrupter.sent_at < WITHIN + KILL_WAIT
+    assert calls == [f"m{i}" for i in range(count)]
+    assert not stream.stats.killed

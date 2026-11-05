@@ -16,9 +16,16 @@ Threads of one run (design 5.3), all daemon threads:
   is full; each closes its pipe when it ends, X-5) and an exit waiter
   (`_Run._wait_exit`: ``Popen.wait()`` returns at the exit, whatever holds the
   pipes);
-- one short-lived worker per one-shot command (`_Run._run_command`);
+- one short-lived worker per one-shot command (`_Run._run_command`), whose
+  adb child is tracked from its spawn until it was reaped, so the end of the
+  run and interpreter exit kill it (`_Run._finished`, `_Run.kill_children`;
+  at exit a spawn in progress is let finish first, `_Run.close_spawns`);
 - in push mode, one dispatcher for the run's whole lifetime
   (`_Run._dispatch`: ``for item in <the delivery iterator>: on_item(item)``).
+
+A worker that raises (a logpyt bug) ends the run as an engine crash does
+(`_Run._worker_failed`, `_Run._crashed`): adb is killed and reaped, then
+every wait ends and raises that exception.
 
 They share one `threading.Condition`. Its lock guards the mailbox (the
 core's `ControlInbox` plus the data inbox), the `Outbox` and what the engine
@@ -49,7 +56,7 @@ import threading
 import time
 import weakref
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Final, Self, assert_never, cast, overload
 
 from logpyt import adb
@@ -88,7 +95,7 @@ from logpyt.streams._events import StateChange, StreamState
 
 if TYPE_CHECKING:
     import subprocess
-    from collections.abc import Callable, Iterable, Iterator
+    from collections.abc import Callable, Iterable, Iterator, Sequence
     from types import TracebackType
     from typing import IO, Literal
 
@@ -108,6 +115,9 @@ _DATA_SLOTS: Final = 16
 _SLICE: Final = 0.25
 # Design 3.4: with-exit waits this long after it killed the stream.
 _KILL_WAIT: Final = 1.0
+# How long the end of a run (and a crash) waits for the adb children it
+# killed to be reaped, so that none is left once join() returns.
+_REAP_WAIT: Final = 1.0
 _TERMINAL: Final = frozenset(
     {StreamState.STOPPED, StreamState.KILLED, StreamState.FAILED}
 )
@@ -162,7 +172,14 @@ class _Run:
         self.data: deque[Data | Eof] = deque()
         self.data_closed = False
         self.outbox = Outbox()
-        self.procs: dict[int, subprocess.Popen[bytes]] = {}
+        self.procs: dict[int, subprocess.Popen[bytes]] = {}  # logcat, until reaped
+        self.oneshots: set[subprocess.Popen[bytes]] = set()  # one-shot, until reaped
+        self.reaping = False  # the run is over: a one-shot child is killed at once
+        # Held from an adb spawn until its child is tracked (`_start_adb`);
+        # `close_spawns` takes it at interpreter exit and sets ``closing``.
+        self.spawn_lock = threading.Lock()
+        self.closing = False  # interpreter exit: no adb child is started any more
+        self.failure: BaseException | None = None  # a worker raised (a logpyt bug)
         self.buffer_entries = config.buffer_entries
         self.buffer_bytes = config.buffer_bytes
         # What the engine publishes after every handle() (design 3.6).
@@ -182,8 +199,11 @@ class _Run:
         self.consumed = False  # a consumer was attached once
         self.pending: OutboxCounts | None = None  # a report the engine has not taken
         self.posted: OutboxCounts | None = None  # the counts reported last
-        self.seen = False  # join(), iteration or wait_running() raised the outcome
-        self.orphaned = False  # the LogStream was garbage-collected
+        # join(), iteration, wait_running() or assert_complete() raised the
+        # outcome (design A.23).
+        self.seen = False
+        # How the LogStream was dropped, for the unseen-outcome ERROR (`abandon`).
+        self.orphaned: str | None = None
         # The worker threads (`_thread_ref`), for the F3-7 check.
         self.engine_thread: weakref.ref[threading.Thread] | None = None
         self.dispatcher_thread: weakref.ref[threading.Thread] | None = None
@@ -234,11 +254,20 @@ class _Run:
             self.kill_flag = True
             self._post(KillRequest())
 
-    def abandon(self) -> None:
-        """The LogStream was garbage-collected: kill a running run (design 3.4)."""
+    def abandon(self, *, at_exit: bool) -> None:
+        """The LogStream was dropped: kill a running run (design 3.4).
+
+        ``at_exit``: its finalizer ran at interpreter exit, while the stream
+        was still referenced; else it was garbage-collected. Either names the
+        cause in the ERROR for an outcome nobody saw.
+        """
         late: str | None = None
         with self.cond:
-            self.orphaned = True
+            self.orphaned = (
+                "was still referenced at interpreter exit"
+                if at_exit
+                else "was garbage-collected"
+            )
             if self.finished:
                 late = self._unseen_outcome_message()
             elif self.started:
@@ -247,9 +276,36 @@ class _Run:
         if late is not None:
             _log.error("%s", late)
 
+    def close_spawns(self, *, wait: bool) -> None:
+        """Interpreter exit: start no adb child any more (design 9.2).
+
+        With ``wait`` (the main thread, in the atexit finalizer), a spawn in
+        progress is let finish first, for at most ``_REAP_WAIT``: daemon
+        threads still run while atexit handlers do, so its child is tracked
+        before `kill_children` runs. Without that wait, the worker could be
+        frozen by the interpreter's finalization inside ``Popen``, its child
+        started but never tracked, and that child would outlive the
+        interpreter. Without ``wait`` (a finalizer run by gc in another
+        thread, maybe inside a critical section) the lock is only tried, and
+        a spawn in progress kills its own child once it tracked it
+        (`_start_adb`), unless finalization freezes it first.
+        """
+        if wait:
+            got = self.spawn_lock.acquire(timeout=_REAP_WAIT)
+        else:
+            got = self.spawn_lock.acquire(blocking=False)
+        self.closing = True
+        if got:
+            self.spawn_lock.release()
+
     def kill_children(self) -> None:
-        """Kill every live adb child at once (interpreter shutdown: no threads)."""
-        for proc in list(self.procs.values()):
+        """Kill every adb child not reaped yet at once: logcat and one-shot.
+
+        It takes no lock, so it also works at interpreter shutdown, where the
+        threads that would take the lock may never run again; the copies are
+        made in one step each.
+        """
+        for proc in [*self.procs.values(), *self.oneshots]:
             with contextlib.suppress(OSError):
                 proc.kill()
 
@@ -388,6 +444,8 @@ class _Run:
             while (item := self.deliver_next(consumer, sliced=False)) is not None:
                 if not self._call(consumer, "on_item", on_item, item):
                     return
+        except BaseException as exc:  # noqa: BLE001  (_call takes the callbacks')
+            self._worker_failed(exc)
         finally:
             self.detach(consumer)
 
@@ -563,10 +621,13 @@ class _Run:
 
         The control inbox comes first, then data while intake is open, then a
         `Tick` at the deadline. The run is over once `Finished` was carried
-        out and no consumer is attached any more.
+        out and no consumer is attached any more, or once a worker failed
+        (the engine then ends it: `_crashed`).
         """
         with self.cond:
             while True:
+                if self.failure is not None:
+                    return None
                 pending = self.pending
                 if pending is not None:
                     self.pending = None
@@ -614,13 +675,28 @@ class _Run:
                         _log.error("%s", late, exc_info=event.error)
                 self._carry_out(core.handle(event, time.monotonic()))
         except BaseException as exc:  # noqa: BLE001  (a bug: end the run visibly)
+            _log.error(
+                "the LogStream engine failed; the run is abandoned", exc_info=exc
+            )
             self._crashed(exc)
+            return
+        if self.failure is not None:  # logged by the worker (`_worker_failed`)
+            self._crashed(self.failure)
 
     def _carry_out(self, commands: Iterable[Command]) -> None:
-        """Carry out one ``handle()`` batch in order, then report and publish."""
+        """Carry out one ``handle()`` batch in order, then report and publish.
+
+        The `Deliver` that ends the run (its last record is the terminal
+        `StateChange`; `Finished` comes right after it) is put into the
+        outbox together with the outcome (`_finished`), so whoever sees the
+        terminal change also sees the terminal state and the outcome.
+        """
         changed = False  # the batch changed the outbox counts
+        final: tuple[Record, ...] = ()  # the Deliver that ends the run
         for command in commands:
             match command:
+                case Deliver(records=records) if _ends_run(records):
+                    final = records
                 case Deliver(records=records):
                     changed |= self._deliver(records)
                 case DiscardUndelivered():
@@ -645,51 +721,98 @@ class _Run:
                         daemon=True,
                     ).start()
                 case Finished(outcome=outcome):
-                    self._finished(outcome)
+                    self._finished(outcome, final)
+                    final = ()
                     changed = False
                 case _:
                     assert_never(command)
+        assert not final  # noqa: S101  (the core emits Finished right after it)
         with self.cond:
             if changed:
                 self.control.post(ConsumerProgress(self._counts()))
             self._publish()
 
     def _deliver(self, records: tuple[Record, ...]) -> bool:
-        """`Deliver`: append to the outbox; whether that changed its counts."""
+        """`Deliver`: append to the outbox; whether that changed its counts.
+
+        The state is published first (design 3.6 item 5: it may run ahead
+        of the events, never behind them), so a consumer that takes one of
+        these records, and a `wait_running` it wakes, read the state that
+        record led to or a later one.
+        """
         with self.cond:
+            self._publish(records)
             before = self.outbox.counts()
-            self.outbox.put(records)
-            if not self.reached_running and any(
-                isinstance(record, StateChange) and record.new is StreamState.RUNNING
-                for record in records
-            ):
-                self.reached_running = True
-            self.cond.notify_all()
+            self._put_records(records)
             return self.outbox.counts() is not before
 
-    def _finished(self, outcome: StreamError | None) -> None:
-        """`Finished`: the engine side's last report first, then the end (protocol)."""
+    def _put_records(self, records: tuple[Record, ...]) -> None:
+        """Append to the outbox and wake the consumer (lock held)."""
+        self.outbox.put(records)
+        if not self.reached_running and any(
+            isinstance(record, StateChange) and record.new is StreamState.RUNNING
+            for record in records
+        ):
+            self.reached_running = True
+        self.cond.notify_all()
+
+    def _finished(self, outcome: StreamError | None, final: tuple[Record, ...]) -> None:
+        """`Finished`: the run's last records, the engine side's last report,
+        then the end (protocol), in one critical section; then the one-shot
+        adb children still running are killed and reaped.
+
+        The core is terminal, so ``handle()`` here only updates its
+        accounting (G2) and runs no user code, which is why it may run
+        under the lock (as in `_handle_late`). A consumer therefore takes the
+        terminal `StateChange` only once ``state``, ``stats`` and ``outcome``
+        are final, and ``assert_complete()`` never sees a terminal state
+        without its outcome. A one-shot command still running belongs to no
+        state now (G5): its result would be ignored, so its adb is not left
+        to its timeout.
+        """
         with self.cond:
-            counts = self._counts()
-        # The core is terminal now: this updates only its accounting (G2).
-        self.core.handle(ConsumerProgress(counts), time.monotonic())
-        with self.cond:
+            if final:
+                self._put_records(final)
+            self.core.handle(ConsumerProgress(self._counts()), time.monotonic())
             self.outbox.close()
             self.finished = True
             self.outcome = outcome
             self._publish()
             late = self._unseen_outcome_message() if self.orphaned else None
+            self.reaping = True
+            oneshots = list(self.oneshots)
             self.cond.notify_all()
         if late is not None:
             _log.error("%s", late)
+        if oneshots:
+            for proc in oneshots:
+                with contextlib.suppress(OSError):
+                    proc.kill()
+            with self.cond:
+                self.cond.wait_for(lambda: not self.oneshots, timeout=_REAP_WAIT)
 
-    def _publish(self) -> None:
-        """Publish the core's state, stats and intake (lock held; design 3.6)."""
+    def _publish(self, records: tuple[Record, ...] = ()) -> None:
+        """Publish the core's state, stats and intake (lock held; design 3.6).
+
+        A terminal state is published only once ``outcome`` is set
+        (`_finished`). Before that, in a batch that ends the run, ``state``
+        is the state the last change in ``records`` led to, and
+        ``concluded`` keeps its value, so ``wait_running()`` never returns
+        for a run whose outcome is not published yet.
+        """
         core = self.core
         self.stats = core.stats()
         self.intake_open = core.intake_open
         state = core.state
         concluded = core.concluded
+        if state in _TERMINAL and not self.finished:
+            changes = [
+                r.new
+                for r in records
+                if isinstance(r, StateChange) and r.new not in _TERMINAL
+            ]
+            state = changes[-1] if changes else self.state
+            concluded = self.concluded
         if state is not self.state or concluded is not self.concluded:
             self.state = state
             self.concluded = concluded
@@ -703,35 +826,105 @@ class _Run:
             return None
         self.seen = True
         return (
-            "a LogStream was garbage-collected and its run ended FAILED without "
+            f"a LogStream {self.orphaned} and its run ended FAILED without "
             f"anyone seeing it: {type(self.outcome).__name__}: {self.outcome}"
         )
 
     def _crashed(self, error: BaseException) -> None:
-        """The engine failed (a logpyt bug): end the run so no wait hangs."""
-        _log.error("the LogStream engine failed; the run is abandoned", exc_info=error)
+        """The engine or a worker failed (a logpyt bug): end the run so no
+        wait hangs (design A.23).
+
+        adb is killed first and reaped (bounded by ``_REAP_WAIT``), so no adb
+        child is left when join() returns; only then does every wait end.
+        ``stats`` stays the snapshot the core published last, with ``failed``
+        set: a crashed capture is never ``complete`` (design 4.4), while
+        ``state`` is not changed (no driver invents a state, 5.2).
+        """
         with self.cond:
+            self.reaping = True
+        self.kill_children()
+        with self.cond:
+            self.cond.wait_for(
+                lambda: not self.procs and not self.oneshots, timeout=_REAP_WAIT
+            )
             self.crash = error
+            self.stats = replace(self.stats, failed=True)
             self.finished = True
             self.outbox.close()
             self._end()
-        self.kill_children()
+
+    def _worker_failed(self, error: BaseException) -> None:
+        """A worker thread raised (a logpyt bug): the engine ends the run.
+
+        The engine takes no event after this (`_take`) and crashes the run
+        with ``error`` (`_crashed`), so join(), iteration and
+        assert_complete() raise it, as for an engine crash (design A.23).
+        It is logged first, so the ERROR is out before any wait ends; the
+        peek that picks the wording takes no lock.
+        """
+        name = threading.current_thread().name
+        if self.failure is None and not self.ended:
+            _log.error(
+                "the LogStream thread %s failed; the run is abandoned",
+                name,
+                exc_info=error,
+            )
+        else:
+            _log.error(
+                "the LogStream thread %s failed after the run ended or was abandoned",
+                name,
+                exc_info=error,
+            )
+        with self.cond:
+            if self.failure is None and not self.ended:
+                self.failure = error
+                self.cond.notify_all()
 
     # -- workers ---------------------------------------------------------------------
 
-    def _spawn(self, connection: int, argv: tuple[str, ...]) -> None:
-        """`Spawn`: start adb, report it, start its readers and its exit waiter."""
-        try:
+    def _start_adb(
+        self,
+        argv: Sequence[str],
+        track: Callable[[subprocess.Popen[bytes]], object],
+    ) -> subprocess.Popen[bytes]:
+        """Start an adb child and ``track`` it (lock held) in one step.
+
+        Both happen under ``spawn_lock``, which `close_spawns` takes at
+        interpreter exit: every child started before is tracked when
+        `kill_children` runs there, and none starts after it. A child whose
+        spawn overlapped a `close_spawns` that only tried the lock is killed
+        here once it is tracked.
+
+        Raises:
+            OSError: adb could not be started, or the interpreter is exiting.
+        """
+        with self.spawn_lock:
+            if self.closing:
+                msg = "the interpreter is exiting: adb is not started"
+                raise OSError(msg)
             # Through the module, like resolve_adb: one patch point for tests.
             proc = adb._spawn_adb(argv)  # noqa: SLF001
+            with self.cond:
+                track(proc)
+            if self.closing:
+                with contextlib.suppress(OSError):
+                    proc.kill()
+        return proc
+
+    def _spawn(self, connection: int, argv: tuple[str, ...]) -> None:
+        """`Spawn`: start adb, report it, start its readers and its exit waiter."""
+
+        def track(proc: subprocess.Popen[bytes]) -> None:
+            self.procs[connection] = proc
+            # Posted before any reader runs, so the core sees it before the data.
+            self._post(Spawned(connection, proc.pid))
+
+        try:
+            proc = self._start_adb(argv, track)
         except OSError as exc:
             with self.cond:
                 self._post(SpawnFailed(connection, exc))
             return
-        with self.cond:
-            self.procs[connection] = proc
-            # Posted before any reader runs, so the core sees it before the data.
-            self._post(Spawned(connection, proc.pid))
         pipes: tuple[tuple[Pipe, IO[bytes] | None], ...] = (
             ("stdout", proc.stdout),
             ("stderr", proc.stderr),
@@ -776,6 +969,8 @@ class _Run:
                 if not self._put(Data(connection, pipe_name, chunk)):
                     return
             self._put(Eof(connection, pipe_name))
+        except BaseException as exc:  # noqa: BLE001  (a bug: end the run visibly)
+            self._worker_failed(exc)
         finally:
             with contextlib.suppress(OSError):
                 pipe.close()
@@ -792,20 +987,58 @@ class _Run:
             return True
 
     def _wait_exit(self, connection: int, proc: subprocess.Popen[bytes]) -> None:
-        returncode = proc.wait()
-        with self.cond:
-            self.procs.pop(connection, None)
-            self._post(Exited(connection, returncode))
+        try:
+            returncode = proc.wait()
+            with self.cond:
+                self.procs.pop(connection, None)
+                self._post(Exited(connection, returncode))
+        except BaseException as exc:  # noqa: BLE001  (a bug: end the run visibly)
+            self._worker_failed(exc)
 
     def _run_command(self, command: RunCommand) -> None:
-        """`RunCommand`: the one-shot runner; its result or error goes back."""
+        """`RunCommand`: the one-shot runner; its result or error goes back.
+
+        Its adb child is in ``oneshots`` from its spawn (`_start_adb`) until
+        `adb._run_adb` has reaped it, so `kill_children` and `_finished` can
+        kill it; one spawned after the run's end is killed at once.
+        """
+        spawned: list[subprocess.Popen[bytes]] = []
+
+        def track(proc: subprocess.Popen[bytes]) -> None:
+            spawned.append(proc)
+            self.oneshots.add(proc)
+            if self.reaping:
+                with contextlib.suppress(OSError):
+                    proc.kill()
+
+        def spawn(argv: Sequence[str]) -> subprocess.Popen[bytes]:
+            return self._start_adb(argv, track)
+
         result: Any
         try:
-            result = adb._run_adb(command.argv, timeout=command.timeout)  # noqa: SLF001
-        except Exception as exc:  # noqa: BLE001  (the core reads the error)
-            result = exc
-        with self.cond:
-            self._post(CommandDone(command.request, result))
+            try:
+                result = adb._run_adb(  # noqa: SLF001
+                    command.argv, timeout=command.timeout, spawn=spawn
+                )
+            except Exception as exc:  # noqa: BLE001  (the core reads the error)
+                result = exc
+            finally:
+                with self.cond:
+                    self.oneshots.difference_update(spawned)
+                    self.cond.notify_all()
+            with self.cond:
+                self._post(CommandDone(command.request, result))
+        except BaseException as exc:  # noqa: BLE001  (a bug: end the run visibly)
+            self._worker_failed(exc)
+
+
+def _ends_run(records: tuple[Record, ...]) -> bool:
+    """Whether a `Deliver` ends the run: its last record is the terminal change.
+
+    The core emits that `Deliver` right before `Finished` (`StreamCore._end`).
+    """
+    last = records[-1] if records else None
+    return isinstance(last, StateChange) and last.new in _TERMINAL
 
 
 def _thread_ref() -> weakref.ref[threading.Thread]:
@@ -834,17 +1067,32 @@ def _abandon(run: _Run) -> None:
 
     It may run inside any critical section (a cyclic collection), so the kill
     is posted from a new thread. At interpreter shutdown (the main thread has
-    ended: weakref.finalize runs at exit) the engine may never run again, so
-    the adb children are killed at once as well. A run that ended and whose
-    outcome was seen (or is None) needs nothing.
+    ended: weakref.finalize runs at exit, for a stream still referenced) the
+    engine may never run again, so no adb child is started any more, a spawn
+    in progress is let finish (`_Run.close_spawns`), and every adb child,
+    one-shot commands' included, is killed at once, also for a run that
+    ended (a one-shot command of its may still be starting). There, in the
+    main thread, gc is off and no critical section is open, so
+    `_Run.abandon` runs in place (a new thread may be refused at shutdown).
+    Otherwise a run that ended and whose outcome was seen (or is None) needs
+    nothing.
     """
+    at_exit = not threading.main_thread().is_alive()
+    in_main = threading.current_thread() is threading.main_thread()
+    if at_exit:
+        run.close_spawns(wait=in_main)
+        run.kill_children()
     if run.finished and (run.outcome is None or run.seen):
         return
-    if not threading.main_thread().is_alive():
-        run.kill_children()
+    if at_exit and in_main:
+        run.abandon(at_exit=True)
+        return
     try:
         threading.Thread(
-            target=run.abandon, name="logpyt-finalizer", daemon=True
+            target=run.abandon,
+            kwargs={"at_exit": at_exit},
+            name="logpyt-finalizer",
+            daemon=True,
         ).start()
     except RuntimeError:
         run.kill_children()
@@ -1035,7 +1283,11 @@ class LogStream[T]:
 
     @property
     def stats(self) -> StreamStats:
-        """An immutable snapshot of the run's counters (design 2.5, 4.4)."""
+        """An immutable snapshot of the run's counters (design 2.5, 4.4).
+
+        After a logpyt bug ended the run (join() raises it), ``failed`` is set,
+        so ``complete`` is False.
+        """
         return self._run.stats
 
     @property
@@ -1207,8 +1459,14 @@ class LogStream[T]:
         block was closed early) takes the `Exception` path: it is how a
         caller's ``break`` reaches the block, not an interrupt. Any other
         exception kills. An exception that interrupts the exit's own wait
-        (Ctrl+C) kills too before it propagates, so neither adb nor the
-        consumer outlives the block (design 9.2).
+        (Ctrl+C) kills too before it propagates: adb does not outlive the
+        block (design 9.2), and the exit waits at most 1 s for the end. A
+        push consumer busy in a callback then finishes that callback after
+        the block, takes no further item (the kill flag, F2-7) and receives
+        only the events left, the terminal change included. A run that ended
+        FAILED before the kill took effect is not killed (kill() after the
+        end does nothing, design A.23): the items it left are still
+        delivered, after the block too (A.21).
         """
         run = self._run
         if exc is None:

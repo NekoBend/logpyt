@@ -380,21 +380,25 @@ def test_join_from_the_loop_body_raises_usage_error(
 def test_one_dispatcher_across_reconnects(driver: Driver, fake_adb: FakeAdb) -> None:
     """One consumer context for the whole run: every callback runs on the same
     dispatcher, before and after a reconnect (F2-6).
+
+    The contexts are kept as objects (`Driver.consumer_identity`), not as
+    thread idents: the OS hands out an ended thread's ident again, so a new
+    dispatcher per connection could reuse the first one's (design A.23).
     """
     fake_adb.logcat(
         run(out(logcat_line("first")), exit_code=1),
         run(out(logcat_line("second")), wait("never")),
     )
-    threads: set[int] = set()
+    contexts: list[object] = []
     messages: list[str] = []
 
     def on_item(entry: LogEntry) -> None:
-        threads.add(threading.get_ident())
+        contexts.append(driver.consumer_identity())
         messages.append(entry.message)
 
     def on_event(event: StreamEvent) -> None:
         del event
-        threads.add(threading.get_ident())
+        contexts.append(driver.consumer_identity())
 
     stream = driver.open(
         config(reconnect=Reconnect(delay=0.01)), on_item=on_item, on_event=on_event
@@ -404,9 +408,56 @@ def test_one_dispatcher_across_reconnects(driver: Driver, fake_adb: FakeAdb) -> 
     driver.stop(stream)
     driver.join(stream)
 
-    assert len(threads) == 1
-    assert threading.get_ident() not in threads
+    assert len({id(context) for context in contexts}) == 1, contexts
+    assert driver.consumer_identity() is not contexts[0]
     assert (stream.stats.connections, stream.stats.reconnects) == (2, 1)
+
+
+def test_state_is_never_behind_a_delivered_change(
+    driver: Driver, fake_adb: FakeAdb, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``state`` may run ahead of the events, never behind them (design 3.6
+    item 5, 2.3): with the engine held right after each delivery of a state
+    change, on_event reads the state that change led to, and wait_running()
+    returns with ``state`` RUNNING.
+    """
+    fake_adb.logcat(run(out(logcat_line("a")), wait("never")))
+    handed: list[StateChange] = []
+    reads: list[tuple[StreamState, StreamState]] = []
+    main_read = threading.Event()
+    stream: LogStream[LogEntry]
+
+    def on_event(event: StreamEvent) -> None:
+        if isinstance(event, StateChange):
+            reads.append((event.new, stream.state))
+            handed.append(event)
+
+    def hold(records: Sequence[object]) -> None:
+        for record in records:
+            if isinstance(record, StateChange):
+                wait_until(
+                    lambda r=record: any(e is r for e in handed), timeout=TIMEOUT
+                )
+                if record.new is S.RUNNING:
+                    assert main_read.wait(TIMEOUT)
+
+    driver.hold_after_delivery(monkeypatch, hold)
+    items: list[LogEntry] = []
+    stream = driver.open(config(), on_item=items.append, on_event=on_event)
+    driver.start(stream)
+    driver.wait_running(stream)
+    after_wait = stream.state
+    main_read.set()
+    driver.stop(stream)
+    driver.join(stream)
+
+    assert after_wait is S.RUNNING
+    assert reads == [
+        (S.CONNECTING, S.CONNECTING),
+        (S.RUNNING, S.RUNNING),
+        (S.STOPPING, S.STOPPING),
+        (S.STOPPED, S.STOPPED),
+    ]
 
 
 @pytest.mark.parametrize("stage", ["on_event", "on_item", "where"])

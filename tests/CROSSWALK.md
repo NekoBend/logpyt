@@ -109,7 +109,7 @@ Rules:
 | tests/test_stream.py::test_stream_error_callback | tests/conformance/test_lifecycle.py::test_spawn_failure_fails_and_is_never_retried |
 | tests/test_stream.py::test_stream_grouper_flushes_buffered_entries_on_stdout_eof | tests/conformance/test_callbacks.py::test_group_by_delivers_groups_and_flushes_at_the_end |
 | tests/test_stream.py::test_stream_grouper_only_groups_stdout_not_stderr | API removed by decision D-9 |
-| tests/test_stream.py::test_stream_join_raises_exception | tests/conformance/test_lifecycle.py::test_engine_crash_raises_from_every_wait |
+| tests/test_stream.py::test_stream_join_raises_exception | tests/conformance/test_lifecycle.py::test_reader_crash_raises_from_every_wait |
 | tests/test_stream.py::test_stream_join_reraises_same_error_on_second_call | tests/conformance/test_lifecycle.py::test_nonzero_exit_without_reconnect_fails |
 | tests/test_stream.py::test_stream_kill_transitions_to_killed_and_join_raises | tests/conformance/test_lifecycle.py::test_kill_discards_backlog_and_join_is_prompt |
 | tests/test_stream.py::test_stream_lifecycle | tests/conformance/test_lifecycle.py::test_start_iterate_stop |
