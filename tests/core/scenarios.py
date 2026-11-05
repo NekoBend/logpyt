@@ -1,6 +1,7 @@
 """Scenarios for the state x event product test and the random event sequences.
 
-`VARIANTS` builds, for every state of design 3.1 (STOPPING split by mode),
+`VARIANTS` builds, for every state of design 3.1 (STOPPING split by mode, the
+``drain`` mode of design A.21 included),
 the cores that the product test probes: one per sub-context an event needs
 (a pending clock read, a pending spawn, an exited child, a full outbox...).
 `stimulus` turns an event kind of the transition table into the event that
@@ -13,6 +14,7 @@ import random
 from typing import TYPE_CHECKING
 
 from logpyt import GroupBy, Package, Tag, Where
+from logpyt._core.machine import Mode
 from logpyt._core.protocol import (
     CallbackFailed,
     CommandDone,
@@ -35,6 +37,8 @@ from logpyt._core.protocol import (
 )
 from logpyt.adb import _MARKER_TAG
 from logpyt.config import Reconnect
+from logpyt.exceptions import CallbackError
+from logpyt.models import LogEntry, LogGroup
 from logpyt.streams._events import StateChange, StreamState
 from tests.core.harness import (
     APP,
@@ -53,9 +57,8 @@ from tests.core.harness import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from logpyt._core.protocol import Command, CommandKind, Event, Pipe
+    from logpyt._core.protocol import Command, CommandKind, Event, Pipe, Record
     from logpyt.adb import _AdbResult
-    from logpyt.models import LogEntry
 
 S = StreamState
 
@@ -68,6 +71,7 @@ STATES = (
     "STOPPING(flush)",
     "STOPPING(kill)",
     "STOPPING(fail)",
+    "STOPPING(drain)",
     "STOPPED",
     "KILLED",
     "FAILED",
@@ -203,6 +207,17 @@ ROWS: dict[str, frozenset[str]] = {
     | {"flush_marker_done", "flush_marker_failed", "flush_timer", "stall"},
     "STOPPING(kill)": _STOPPING_ROWS,
     "STOPPING(fail)": _STOPPING_ROWS,
+    # Design A.21: the data side ended; only requests and the consumer count.
+    "STOPPING(drain)": frozenset(
+        {
+            "stop",
+            "stop_flush",
+            "kill",
+            "consumer_progress",
+            "consumer_detached",
+            "callback_failed",
+        }
+    ),
     "STOPPED": frozenset({"consumer_progress", "consumer_detached"}),
     "KILLED": frozenset({"consumer_progress", "consumer_detached"}),
     "FAILED": frozenset({"consumer_progress", "consumer_detached"}),
@@ -323,12 +338,38 @@ def _stopping(mode: str, stage: str) -> Harness:
     return harness
 
 
+def _draining(stage: str) -> Harness:
+    """STOPPING(drain): records wait for the consumer after the data side ended."""
+    if stage == "connecting":
+        harness = _connecting("clock")  # no child: CONNECTING -> STOPPING
+    elif stage == "reconnecting":
+        harness = _reconnecting("error")  # RECONNECTING -> STOPPING
+    elif stage == "spawn_failed":
+        harness = _connecting("spawn")  # STOPPING(stop) before Spawned
+    else:
+        harness = _running("plain")
+    harness.send(StopRequest(flush=5.0) if stage == "ended-flush" else StopRequest())
+    if stage == "spawn_failed":
+        harness.spawn_failed()
+    elif stage.startswith("ended"):
+        harness.end_connection(0)
+    # The conclusion abandoned every pending command (G5): a probe answers
+    # them only in their late form.
+    waited = harness.core._requests
+    harness.pending = {
+        key: cmd for key, cmd in harness.pending.items() if key in waited
+    }
+    return harness
+
+
 def _terminal(state: str) -> Harness:
     harness = _running("plain")
     harness.send(
         _request({"STOPPED": "stop", "KILLED": "kill", "FAILED": "fail"}[state])
     )
     harness.end_connection(0)
+    if state == "STOPPED":
+        harness.consume()  # design A.21: the drain ends once all is handled
     return harness
 
 
@@ -357,6 +398,16 @@ VARIANTS: dict[str, tuple[Callable[[], Harness], ...]] = {
             "fail": ("plain", "spawn", "exited", "lookup", "graceful"),
         }.items()
     },
+    "STOPPING(drain)": tuple(
+        (lambda stage=stage: _draining(stage))
+        for stage in (
+            "ended-stop",
+            "ended-flush",
+            "spawn_failed",
+            "reconnecting",
+            "connecting",
+        )
+    ),
     **{
         state: ((lambda state=state: _terminal(state)),)
         for state in ("STOPPED", "KILLED", "FAILED")
@@ -431,6 +482,7 @@ TRANSITIONS = frozenset(
         (S.RUNNING, S.RECONNECTING),
         (S.RUNNING, S.FAILED),
         (S.RECONNECTING, S.CONNECTING),
+        (S.RECONNECTING, S.STOPPING),  # design A.21: the drain
         (S.RECONNECTING, S.STOPPED),
         (S.RECONNECTING, S.KILLED),
         (S.RECONNECTING, S.FAILED),
@@ -442,6 +494,17 @@ TRANSITIONS = frozenset(
 TERMINAL = frozenset({S.STOPPED, S.KILLED, S.FAILED})
 
 
+# How likely a consumer callback raises while the run drains (design A.21),
+# per record and on the last item: high enough that the seeds exercise both.
+# DRAIN_ODDS also holds for the events a KILLED run leaves the consumer, so
+# that late failures after a kill occur (StreamCore.late_failure).
+DRAIN_ODDS = 0.2
+LAST_ODDS = 0.7
+# The weight of kill() among a step's actions while the run drains, so that
+# the seeds reach the drain's kill row as well as its consumer exits.
+DRAIN_KILL_WEIGHT = 0.6
+
+
 class RandomDriver:
     """Plays a plausible driver against a core, from one seed.
 
@@ -449,7 +512,15 @@ class RandomDriver:
     split lines, dividers, garbage, oversized lines, the marker echoes) only
     while intake is open, takes records as a consumer at random, issues stop,
     kill, detach and callback failures at random, and moves the clock. After
-    every step it checks the global rules (see `step`).
+    every event it checks the global rules (see `send`).
+
+    The consumer follows the contract of design A.21 (`consume`): each step
+    settles the record in hand, pops the next one and reports; a callback
+    raises now and then, and the consumer then takes nothing more and
+    detaches once the outbox is closed; at its end it detaches. While the
+    run drains, kill() is likelier (`DRAIN_KILL_WEIGHT`). The seeds enter the
+    drain from STOPPING(stop), CONNECTING and RECONNECTING; the entry from
+    STOPPING(flush) is left to the product test (`VARIANTS`, ended-flush).
     """
 
     def __init__(self, seed: int) -> None:
@@ -492,6 +563,17 @@ class RandomDriver:
         self.changes: list[StateChange] = []
         self.finished_at: int | None = None
         self.steps = 0
+        # The consumer (design A.21): the record popped last, and its failure.
+        self.hand: Record | None = None
+        self.failed_on: Record | None = None  # its callback raised
+        self.attached_at_finished = False
+        # Per CallbackFailed the core got: "outcome" (latched), or "late".
+        self.failures: list[str] = []
+        self.drain_failures = 0  # handled in STOPPING(drain)
+        self.last_item_failures = 0  # ... on the last item emitted
+        self.drained = 0  # runs that waited in STOPPING(drain)
+        self.drain_kills = 0  # kill() handled in STOPPING(drain)
+        self.drain_progress_ends = 0  # drains a consumer report ended
 
     def _where(self, entry: LogEntry) -> bool:
         if entry.message == "boom":
@@ -501,7 +583,7 @@ class RandomDriver:
     # -- one step --------------------------------------------------------------------
 
     def run(self, steps: int) -> None:
-        """Play ``steps`` random steps, then end the run and drain the consumer."""
+        """Play ``steps`` random steps, then end the run; the consumer finishes."""
         self.send(Start())
         for _ in range(steps):
             if self.harness.core.state in TERMINAL:
@@ -512,9 +594,14 @@ class RandomDriver:
     def send(self, event: Event, at: float | None = None) -> list[Command]:
         """Hand one event to the core and check the global rules on the result."""
         harness = self.harness
-        before = harness.core.state
-        live_before = harness.core.connection
+        core = harness.core
+        before = core.state
+        draining = core.mode is Mode.DRAIN
+        live_before = core.connection
         issued = len(harness.commands)
+        late = core.late_failure(event) if isinstance(event, CallbackFailed) else None
+        if isinstance(event, CallbackFailed) and core.mode is Mode.DRAIN:
+            self.drain_failures += 1
         out = harness.send(event, at=at)
         # With the harness's own reports of the outbox counts after ``out``.
         out = harness.commands[issued:]
@@ -530,6 +617,20 @@ class RandomDriver:
             assert self.finished_at is None, "a second Finished"
             self.finished_at = self.steps
             assert isinstance(out[-1], Finished), "Finished is not the last command"
+            box = harness.outbox
+            self.attached_at_finished = not box.detached
+            if core.state is S.STOPPED and not box.detached:
+                # A.21: an attached consumer finished every earlier record.
+                assert (len(box), box.in_hand) == (1, False), "STOPPED unhandled"
+        self._count_drain(event, draining=draining)
+        if isinstance(event, CallbackFailed):
+            # A.21: a failure handled before the end is the outcome (G4);
+            # one the core cannot latch is late (the engine logs it).
+            if late is None:
+                outcome = core.outcome
+                assert isinstance(outcome, CallbackError), "a live failure was lost"
+                assert outcome.__cause__ is event.error, "not the latched failure"
+            self.failures.append("outcome" if late is None else "late")
         live = harness.core.connection
         if live_before is not None and live != live_before:
             self.retired.add(live_before)
@@ -544,6 +645,17 @@ class RandomDriver:
             assert change.old is previous, f"broken chain: {previous} then {change}"
             self.changes.append(change)
         return out
+
+    def _count_drain(self, event: Event, *, draining: bool) -> None:
+        """Count drains, and how ``event`` ended one (for the reach test)."""
+        core = self.harness.core
+        if core.mode is Mode.DRAIN and not draining:
+            self.drained += 1
+        if draining and core.state in TERMINAL:
+            if isinstance(event, KillRequest):
+                self.drain_kills += 1
+            elif isinstance(event, ConsumerProgress):
+                self.drain_progress_ends += 1
 
     def step(self) -> None:
         """One random action a driver could take now."""
@@ -564,6 +676,8 @@ class RandomDriver:
             weighted += [(8.0, self.output), (0.2, self.close_pipe)]
         if conn is not None and conn.alive:
             weighted.append((0.25, self.exit))
+        if core.mode is Mode.DRAIN:
+            weighted.append((DRAIN_KILL_WEIGHT, self.kill))
         actions = [action for _, action in weighted]
         rng.choices(actions, weights=[weight for weight, _ in weighted])[0]()
 
@@ -572,15 +686,95 @@ class RandomDriver:
         self.send(Tick(), at=self.harness.now + step)
 
     def consume(self) -> None:
-        """The consumer takes up to four records and reports its progress."""
+        """Up to four steps of the delivery iterator (design A.21, C1).
+
+        Each step settles the record in hand (its callback returned), pops
+        the next one and reports; the reports of one action merge into one,
+        as in a control inbox. The callback of the last record popped is
+        still running when the action ends. Now and then the callback of
+        the record in hand raises (`_failure_odds`, `fail`). At the end of
+        the records the consumer detaches; after its failure it takes
+        nothing more and detaches once the outbox is closed.
+        """
         outbox = self.harness.outbox
         if outbox.detached:
             return
+        if self.failed_on is not None:
+            if outbox.closed:
+                self.detach()
+            return
         for _ in range(self.rng.randint(0, 4)):
-            if outbox.pop() is None:
+            if outbox.in_hand:
+                if self.rng.random() < self._failure_odds():
+                    self.report()
+                    self.fail()
+                    return
+                outbox.done()
+            self.hand = outbox.pop()
+            if self.hand is None:
+                if outbox.ended:
+                    self.report()
+                    self.detach()
+                    return
                 break
+        self.report()
+
+    def _failure_odds(self) -> float:
+        """How likely the callback of the record in hand raises.
+
+        5% per record in a run with ``raising`` callbacks. While the run
+        drains (design A.21), DRAIN_ODDS in every run, and LAST_ODDS on the
+        last item, so that the seeds exercise the failures the drain exists
+        for; after a kill ended the run, DRAIN_ODDS on the events left (a
+        late failure: the run stays KILLED).
+        """
+        if self.harness.core.state is S.KILLED:
+            return DRAIN_ODDS
+        if self.harness.core.mode is Mode.DRAIN:
+            record = self.hand
+            last = (
+                isinstance(record, LogEntry | LogGroup)
+                and self.harness.outbox.entries == 0
+            )
+            return LAST_ODDS if last else DRAIN_ODDS
+        return 0.05 if self.raising else 0.0
+
+    def kill(self) -> None:
+        """``kill()`` now (the drain's kill row; `control` covers the rest)."""
+        self.send(KillRequest())
+
+    def report(self) -> None:
+        """The consumer side's ``ConsumerProgress`` with the outbox counts."""
+        outbox = self.harness.outbox
         self.harness.reported = outbox.counts()
         self.send(ConsumerProgress(outbox.counts()))
+
+    def fail(self) -> None:
+        """The callback of the record in hand raised (design A.21, C3).
+
+        The record stays unsettled; the consumer posts one CallbackFailed
+        and takes nothing more.
+        """
+        record = self.hand
+        assert record is not None
+        assert self.harness.outbox.in_hand
+        self.failed_on = record
+        core = self.harness.core
+        if (
+            core.mode is Mode.DRAIN
+            and isinstance(record, LogEntry | LogGroup)
+            and self.harness.outbox.entries == 0
+        ):
+            self.last_item_failures += 1
+        stage = "on_item" if isinstance(record, LogEntry | LogGroup) else "on_event"
+        self.send(CallbackFailed(stage, ValueError("callback")))
+
+    def detach(self) -> None:
+        """The consumer detaches: `Outbox.detach`, then ``ConsumerDetached``."""
+        outbox = self.harness.outbox
+        outbox.detach()
+        self.harness.reported = outbox.counts()
+        self.send(ConsumerDetached(outbox.counts()))
 
     def answer(self) -> None:
         rng = self.rng
@@ -672,32 +866,39 @@ class RandomDriver:
         self.send(Exited(connection, self.rng.choice([0, 1, -9])))
 
     def control(self) -> None:
+        """stop, stop(flush), kill, a detach, or a callback failure now."""
         rng = self.rng
         outbox = self.harness.outbox
-        event = rng.choice(
-            [
-                StopRequest(),
-                StopRequest(flush=rng.choice([0.2, 2.0])),
-                KillRequest(),
-                None,  # the consumer detaches
-                CallbackFailed("on_item", ValueError("callback")),
-            ]
-        )
-        if event is None:
-            outbox.detach()
-            self.harness.reported = outbox.counts()
-            event = ConsumerDetached(outbox.counts())
-        self.send(event)
+        choice = rng.choice(["stop", "flush", "kill", "detach", "fail"])
+        if choice == "stop":
+            self.send(StopRequest())
+        elif choice == "flush":
+            self.send(StopRequest(flush=rng.choice([0.2, 2.0])))
+        elif choice == "kill":
+            self.send(KillRequest())
+        elif outbox.detached or self.failed_on is not None:
+            return  # no consumer, or one that takes nothing more (C3)
+        elif choice == "detach":
+            self.detach()  # break, close(), or a dropped iterator
+        else:
+            # The callback of the record in hand raises; with none in hand,
+            # the next record's callback does.
+            if not outbox.in_hand:
+                self.hand = outbox.pop()
+                self.report()
+                if self.hand is None:
+                    return
+            self.fail()
 
     # -- the end -----------------------------------------------------------------
 
     def finish(self) -> None:
-        """Stop, let every connection end, and drain the consumer."""
+        """Stop, let every connection end, and let the consumer finish."""
         harness = self.harness
         core = harness.core
         if core.state not in TERMINAL:
             self.send(StopRequest())
-        for _ in range(200):
+        for _ in range(1000):
             if core.state in TERMINAL:
                 break
             conn = core._conn
@@ -715,5 +916,16 @@ class RandomDriver:
                 self.consume()
                 self.send(Tick(), at=harness.now + 1.0)
         assert core.state in TERMINAL, f"the run did not end: {state_key(harness)}"
-        while not harness.outbox.ended and not harness.outbox.detached:
+        # The consumer takes the rest and detaches at its end, or detaches
+        # after its own failure (design A.21, C6). Bounded, so a core that
+        # ends without Finished fails here instead of hanging the run.
+        for _ in range(10_000):
+            if harness.outbox.detached:
+                break
             self.consume()
+        else:
+            msg = (
+                f"the consumer never detached in {state_key(harness)} "
+                f"(Finished carried out: {len(harness.finished)})"
+            )
+            raise AssertionError(msg)

@@ -71,6 +71,7 @@ from tests.core.scenarios import (
     RESULTS,
     ROWS,
     STATES,
+    TERMINAL,
     TIMERS,
     UNREACHABLE,
     VARIANTS,
@@ -80,6 +81,16 @@ from tests.core.scenarios import (
 )
 
 S = StreamState
+# The STOPPING modes a request enters; DRAIN follows the end of the data side.
+_MODES = (Mode.STOP, Mode.FLUSH, Mode.KILL, Mode.FAIL)
+
+
+def _drain(harness: Harness) -> None:
+    """Design A.21: the run waits in STOPPING(drain); the consumer ends it."""
+    assert harness.core.state is S.STOPPING
+    assert harness.core.mode is Mode.DRAIN
+    assert harness.finished == []
+    harness.consume()
 
 
 def _stop(flush: float | None) -> StopRequest:
@@ -178,6 +189,7 @@ def test_kill_in_idle_is_noop() -> None:
     harness.running()
     harness.send(StopRequest())
     harness.end_connection(0)
+    _drain(harness)
 
     assert harness.core.state is S.STOPPED
     assert harness.finished == [Finished(None)]
@@ -629,7 +641,11 @@ def test_lines_after_a_failed_lookup_are_unattributed() -> None:
 @pytest.mark.parametrize("flush", [None, 1.0], ids=["stop", "flush"])
 @pytest.mark.parametrize("child", [True, False], ids=["child", "no-child"])
 def test_connecting_stop(child: bool, flush: float | None) -> None:  # noqa: FBT001
-    """CONNECTING stop or stop(flush): STOPPING(stop) with a child, else STOPPED."""
+    """CONNECTING stop or stop(flush): STOPPING(stop) with a child, else STOPPED.
+
+    Design A.21: without a child the run drains first (STOPPING), as a child
+    does once its connection ended, while the consumer has records left.
+    """
     harness = _connecting_with_child() if child else _connecting_without_child()
 
     out = harness.send(_stop(flush))
@@ -640,9 +656,12 @@ def test_connecting_stop(child: bool, flush: float | None) -> None:  # noqa: FBT
         assert harness.core.armed_timers() == {"stop_grace"}
         harness.end_connection(0)
     else:
-        assert kinds(out) == ["Deliver", "Finished"]
+        # A.21: IDLE -> CONNECTING is not handled yet: CONNECTING -> STOPPING.
+        assert kinds(out) == ["Deliver"]
+        assert harness.states()[-1] == (S.CONNECTING, S.STOPPING)
         # The clock read is abandoned (G5): its late result changes nothing.
         assert harness.answer("clock", CLOCK_OK) == []
+    _drain(harness)
     assert harness.core.state is S.STOPPED
     # Design A.20: no connection reads a marker here, so a flush cannot run.
     stats = harness.core.stats()
@@ -1316,9 +1335,12 @@ def test_reconnecting_stop(flush: float | None) -> None:
 
     out = harness.send(_stop(flush))
 
-    assert kinds(out) == ["Deliver", "Finished"]
-    assert harness.core.state is S.STOPPED
+    # A.21: RECONNECTING -> STOPPING(drain) while records wait for the consumer.
+    assert kinds(out) == ["Deliver"]
+    assert harness.states()[-1] == (S.RECONNECTING, S.STOPPING)
     assert harness.core.next_deadline() is None
+    _drain(harness)
+    assert harness.core.state is S.STOPPED
     # Design A.20: no connection reads a marker here, so a flush cannot run.
     assert harness.core.stats().flush_failed is (flush is not None)
 
@@ -1330,6 +1352,7 @@ def test_stop_during_backoff_is_stopped() -> None:
 
     harness.send(StopRequest())
     harness.advance(3600.0)
+    _drain(harness)
 
     assert harness.core.state is S.STOPPED
     assert harness.core.outcome is None
@@ -1476,6 +1499,7 @@ def test_stopping_flush_marker_read() -> None:
     assert harness.core.stats().filtered == 1
     assert harness.core.armed_timers() == {"stop_grace"}
     harness.end_connection(0)
+    _drain(harness)
     assert harness.core.state is S.STOPPED
     assert harness.core.stats().complete
 
@@ -1639,7 +1663,7 @@ def test_stopping_kill_or_fail_lookup_hold_idle_detached(
     assert harness.core.state is (S.KILLED if mode is Mode.KILL else S.FAILED)
 
 
-@pytest.mark.parametrize("mode", list(Mode))
+@pytest.mark.parametrize("mode", _MODES)
 def test_stopping_exited_eof(mode: Mode) -> None:
     """STOPPING(any) exited, eof: as in RUNNING (exit_drain)."""
     harness = _stopping(mode)
@@ -1648,10 +1672,12 @@ def test_stopping_exited_eof(mode: Mode) -> None:
 
     assert "exit_drain" in harness.core.armed_timers()
     harness.eof()
+    if mode in {Mode.STOP, Mode.FLUSH}:
+        _drain(harness)
     assert harness.core.state in {S.STOPPED, S.KILLED, S.FAILED}
 
 
-@pytest.mark.parametrize("mode", list(Mode))
+@pytest.mark.parametrize("mode", _MODES)
 def test_stopping_exit_drain(mode: Mode) -> None:
     """STOPPING(any) exited, exit_drain expired: the run ends (G4)."""
     harness = _stopping(mode, exit_drain=0.5, stop_grace=60.0)
@@ -1660,6 +1686,8 @@ def test_stopping_exit_drain(mode: Mode) -> None:
     assert harness.core.state is S.STOPPING
 
     harness.advance(0.5)
+    if mode in {Mode.STOP, Mode.FLUSH}:
+        _drain(harness)
 
     expected = {
         Mode.STOP: S.STOPPED,
@@ -1675,7 +1703,7 @@ def test_stopping_exit_drain(mode: Mode) -> None:
     assert "its stdout pipe stayed open" in warning.message
 
 
-@pytest.mark.parametrize("mode", list(Mode))
+@pytest.mark.parametrize("mode", _MODES)
 def test_stopping_stop_grace(mode: Mode) -> None:
     """STOPPING(any) stop_grace: Kill(c) (F2-10, both drivers)."""
     harness = Harness.make(stop_grace=2.0).running()
@@ -1695,7 +1723,7 @@ def test_stopping_stop_grace(mode: Mode) -> None:
     assert "stop_grace" not in harness.core.armed_timers()
 
 
-@pytest.mark.parametrize("mode", list(Mode))
+@pytest.mark.parametrize("mode", _MODES)
 def test_stopping_kill(mode: Mode) -> None:
     """STOPPING(any) kill: STOPPING(kill); Kill(c); DiscardUndelivered; latch kept."""
     harness = _stopping(mode)
@@ -1710,7 +1738,7 @@ def test_stopping_kill(mode: Mode) -> None:
     assert harness.core.state is (S.FAILED if mode is Mode.FAIL else S.KILLED)
 
 
-@pytest.mark.parametrize("mode", list(Mode))
+@pytest.mark.parametrize("mode", _MODES)
 @pytest.mark.parametrize("flush", [None, 1.0], ids=["stop", "flush"])
 def test_stopping_stop(mode: Mode, flush: float | None) -> None:
     """STOPPING(any) stop, stop(flush): none."""
@@ -1720,7 +1748,7 @@ def test_stopping_stop(mode: Mode, flush: float | None) -> None:
     assert harness.core.mode is mode
 
 
-@pytest.mark.parametrize("mode", list(Mode))
+@pytest.mark.parametrize("mode", _MODES)
 def test_stopping_callback_failed(mode: Mode) -> None:
     """STOPPING(any) callback_failed: STOPPING(fail); latch if none yet; Kill."""
     harness = _stopping(mode)
@@ -1753,7 +1781,7 @@ def test_stopping_spawned(request_: str) -> None:
     assert kinds(out) == (["Terminate"] if request_ == "stop" else ["Kill"])
 
 
-@pytest.mark.parametrize("mode", list(Mode))
+@pytest.mark.parametrize("mode", _MODES)
 @pytest.mark.parametrize("end", ["ended", "spawn_failed"])
 def test_stopping_connection_ended(mode: Mode, end: str) -> None:
     """STOPPING(any) connection ended or spawn_failed: the terminal state of G4."""
@@ -1783,6 +1811,8 @@ def test_stopping_connection_ended(mode: Mode, end: str) -> None:
         )
         harness.end_connection(0)
         flush_failed = mode is Mode.FLUSH  # the connection ended before the marker
+    if mode in {Mode.STOP, Mode.FLUSH}:
+        _drain(harness)
 
     expected = {
         Mode.STOP: S.STOPPED,
@@ -1804,19 +1834,27 @@ def test_stopping_connection_ended(mode: Mode, end: str) -> None:
 
 
 def test_terminal_consumer_accounting() -> None:
-    """terminal consumer_progress, consumer_detached: outbox accounting only (G2)."""
+    """terminal consumer_progress, consumer_detached: outbox accounting only (G2).
+
+    On a FAILED end, which leaves items queued: a STOPPED run with an attached
+    consumer ends only once it handled them (design A.21).
+    """
     harness = Harness.make().running()
     harness.stdout(lines(2))
-    harness.send(StopRequest())
-    harness.end_connection(0)
+    harness.end_connection(1)  # no reconnect: AdbExitError
+    assert harness.core.state is S.FAILED
     assert harness.core.stats().delivered == 0
 
     assert harness.send(ConsumerProgress(harness.outbox.counts())) == []
     harness.consume()
     assert harness.detach() == []
 
-    assert harness.core.stats().delivered == 3
-    assert harness.core.state is S.STOPPED
+    stats = harness.core.stats()
+    assert stats.delivered == 3
+    assert harness.core.state is S.FAILED
+    outcome = harness.core.outcome
+    assert outcome is not None
+    assert outcome.stats == stats
 
 
 @pytest.mark.parametrize(
@@ -1867,6 +1905,7 @@ def _snapshot(harness: Harness) -> tuple[object, ...]:
         core.next_deadline(),
         core.intake_open,
         core.connection,
+        core.concluded,
     )
 
 
@@ -1940,6 +1979,7 @@ def test_product_covers_the_ignored_lists() -> None:
         },
     }  # fmt: skip
     listed["IDLE"] = {*CONNECTION, *RESULTS, *CONSUMER, *TIMERS}
+    listed["STOPPING(drain)"] = {*CONNECTION, *RESULTS, *TIMERS}
     for state in ("STOPPED", "KILLED", "FAILED"):
         listed[state] = set(KINDS) - {"consumer_progress", "consumer_detached"}
     for state, kinds_ in listed.items():
@@ -2066,35 +2106,46 @@ def test_no_discard_warning_after_the_consumer_caught_up(request_: str) -> None:
     assert (stats.delivered, stats.undelivered) == (4, 0)
 
 
-@pytest.mark.parametrize("when", ["live", "after-finished"])
+@pytest.mark.parametrize("when", ["live", "drain", "after-failed"])
 def test_detach_counts_reach_stats(when: str) -> None:
     """3.4 break: the entries a detach discards are counted from its own counts.
 
-    live: no later report is needed, and the WARNING follows what the detach
-    discarded. after-finished: the run ended STOPPED with entries queued; G2
-    allows no command then, so they are counted without a WARNING.
+    live and drain: no later report is needed, and the WARNING follows what
+    the detach discarded; in the drain the detach ends the run, so the
+    discards are in the stats at Finished (A.21: a STOPPED run no longer ends
+    with entries queued). after-failed: the run ended FAILED with entries
+    queued (no drain once an error is latched); G2 allows no command then,
+    so they are counted without a WARNING.
     """
     harness = Harness.make().running()
     harness.stdout(lines(4))
-    if when == "after-finished":
+    if when == "drain":
         harness.send(StopRequest())
         harness.end_connection(0)
-        assert harness.core.stats().complete
+        assert harness.core.state is S.STOPPING
+        assert harness.core.mode is Mode.DRAIN
+    elif when == "after-failed":
+        harness.end_connection(1)  # no reconnect: AdbExitError
+        assert harness.core.state is S.FAILED
 
     out = harness.detach()
 
     stats = harness.core.stats()
     assert stats.undelivered == 5
     assert "undelivered" in stats.incomplete
-    if when == "live":
-        assert _discard_warnings(harness) == [
-            "discarding undelivered items (the consumer detached); they are "
-            "counted in stats.undelivered"
-        ]
-    else:
+    warning = [
+        "discarding undelivered items (the consumer detached); they are "
+        "counted in stats.undelivered"
+    ]
+    if when == "after-failed":
         assert out == []
-        assert harness.core.state is S.STOPPED
         assert _discard_warnings(harness) == []
+    else:
+        assert _discard_warnings(harness) == warning
+    if when == "drain":
+        assert harness.core.state is S.STOPPED
+        assert harness.at_finished is not None
+        assert harness.at_finished[0].undelivered == 5
 
 
 def _reconnecting_with_six_queued() -> Harness:
@@ -2204,8 +2255,8 @@ def test_backpressure_holds_through_stopping() -> None:
     harness.stdout(lines(3, "tail"))
     harness.eof()
 
+    _drain(harness)
     assert harness.core.state is S.STOPPED
-    harness.consume()
     assert harness.messages() == ["first", "m0", "tail0", "tail1", "tail2"]
     assert harness.core.stats().undelivered == 0
 
@@ -2288,7 +2339,11 @@ def test_line_conservation_invariant(seed: int) -> None:
     no command for a retired connection; the outcome latched once; nothing after
     the terminal state; and every stdout line delivered, filtered, discarded
     with a counted reason or held (checked after every event by the harness).
-    At the end the counters balance from the stats alone.
+    Design A.21, with consumer callbacks that fail now and then (also in the
+    drain, on the last item and after a kill) and kills in the drain: a
+    STOPPED Finished leaves an attached consumer only the terminal change;
+    every CallbackFailed the core gets is the outcome or late. At the end the
+    counters balance from the stats alone.
     """
     driver = RandomDriver(seed)
 
@@ -2309,6 +2364,25 @@ def test_line_conservation_invariant(seed: int) -> None:
     )
     assert harness.core.next_deadline() is None
     assert harness.send(Tick(), at=harness.now + 10.0) == []
+    # Design A.21: the consumer ends detached (C6). A callback failure the
+    # core handled while the run was live ended it FAILED; one on a record
+    # before the terminal change never lets it end STOPPED (KILLED only when
+    # a kill came first, and then the failure was late).
+    assert harness.outbox.detached
+    assert len(driver.failures) <= 1  # one CallbackFailed per consumer
+    if "outcome" in driver.failures:
+        assert harness.core.state is S.FAILED
+    failed_on = driver.failed_on
+    if failed_on is not None and not (
+        isinstance(failed_on, StateChange) and failed_on.new in TERMINAL
+    ):
+        assert harness.core.state is not S.STOPPED
+        if harness.core.state is S.KILLED:
+            assert driver.failures == ["late"]
+    if harness.core.state is S.STOPPED and driver.attached_at_finished:
+        # The stats of a STOPPED run are final at Finished.
+        assert harness.at_finished is not None
+        assert harness.at_finished[0] == stats
 
 
 def test_random_runs_reach_the_main_paths() -> None:
@@ -2333,10 +2407,25 @@ def test_random_runs_reach_the_main_paths() -> None:
             for cmd in commands
         )
         reach[core.state.value] += 1
+        # Design A.21: runs that drained, and consumer failures in the drain.
+        reach["drained"] += driver.drained > 0
+        reach["drain failure"] += driver.drain_failures > 0
+        reach["last item failure"] += driver.last_item_failures > 0
+        reach["drain killed"] += driver.drain_kills > 0
+        reach["drain ended by progress"] += driver.drain_progress_ends > 0
+        failed_on = driver.failed_on
+        reach["late failure after kill"] += (
+            core.state is S.KILLED
+            and failed_on is not None
+            and not (isinstance(failed_on, StateChange) and failed_on.new in TERMINAL)
+        )
 
     assert reach["read lines"] >= 0.8 * len(_SEEDS)
     floors = {"reconnected": 20, "stall resumed": 10, "flushed": 10}
     floors |= {"STOPPED": 20, "KILLED": 15, "FAILED": 40}
+    floors |= {"drained": 8, "drain failure": 4, "last item failure": 2}
+    floors |= {"drain killed": 2, "drain ended by progress": 2}
+    floors |= {"late failure after kill": 1}
     assert {name: reach[name] for name in floors} == {
         name: max(reach[name], floor) for name, floor in floors.items()
     }
@@ -2520,6 +2609,7 @@ def test_due_timers_fire_earliest_first() -> None:
     assert harness.core.armed_timers() == {"flush", "exit_drain"}
 
     harness.advance(3.0)
+    _drain(harness)
 
     assert harness.core.state is S.STOPPED
     stats = harness.core.stats()
@@ -2556,16 +2646,21 @@ def test_stop_flush_infinite_waits_without_a_bound() -> None:
 
 
 def test_finish_reports_the_suppressed_stderr_count() -> None:
-    """5.9: the count of stderr lines over the limit is logged at the end too."""
+    """5.9: the count of stderr lines over the limit is logged at the end too.
+
+    Design A.21: at the conclusion, which comes before the drain.
+    """
     harness = Harness.make().running()
     harness.stderr(b"e\n" * 15)
 
     harness.send(StopRequest())
     out = harness.end_connection(0)
 
+    # Logged at the conclusion, before the drain (design A.21).
     messages = [cmd.message for cmd in out if isinstance(cmd, Diagnostic)]
     assert "5 more adb stderr lines were not logged (rate limit)" in messages
-    assert harness.core.state is S.STOPPED
+    assert harness.core.state is S.STOPPING
+    assert harness.core.mode is Mode.DRAIN
 
 
 def test_outcome_stats_follow_the_consumer_after_the_end() -> None:
@@ -2601,6 +2696,7 @@ def test_flush_and_connection_end_race_gives_one_verdict(order: str) -> None:
         harness.end_connection(1)
         assert harness.core.state is S.RECONNECTING
         harness.send(StopRequest(flush=5.0))
+    _drain(harness)  # A.21: the consumer has records left
 
     assert harness.core.state is S.STOPPED
     assert harness.core.stats().incomplete == ("flush_failed",)
@@ -2620,6 +2716,7 @@ def test_flush_and_stall_race_gives_one_verdict(order: str) -> None:
         harness.end_connection(-9)
         assert harness.core.state is S.RECONNECTING
         harness.send(StopRequest(flush=5.0))
+    _drain(harness)  # A.21: the consumer has records left
 
     assert harness.core.state is S.STOPPED
     assert "flush_failed" in harness.core.stats().incomplete
