@@ -266,6 +266,38 @@ def test_detach_discards_everything_and_counts_later_items() -> None:
     assert outbox.counts().discarded_entries == 2
 
 
+def test_outbox_done_counts_handled() -> None:
+    """Design A.21: done settles the record in hand once; handled is cumulative.
+
+    done without a record in hand raises; a record popped and never settled
+    (its callback raised) stays unsettled when the next one is popped; the
+    newest of two reports keeps the larger handled count.
+    """
+    outbox = Outbox()
+    outbox.put([_change(S.IDLE, S.CONNECTING), _entry("a"), _entry("b"), _entry("c")])
+    assert not outbox.in_hand
+    with pytest.raises(RuntimeError, match="without a record in hand"):
+        outbox.done()
+
+    outbox.pop()
+    assert outbox.in_hand
+    outbox.done()
+    assert not outbox.in_hand
+    with pytest.raises(RuntimeError, match="without a record in hand"):
+        outbox.done()
+    outbox.pop()  # "a": its callback raises, so it is never settled
+    outbox.pop()  # "b"
+    outbox.done()
+    outbox.pop()  # "c": still in hand
+
+    counts = outbox.counts()
+    assert (counts.handled, counts.taken_entries, outbox.in_hand) == (2, 3, True)
+    assert OutboxCounts(handled=3).newest(OutboxCounts(taken_entries=1)) == (
+        OutboxCounts(taken_entries=1, handled=3)
+    )
+    assert OutboxCounts(handled=1).newest(OutboxCounts(handled=4)).handled == 4
+
+
 def test_close_marks_the_end() -> None:
     outbox = Outbox()
     outbox.put([_entry()])
@@ -301,11 +333,13 @@ def test_terminal_group_survives_full_outbox() -> None:
 
     harness.send(StopRequest())
     harness.end_connection(0)
+    # Design A.21: the run waits until the consumer handled every record.
+    assert harness.core.state is S.STOPPING
+    assert harness.finished == []
 
+    records = harness.consume()
     assert harness.core.state is S.STOPPED
-    records = []
-    while (record := harness.outbox.pop()) is not None:
-        records.append(record)
+    records += harness.consume()
     groups = [record for record in records if isinstance(record, LogGroup)]
     assert [group.reason for group in groups] == ["size", "size", "end"]
     assert [entry.message for entry in groups[-1]] == ["tail0", "tail1"]

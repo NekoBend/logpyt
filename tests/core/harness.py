@@ -6,8 +6,10 @@ command is recorded so a test can answer it (`answer`, `spawned`) or check it.
 Like a driver (`logpyt._core.protocol.ConsumerProgress`), it reports the
 outbox's counts after carrying out commands that changed them and always
 before it carries out `Finished`, and the consumer side reports when it takes
-(`consume`) or detaches (`detach`). ``at_finished`` keeps what a ``join()``
-returning at `Finished` would see.
+(`consume`, `take`), settles (`ack`) or detaches (`detach`). `consume` is a
+consumer whose callbacks return: it settles each record (`Outbox.done`, design
+A.21); `take` leaves the record in hand, its callback still to run.
+``at_finished`` keeps what a ``join()`` returning at `Finished` would see.
 Time only moves when a test moves it (`advance`, ``at=``).
 """
 
@@ -307,22 +309,41 @@ class Harness:
     # -- consumer --------------------------------------------------------------------
 
     def consume(self, limit: int | None = None) -> list[Record]:
-        """Take records, up to ``limit`` items (all by default), and report it.
+        """Take and finish records, up to ``limit`` items (all by default).
 
-        Events are taken as they come; only items count against ``limit``.
+        A record still in hand (`take`) is settled first; each record taken
+        here is popped and settled at once (`Outbox.done`), and the counts are
+        reported once at the end. Events are taken as they come; only items
+        count against ``limit``.
         """
+        if self.outbox.in_hand:
+            self.outbox.done()
         taken: list[Record] = []
         items = 0
         while limit is None or items < limit:
             record = self.outbox.pop()
             if record is None:
                 break
+            self.outbox.done()
             taken.append(record)
             if isinstance(record, LogEntry | LogGroup):
                 items += 1
         self.taken += taken
         self.report()
         return taken
+
+    def take(self) -> Record | None:
+        """Pop one record and report it; its callback is still to run (A.21)."""
+        record = self.outbox.pop()
+        if record is not None:
+            self.taken.append(record)
+        self.report()
+        return record
+
+    def ack(self) -> list[Command]:
+        """The callback of the record in hand returned: `Outbox.done`, report."""
+        self.outbox.done()
+        return self.report()
 
     def detach(self) -> list[Command]:
         """The consumer goes away: `Outbox.detach`, then ``ConsumerDetached``."""

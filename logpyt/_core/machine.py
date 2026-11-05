@@ -28,6 +28,14 @@ Facts the code relies on:
   reported; intake closes when the outbox is full and reopens at half. While a
   kill or a failed consumer discards the undelivered items, or no consumer is
   attached, nothing blocks, so the connection always drains and ends.
+- A run that would end STOPPED does not end while an attached consumer has
+  records it has not finished (design A.21): the core counts the records it
+  emits and compares them with the reported ``handled`` plus
+  ``events_coalesced``, never with what was merely taken. The run concludes
+  first (groups flushed, the connection retired, pending commands abandoned,
+  timers disarmed) and waits in STOPPING(drain), which reads nothing, emits
+  nothing and arms no timer; only the terminal `StateChange` and `Finished`
+  wait for the consumer. KILLED and FAILED runs never wait.
 - Line conservation: every framed stdout line is delivered (admitted to the
   outbox, as an entry or a group member), filtered, discarded and counted in
   ``undelivered``, counted in ``before_start`` (or by PR-14 in
@@ -131,12 +139,14 @@ _CONNECTING_KINDS = frozenset({"clock", "start_marker", "state"})
 
 
 class Mode(StrEnum):
-    """What STOPPING is doing (design 3.1)."""
+    """What STOPPING is doing (design 3.1; ``drain``: design A.21)."""
 
     STOP = "stop"
     FLUSH = "flush"
     KILL = "kill"
     FAIL = "fail"
+    # The data side ended; the attached consumer still has records to finish.
+    DRAIN = "drain"
 
 
 type _Timer = Literal[
@@ -279,6 +289,7 @@ class StreamCore:
         self._bp_since: float | None = None
         self._bp_total = 0.0
         self._counts = OutboxCounts()
+        self._emitted = 0  # records sent in Deliver commands (A.21)
         self._tally = Tally()
         self._warned_discard = False
         self._discard_reason = "the consumer detached"  # of the outbox's discards
@@ -313,13 +324,48 @@ class StreamCore:
         False while the outbox is full (until the low-water mark) and while
         the first package lookup runs. A kill and a failed consumer discard
         what is read, and a detached consumer takes nothing, so then intake
-        stays open: the connection drains and ends.
+        stays open: the connection drains and ends. True in STOPPING(drain):
+        a retired reader blocked on the data inbox is drained and ignored (G1).
         """
-        if self._state in TERMINAL or self._mode in {Mode.KILL, Mode.FAIL}:
+        if self._state in TERMINAL or self._mode in {Mode.KILL, Mode.FAIL, Mode.DRAIN}:
             return True
         if not self._attribution.ready:
             return False
         return self._detached or self._admission.open
+
+    @property
+    def concluded(self) -> bool:
+        """Whether the run's data side has ended: terminal, or STOPPING(drain).
+
+        Nothing more is read or emitted but the terminal `StateChange`;
+        ``wait_running()`` returns (or raises the latched outcome) from here
+        (design A.21).
+        """
+        return self._state in TERMINAL or (
+            self._state is S.STOPPING and self._mode is Mode.DRAIN
+        )
+
+    def late_failure(self, event: CallbackFailed) -> str | None:
+        """The ERROR message for a callback failure that cannot become the outcome.
+
+        None while handling ``event`` would latch it (G4): the run is live and
+        no error is latched. Otherwise the run is terminal (``handle`` returns
+        nothing, G2) or another error is latched (the first error wins, 4.3;
+        the callback_failed row still discards and kills): the outcome does
+        not change, and the engine logs this message at ERROR with
+        ``event.error``'s traceback before ``join()`` returns (design A.21).
+        """
+        if self._state not in TERMINAL and self._outcome is None:
+            return None
+        verdict = (
+            f"after the run ended {self._state}"
+            if self._state in TERMINAL
+            else "after the run had already failed"
+        )
+        return (
+            f"{event.stage} raised {type(event.error).__name__}: {event.error} "
+            f"{verdict}; the outcome is unchanged"
+        )
 
     def next_deadline(self) -> float | None:
         """The earliest armed timer, in the monotonic time of ``handle``."""
@@ -531,7 +577,10 @@ class StreamCore:
         # STOPPING: nothing (a stop is already under way).
 
     def _stop_connecting(self, now: float) -> None:
-        """CONNECTING stop: STOPPING(stop) with a child, STOPPED without one."""
+        """CONNECTING stop: STOPPING(stop) with a child; without one the run concludes.
+
+        It ends STOPPED, or waits in STOPPING(drain) for the consumer (A.21).
+        """
         conn = self._conn
         if conn is not None and conn.spawn_issued:
             self._enter_stopping(Mode.STOP)
@@ -542,11 +591,7 @@ class StreamCore:
 
     def _kill(self) -> None:
         self._kill_requested = True
-        state = self._state
-        conn = self._conn
-        if state is S.RECONNECTING or (
-            state is S.CONNECTING and (conn is None or not conn.spawn_issued)
-        ):
+        if self._childless():
             self._discard_undelivered()
             self._finish()
             return
@@ -562,15 +607,20 @@ class StreamCore:
             # The consumer takes nothing more; where/group_by failures keep
             # the items accepted before them (F3-1).
             self._discard_undelivered()
-        state = self._state
-        conn = self._conn
-        if state is S.RECONNECTING or (
-            state is S.CONNECTING and (conn is None or not conn.spawn_issued)
-        ):
+        if self._childless():
             self._finish()
             return
         self._enter_stopping(Mode.FAIL)
         self._kill_child()
+
+    def _childless(self) -> bool:
+        """No adb process can end the run: RECONNECTING, early CONNECTING, the drain."""
+        conn = self._conn
+        return (
+            self._state is S.RECONNECTING
+            or (self._state is S.CONNECTING and (conn is None or not conn.spawn_issued))
+            or self._mode is Mode.DRAIN
+        )
 
     def _consumer_detached(self, counts: OutboxCounts, now: float) -> None:
         """No consumer is left: the rest is discarded and counted (design 3.5)."""
@@ -580,7 +630,11 @@ class StreamCore:
         # what was discarded, not the core's estimate of the fill.
         self._progress(counts)
         state = self._state
-        if state is S.CONNECTING:
+        if state in TERMINAL:
+            return  # the detach's counts showed every record handled (A.21)
+        if self._mode is Mode.DRAIN:
+            self._end()
+        elif state is S.CONNECTING:
             self._stop_connecting(now)
         elif state is S.RECONNECTING:
             self._finish()
@@ -595,6 +649,8 @@ class StreamCore:
 
         Entries the outbox discarded (a detach, or items put into a detached
         outbox) get the run's one discard WARNING here, while the run is live.
+        In STOPPING(drain) the run ends once the consumer has handled every
+        record (design A.21).
         """
         merged = self._counts.newest(counts)
         discarded = merged.discarded_entries > self._counts.discarded_entries
@@ -602,6 +658,8 @@ class StreamCore:
         self._admission.release(merged)
         if discarded and self._state not in TERMINAL:
             self._warn_discard(self._discard_reason)
+        if self.mode is Mode.DRAIN and self._drained():
+            self._end()
 
     # -- one-shot commands ---------------------------------------------------------
 
@@ -809,7 +867,11 @@ class StreamCore:
         self._attempt_ended(cause, stalled=False, retry=not could_not_start)
 
     def _spawn_failed(self, error: OSError, now: float) -> None:
-        """spawn_failed: CONNECTING ends FAILED, never retried (A-12); STOPPING ends."""
+        """spawn_failed: CONNECTING ends FAILED, never retried (A-12).
+
+        STOPPING concludes: it ends (G4), or STOPPING(stop or flush) waits in
+        STOPPING(drain) for the consumer (A.21).
+        """
         conn = self._conn
         assert conn is not None  # noqa: S101  (checked by the caller)
         self._conn = None
@@ -908,16 +970,60 @@ class StreamCore:
         self._finish()
 
     def _stopping_ended(self, now: float) -> None:
-        """STOPPING: the connection ended, or its spawn failed: the run ends (G4)."""
+        """STOPPING: the connection ended, or its spawn failed: the run concludes.
+
+        It ends (G4), or STOPPING(stop or flush) waits in STOPPING(drain) for
+        the consumer (A.21).
+        """
         del now
         if self._mode is Mode.FLUSH:
             self._tally.flush_failed = True
         self._finish()
 
     def _finish(self) -> None:
-        """Enter the terminal state of G4 and emit Finished."""
+        """The run concludes; it ends now, or drains first (design A.21).
+
+        The conclusion is the last point where records are emitted: groups
+        are flushed, the suppressed stderr count is logged, the connection is
+        retired (G1), every pending command is abandoned (G5) and every timer
+        is disarmed. A run that would end STOPPED with an attached consumer
+        that has not handled every record waits in STOPPING(drain); the state
+        changes to STOPPING only when it was not STOPPING already.
+        """
+        # PR-11: lines held for attribution are released (or discarded and
+        # counted) here too, before the drain check (design A.21).
         self._flush_groups()
         self._out += self._stderr_log.pending()
+        self._conn = None
+        self._requests.clear()
+        self._backoff_at = self._stable_at = None
+        self._flush = None
+        if self._bp_since is not None:
+            self._bp_total += self._now - self._bp_since
+            self._bp_since = None
+        if (
+            self._outcome is None
+            and not self._kill_requested
+            and not self._detached
+            and not self._drained()
+        ):
+            self._enter_stopping(Mode.DRAIN)
+            return
+        self._end()
+
+    def _drained(self) -> bool:
+        """Whether the consumer handled every record the core emitted (A.21).
+
+        A coalesced state change absorbed one record, so it counts as handled.
+        Discards never matter: only a kill, a consumer failure and a detach
+        discard, and each of them ends the run without a drain.
+        """
+        counts = self._counts
+        emitted = self._emitted + len(self._records)
+        return counts.handled + counts.events_coalesced >= emitted
+
+    def _end(self) -> None:
+        """Enter the terminal state of G4 and emit Finished."""
         final = (
             S.FAILED
             if self._outcome is not None
@@ -925,15 +1031,8 @@ class StreamCore:
             if self._kill_requested
             else S.STOPPED
         )
-        self._conn = None
-        self._requests.clear()
-        self._backoff_at = self._stable_at = None
-        self._flush = None
         self._set_state(final, error=self._outcome)
         self._mode = None
-        if self._bp_since is not None:
-            self._bp_total += self._now - self._bp_since
-            self._bp_since = None
         if self._outcome is not None:
             self._outcome.stats = self.stats()
         self._flush_records()
@@ -1208,6 +1307,7 @@ class StreamCore:
 
     def _flush_records(self) -> None:
         if self._records:
+            self._emitted += len(self._records)
             self._out.append(Deliver(tuple(self._records)))
             self._records = []
 
@@ -1218,7 +1318,7 @@ class StreamCore:
         return (
             self._state not in TERMINAL
             and self._state is not S.IDLE
-            and self._mode not in {Mode.KILL, Mode.FAIL}
+            and self._mode not in {Mode.KILL, Mode.FAIL, Mode.DRAIN}
             and not self._detached
         )
 
@@ -1256,6 +1356,8 @@ class StreamCore:
         """Every armed timer of the current state (G5)."""
         found: dict[_Timer, float | None] = {}
         state = self._state
+        if self.mode is Mode.DRAIN:
+            return {}  # A.21: the data side ended; only the consumer is waited for
         config = self._config
         conn = self._conn
         usable = False  # a live adb that the core has not killed

@@ -21,7 +21,10 @@ the wake-ups.
   ``new``, ``connection`` and ``error`` of the latest, so the chain of states
   stays unbroken, and ``old`` can equal ``new`` (RUNNING -> RECONNECTING ->
   CONNECTING -> RUNNING merges into RUNNING -> RUNNING with the latest
-  connection number).
+  connection number). The consumer settles each record it finished with
+  (`Outbox.done`, like ``queue.Queue.task_done``); the cumulative ``handled``
+  count lets the core end a STOPPED run only once every record it emitted
+  was handled, never merely taken (design A.21).
 - `Admission`: the engine's copy of the outbox fill, counted from what the core
   delivered and what the consumer side reported in `ConsumerProgress`. Intake
   closes when the outbox is full (``buffer_entries`` entries or
@@ -175,7 +178,7 @@ class Outbox:
 
     Engine side: `put` (the `Deliver` command), `discard`
     (`DiscardUndelivered`), `close` (`Finished`). Consumer side: `pop`,
-    `detach`. `counts` changes on both sides (a put into a detached outbox
+    `done`, `detach`. `counts` changes on both sides (a put into a detached outbox
     and a coalesced event count too), and the driver reports it to the core
     after each change (`ConsumerProgress`, `ConsumerDetached`).
 
@@ -192,6 +195,7 @@ class Outbox:
         "_detached",
         "_entries",
         "_events",
+        "_in_hand",
         "_max_events",
         "_queue",
     )
@@ -205,6 +209,7 @@ class Outbox:
         self._counts = OutboxCounts()
         self._detached = False
         self._closed = False
+        self._in_hand = False
 
     @property
     def entries(self) -> int:
@@ -263,7 +268,9 @@ class Outbox:
     def discard(self) -> None:
         """Discard the items waiting and count them; keep the events.
 
-        The consumer still sees the state changes, the terminal one included.
+        The consumer still sees the state changes, the terminal one included
+        (after ``kill()``; a consumer whose callback raised takes nothing more,
+        design A.21).
         """
         kept: deque[Record] = deque()
         entries = nbytes = 0
@@ -293,11 +300,45 @@ class Outbox:
         """Mark the end of the run: `ended` once the consumer took the rest."""
         self._closed = True
 
+    @property
+    def in_hand(self) -> bool:
+        """Whether the last record popped is not settled yet (`done`)."""
+        return self._in_hand
+
+    def done(self) -> None:
+        """The consumer finished with the record it popped last (design A.21).
+
+        The next step of the delivery iterator calls it: the record's
+        callback returned (and an awaitable it returned completed), none
+        applies, or a ``BaseException`` that is not a callback failure
+        (``KeyboardInterrupt``, a real cancellation) interrupted it and the
+        consumer asked for the next record. Never for a record whose callback
+        raised, nor for an item skipped under the kill flag (F2-7): that one
+        stays unsettled, so the core cannot end the run STOPPED before its
+        `CallbackFailed` or `KillRequest`.
+
+        Raises:
+            RuntimeError: No record is in hand.
+
+        """
+        if not self._in_hand:
+            msg = "Outbox.done() without a record in hand"
+            raise RuntimeError(msg)
+        self._in_hand = False
+        self._counts = replace(self._counts, handled=self._counts.handled + 1)
+
     def pop(self) -> Record | None:
-        """Take the next record, or None when none waits."""
+        """Take the next record, or None when none waits.
+
+        A record still in hand that was not settled stays unsettled for good;
+        a conforming consumer settles first, pops on past an item it skipped
+        under the kill flag (F2-7) on purpose, and after its own failure pops
+        nothing more (design A.21).
+        """
         if not self._queue:
             return None
         record = self._queue.popleft()
+        self._in_hand = True
         if isinstance(record, LogEntry | LogGroup):
             entries, nbytes = item_size(record)
             self._entries -= entries
@@ -374,9 +415,20 @@ class ControlInbox:
     core then decides on a request with the freshest outbox fill (whether a
     kill or a failure actually discards anything), and what a waiting detach
     discarded is counted, with its WARNING, before a stop that waits with it
-    ends the run. Requests that race each other end in the same state in any
-    order (G4); the stop comes before the detach, so a raced
-    ``stop(flush=...)`` still sets ``flush_failed`` as it would alone. A
+    ends the run. Requests that race each other end in the same state in
+    either order (G4) while a child runs. Where the run ends at once
+    (RECONNECTING, CONNECTING without a child, STOPPING(drain)) the first
+    one handled decides and a later one changes nothing (G2): a kill before
+    a `CallbackFailed` ends KILLED, and the failure is late
+    (`StreamCore.late_failure`); a stop that finds the consumer done ends
+    STOPPED before a kill. Waiting together here, the failure comes before
+    the kill and the kill before the stop. In STOPPING(drain) a report can
+    itself end the run STOPPED (design A.21), so a waiting kill, handed over
+    after it even when posted first, changes nothing; that STOPPED is
+    truthful because a consumer settles only the records it finished with,
+    never an item it skipped under the kill flag (`Outbox.done`). The stop
+    comes before the detach, so a raced ``stop(flush=...)`` still sets
+    ``flush_failed`` as it would alone. A
     result that waits together with a request is taken after it, even if it
     arrived first. Both orders are valid, because the two are concurrent
     (the poster of the request cannot have seen the result: state is

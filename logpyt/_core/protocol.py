@@ -20,6 +20,59 @@ Commands (8; the budget is 8): `Spawn`, `Terminate`, `Kill`, `RunCommand`,
 
 Both unions are matched exhaustively with `typing.assert_never`, so adding a
 member is a type error until every consumer handles it.
+
+The consumer side of a driver (design A.21) is mechanical; every decision is
+the core's (5.2). A critical section is the driver's one lock (sync) or one
+task step without an ``await`` (async).
+
+- One delivery iterator serves pull and push (the dispatcher is
+  ``for item in it: on_item(item)``). Each step is one critical section:
+  `Outbox.done` if a record is in hand (except an item skipped under the
+  kill flag, below), `Outbox.pop`, then ``ConsumerProgress(outbox.counts())``;
+  with nothing popped it detaches if the outbox ended, else waits for a put
+  and repeats. An event's ``on_event`` runs inside the step (outside the
+  section), and the step repeats once it returned (and an awaitable it
+  returned completed); an item is returned, and its ``on_item`` (push) or
+  the loop body (pull) runs before the next step settles it. A record whose
+  callback raised never reaches a next step (below).
+- In async no ``await`` comes between `Outbox.pop` and handing the record to
+  ``on_event`` or to the caller: the once-per-batch yield (5.4) comes before
+  the step's `Outbox.done`, so a cancelled ``__anext__`` cancels only its
+  wait and never loses a record it popped.
+- An item skipped under the kill flag (F2-7) is never settled: its callback
+  never ran. The step pops on instead of handing it out, and no later step
+  settles it (a pop leaves it unsettled for good), so only the
+  `KillRequest` ends the run. A settled skip would let the run end STOPPED
+  and complete before that request is handed over: in the drain by a
+  report (the control inbox hands reports over first), in STOPPING(stop)
+  by the connection end. ``kill()`` sets the flag only where it posts the
+  `KillRequest`, never before ``start()`` (D-6): a skip with no request
+  behind it would keep a drain waiting.
+- A record whose callback raised is never settled. The consumer posts
+  `CallbackFailed`, takes nothing more, calls no further callback, and
+  detaches once the outbox is closed; a pull iterator whose ``on_event``
+  raised then raises the published outcome once if the run ended FAILED,
+  else ends. A ``BaseException`` that is not a callback failure
+  (``KeyboardInterrupt``, a real cancellation) leaves the record in hand:
+  the next step settles it, or the dropped iterator detaches.
+- A detach is `Outbox.detach` and `ConsumerDetached` in one critical section:
+  at the consumer's end, after its failure, on ``break``, ``close()``,
+  ``__del__``, with-exit, or a real cancellation of the dispatcher. After
+  ``start()``, ``stop()`` with no consumer attached posts `StopRequest` and
+  then the detach in one critical section, under the lock that creating an
+  iterator takes (3.5); ``stop()`` in IDLE posts nothing and leaves the
+  outbox attached (D-6).
+- The engine takes everything waiting in the control inbox before it blocks,
+  reports the outbox counts as `ConsumerProgress` describes, asks
+  `StreamCore.late_failure` before handing over a `CallbackFailed` (and logs
+  a message it returns at ERROR on `STREAM_LOGGER` with
+  ``exc_info=event.error``), and keeps handling consumer events after
+  `Finished` (accounting only).
+- ``join()`` returns once `Finished` was carried out and the core has handled
+  the consumer's `ConsumerDetached` (or no consumer was ever attached).
+  ``wait_running()`` returns at the first RUNNING, or once
+  `StreamCore.concluded` is published (raising the latched outcome if there
+  is one), so it never waits for the caller's own iterator.
 """
 
 from __future__ import annotations
@@ -95,6 +148,16 @@ class OutboxCounts:
             detached consumer).
         discarded_bytes: Their bytes.
         events_coalesced: State changes merged into a later one (design 5.10).
+        handled: Records (items and events) the consumer finished with
+            (`Outbox.done`): the callback returned (and an awaitable it
+            returned completed) or none applies; for an iterator, the item
+            was handed out and the iterator was asked for the next record,
+            also after a ``BaseException`` that is not a callback failure
+            (``KeyboardInterrupt``, a real cancellation) interrupted it. A
+            record whose callback raised and an item skipped under the kill
+            flag (F2-7) are never counted, so the core cannot end a run
+            STOPPED before its `CallbackFailed` or `KillRequest` (design
+            A.21).
 
     """
 
@@ -103,6 +166,7 @@ class OutboxCounts:
     discarded_entries: int = 0
     discarded_bytes: int = 0
     events_coalesced: int = 0
+    handled: int = 0
 
     @property
     def removed_entries(self) -> int:
@@ -122,6 +186,7 @@ class OutboxCounts:
             discarded_entries=max(self.discarded_entries, other.discarded_entries),
             discarded_bytes=max(self.discarded_bytes, other.discarded_bytes),
             events_coalesced=max(self.events_coalesced, other.events_coalesced),
+            handled=max(self.handled, other.handled),
         )
 
 
@@ -222,10 +287,13 @@ class ConsumerProgress:
     (and from `ConsumerDetached`), so the driver reports
     ``ConsumerProgress(outbox.counts())``:
 
-    - on the consumer side, in the same critical section (lock or task step)
-      as the `Outbox.pop` that took the items, so a request posted after it
-      (``kill()``, a `CallbackFailed`, a `ConsumerDetached`) never comes
-      first;
+    - on the consumer side, in the critical section (lock or task step) that
+      settles the record in hand (`Outbox.done`) and pops the next one, also
+      when nothing is popped; a consumer never waits with an unreported done
+      (the core ends a STOPPED run only once ``handled`` plus
+      ``events_coalesced`` reaches the records it emitted: design A.21), and
+      a request posted after it (``kill()``, a `CallbackFailed`, a
+      `ConsumerDetached`) never comes first;
     - on the engine side, after carrying out the commands of a
       `StreamCore.handle` call whenever they changed the counters: a
       `DiscardUndelivered`, a `Deliver` into a detached outbox (counted as
@@ -247,6 +315,12 @@ class ConsumerDetached:
     The consumer side calls `Outbox.detach` first; ``counts`` is the outbox's
     state after it, the entries the detach discarded included. A
     `ControlInbox` hands these counts over before any waiting request.
+
+    Also posted by ``stop()`` after ``start()`` when no consumer is attached
+    (design 3.5; ``stop()`` in IDLE posts nothing and leaves the outbox
+    attached, D-6); by a consumer at its end, after taking the terminal
+    `StateChange`; and by a consumer whose callback raised, once the outbox
+    is closed. ``join()`` waits until the core has handled it.
     """
 
     counts: OutboxCounts
@@ -256,8 +330,15 @@ class ConsumerDetached:
 class CallbackFailed:
     """``on_item`` or ``on_event`` raised ``error`` in the consumer context.
 
-    ``where`` and ``group_by`` run inside the core, which catches their
-    exceptions itself.
+    An exception while awaiting the awaitable a callback returned is a
+    callback failure too. ``where`` and ``group_by`` run inside the core,
+    which catches their exceptions itself.
+
+    A consumer posts at most one: it never settles that record, takes nothing
+    more, and detaches once the outbox is closed (design A.21). One the core
+    cannot latch (terminal, or another error latched) leaves the outcome as
+    it is; the engine logs it at ERROR on `STREAM_LOGGER` with its traceback
+    (`StreamCore.late_failure`).
     """
 
     stage: Literal["on_item", "on_event"]
@@ -387,12 +468,14 @@ class Finished:
     last batch reaches ``stats`` and ``outcome.stats`` before anyone can see
     the end.
 
-    The consumer side keeps reporting after it (G2: accounting only).
-    ``join()`` returns, and the final ``stats`` are published, only once the
-    core has handled the consumer side's last report: the `ConsumerDetached`,
-    or the `ConsumerProgress` posted after the consumer took the terminal
-    `StateChange` (design 3.2: the consumer took the last item or is
-    detached).
+    The consumer side keeps reporting after it (G2: accounting only). A
+    STOPPED run's ``Finished`` comes only after an attached consumer finished
+    every earlier record (STOPPING(drain), design A.21), so its stats are
+    final here; KILLED and FAILED runs do not wait for the consumer.
+    ``join()`` returns, and the final ``stats`` are published, once this was
+    carried out and the core has handled the consumer's `ConsumerDetached`
+    (or no consumer was ever attached, for example a pull stream that was
+    never iterated).
     """
 
     outcome: StreamError | None
