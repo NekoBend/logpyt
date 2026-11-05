@@ -6,7 +6,8 @@ The child side and the config format are described in ``tests/fake_adb.py``.
     Patches ``subprocess.Popen`` and ``asyncio.create_subprocess_exec`` so
     that a spawn of ``fake.path`` runs ``tests/fake_adb.py`` instead, and
     patches ``resolve_adb`` to return ``fake.path``. Configure behavior with
-    ``logcat()`` / ``pidof()`` / ``command()``, observe it with ``calls()``,
+    ``logcat()`` / ``pidof()`` / ``dumpsys()`` / ``command()``, observe it
+    with ``calls()``,
     ``wait_for()`` and ``release()``. Outside pytest, ``install_fake_adb()``
     sets up the same interception (``bench/stream_bench.py`` uses it).
 
@@ -164,6 +165,26 @@ def threadtime(
 ) -> str:
     """Format one ``-v threadtime`` line, newline included."""
     return f"{date} {time_} {pid:5d} {tid:5d} {level} {tag}: {message}\n"
+
+
+def dumpsys_package(
+    package: str, uid: int | None = None, *, key: str = "userId"
+) -> str:
+    """The stdout of ``dumpsys package <package>`` for an install with ``uid``.
+
+    ``key`` is ``userId`` (API 24) or ``appId`` (API 36; FINDINGS check 3,
+    design A.8). With ``uid=None`` the package is not installed: the output
+    has no record of it.
+    """
+    text = "Activity Resolver Table:\n  Non-Data Actions:\n\nPackages:\n"
+    if uid is None:
+        return text
+    return (
+        f"{text}  Package [{package}] (4c3a2e1):\n"
+        f"    {key}={uid}\n"
+        "    pkg=Package{4c3a2e1 " + package + "}\n"
+        "    versionCode=1 minSdk=24 targetSdk=36\n"
+    )
 
 
 def _posix_child_running(pid: int) -> bool:
@@ -349,7 +370,7 @@ class FakeAdb:
 
     Pass ``fake.path`` as ``adb_path`` (``resolve_adb`` is also patched to
     return it). Configure behavior with ``logcat()`` / ``pidof()`` /
-    ``command()`` before the library spawns adb.
+    ``dumpsys()`` / ``command()`` before the library spawns adb.
     """
 
     def __init__(self, state: Path) -> None:
@@ -377,6 +398,18 @@ class FakeAdb:
     def pidof(self, package: str, *runs: Run) -> None:
         """Set the runs for successive ``adb shell pidof <package>`` calls."""
         self._config.setdefault("pidof", {})[package] = list(runs)
+        self._write_config()
+
+    def dumpsys(self, package: str, *runs: Run) -> None:
+        """Set the runs for successive ``adb shell dumpsys package <package>`` calls.
+
+        This is the uid lookup of a live stream (design 5.8, A.8); script its
+        answers with `dumpsys_package`. Each package counts its own
+        invocations: ``dumpsys(p, run(out(dumpsys_package(p))), run(out(
+        dumpsys_package(p, 10123))))`` answers "not installed", then the uid
+        of an install.
+        """
+        self._config.setdefault("dumpsys", {})[package] = list(runs)
         self._write_config()
 
     def command(self, name: str, *runs: Run) -> None:

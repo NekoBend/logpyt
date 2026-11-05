@@ -772,7 +772,7 @@ def test_explicit_adb_path_is_used_without_resolving(
 @pytest.mark.asyncio
 async def test_hanging_lookup_child_is_reaped_on_timeout(fake_adb: FakeAdb) -> None:
     """A uid lookup that never answers is killed and reaped at its timeout (F3-4)."""
-    fake_adb.command("shell", run(touch("looking-up"), hang=True))
+    fake_adb.dumpsys(PACKAGE, run(touch("looking-up"), hang=True))
     argv = adb._package_uid_argv(fake_adb.path, "emulator-5554", PACKAGE)
     started = time.monotonic()
 
@@ -786,7 +786,7 @@ async def test_hanging_lookup_child_is_reaped_on_timeout(fake_adb: FakeAdb) -> N
 @pytest.mark.asyncio
 async def test_cancel_reaps_child(fake_adb: FakeAdb) -> None:
     """Cancelling a lookup kills and reaps its child before the task ends (F3-4)."""
-    fake_adb.command("shell", run(touch("looking-up"), hang=True))
+    fake_adb.dumpsys(PACKAGE, run(touch("looking-up"), hang=True))
     argv = adb._package_uid_argv(fake_adb.path, None, PACKAGE)
     task = asyncio.create_task(adb._async_run_adb(argv, timeout=None))
     await fake_adb.async_wait_for("looking-up", timeout=TIMEOUT)

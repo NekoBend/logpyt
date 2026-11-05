@@ -3,7 +3,8 @@
 `VARIANTS` builds, for every state of design 3.1 (STOPPING split by mode, the
 ``drain`` mode of design A.21 included),
 the cores that the product test probes: one per sub-context an event needs
-(a pending clock read, a pending spawn, an exited child, a full outbox...).
+(a pending clock read, a pending spawn, an exited child, a full outbox, a line
+held for package attribution with its re-lookup in flight...).
 `stimulus` turns an event kind of the transition table into the event that
 probes it. `RandomDriver` plays a plausible driver against a core.
 """
@@ -42,8 +43,10 @@ from logpyt.models import LogEntry, LogGroup
 from logpyt.streams._events import StateChange, StreamState
 from tests.core.harness import (
     APP,
+    APP_UID,
     CLOCK_FAILED,
     CLOCK_OK,
+    LOOKUP_ABSENT,
     LOOKUP_FAILED,
     LOOKUP_OK,
     MARKER_FAILED,
@@ -52,6 +55,7 @@ from tests.core.harness import (
     STATE_OFFLINE,
     Harness,
     line,
+    lookup,
 )
 
 if TYPE_CHECKING:
@@ -86,6 +90,7 @@ RESULTS = (
     "state_device",
     "state_other",
     "lookup_done",
+    "lookup_failed",
     "flush_marker_done",
     "flush_marker_failed",
 )
@@ -112,6 +117,7 @@ _RESULT: dict[str, tuple[CommandKind, _AdbResult]] = {
     "state_device": ("state", STATE_DEVICE),
     "state_other": ("state", STATE_OFFLINE),
     "lookup_done": ("lookup", LOOKUP_OK),
+    "lookup_failed": ("lookup", LOOKUP_FAILED),
     "flush_marker_done": ("flush_marker", MARKER_OK),
     "flush_marker_failed": ("flush_marker", MARKER_FAILED),
 }
@@ -130,6 +136,7 @@ _STOPPING_ROWS = frozenset(
         "eof",
         "exited",
         "lookup_done",
+        "lookup_failed",
         "consumer_progress",
         "consumer_detached",
         "callback_failed",
@@ -159,6 +166,7 @@ ROWS: dict[str, frozenset[str]] = {
             "state_device",
             "state_other",
             "lookup_done",
+            "lookup_failed",
             "consumer_progress",
             "consumer_detached",
             "callback_failed",
@@ -177,6 +185,7 @@ ROWS: dict[str, frozenset[str]] = {
             "eof",
             "exited",
             "lookup_done",
+            "lookup_failed",
             "consumer_progress",
             "consumer_detached",
             "callback_failed",
@@ -194,6 +203,7 @@ ROWS: dict[str, frozenset[str]] = {
             "stop_flush",
             "kill",
             "lookup_done",
+            "lookup_failed",
             "consumer_progress",
             "consumer_detached",
             "callback_failed",
@@ -281,7 +291,21 @@ def _connecting(stage: str, **fields: object) -> Harness:
 
 
 def _running(stage: str) -> Harness:
-    """RUNNING: plain, full outbox, exited child, or lookup still pending."""
+    """RUNNING: plain, full outbox, exited child, lookup still pending, or a
+    line held for attribution with its re-lookup in flight.
+    """
+    if stage == "held":
+        harness = _make()
+        harness.start()
+        harness.answer("lookup", LOOKUP_ABSENT)  # APP not installed at start
+        harness.answer("clock", CLOCK_OK)
+        harness.spawned()
+        harness.stdout(line("first", uid=1000))  # RUNNING; a system uid
+        harness.stdout(line("held", tag="Other"))  # its verdict needs APP
+        harness.until_deadline()  # the re-lookup starts (and the idle flush)
+        assert harness.core._attribution.held == 1
+        assert "lookup" in {cmd.kind for cmd in harness.pending.values()}
+        return harness
     if stage == "lookup":
         harness = _make()
         harness.start()
@@ -309,7 +333,7 @@ def _reconnecting(stage: str) -> Harness:
         harness.until_deadline()  # stall: Kill(c)
         harness.end_connection(-9)
         return harness
-    harness = _running("lookup") if stage == "lookup" else _running("plain")
+    harness = _running(stage if stage in {"lookup", "held"} else "plain")
     harness.end_connection(1)
     return harness
 
@@ -381,21 +405,21 @@ VARIANTS: dict[str, tuple[Callable[[], Harness], ...]] = {
     ),
     "RUNNING": tuple(
         (lambda stage=stage: _running(stage))
-        for stage in ("plain", "full", "exited", "lookup")
+        for stage in ("plain", "full", "exited", "lookup", "held")
     ),
     "RECONNECTING": tuple(
         (lambda stage=stage: _reconnecting(stage))
-        for stage in ("error", "lookup", "stall")
+        for stage in ("error", "lookup", "stall", "held")
     ),
     **{
         f"STOPPING({mode})": tuple(
             (lambda mode=mode, stage=stage: _stopping(mode, stage)) for stage in stages
         )
         for mode, stages in {
-            "stop": ("plain", "spawn", "exited", "lookup"),
-            "flush": ("plain", "full", "exited", "lookup"),
-            "kill": ("plain", "spawn", "exited", "lookup", "graceful"),
-            "fail": ("plain", "spawn", "exited", "lookup", "graceful"),
+            "stop": ("plain", "spawn", "exited", "lookup", "held"),
+            "flush": ("plain", "full", "exited", "lookup", "held"),
+            "kill": ("plain", "spawn", "exited", "lookup", "graceful", "held"),
+            "fail": ("plain", "spawn", "exited", "lookup", "graceful", "held"),
         }.items()
     },
     "STOPPING(drain)": tuple(
@@ -494,6 +518,12 @@ TRANSITIONS = frozenset(
 TERMINAL = frozenset({S.STOPPED, S.KILLED, S.FAILED})
 
 
+# Package attribution (design 5.8): the uids of the random lines (APP's, another
+# app's, APP's on a secondary user, system uids), and a lookup that names
+# another uid for APP (an install during the capture).
+_UIDS: tuple[int | str, ...] = (APP_UID, APP_UID, 10_070, 1_010_065, 1000, "root")
+OTHER_LOOKUP = lookup(10_070)
+
 # How likely a consumer callback raises while the run drains (design A.21),
 # per record and on the last item: high enough that the seeds exercise both.
 # DRAIN_ODDS also holds for the events a KILLED run leaves the consumer, so
@@ -514,6 +544,13 @@ class RandomDriver:
     kill, detach and callback failures at random, and moves the clock. After
     every event it checks the global rules (see `send`).
 
+    Package attribution (design 5.8): ``where`` watches APP in most runs; the
+    lines come from APP's uid, another app uid, a secondary user and system
+    uids; a lookup answers APP's uid, another uid, "not installed" or fails;
+    and now and then a lookup's result is delivered again late (stale: X-3),
+    which must change nothing. So lines are held, re-looked-up, released,
+    expire, and go through the connection end and the conclusion while held.
+
     The consumer follows the contract of design A.21 (`consume`): each step
     settles the record in hand, pops the next one and reports; a callback
     raises now and then, and the consumer then takes nothing more and
@@ -529,7 +566,12 @@ class RandomDriver:
         where = None
         self.raising = rng.random() < 0.3
         if rng.random() < 0.7:
-            where = Where(self._where) if self.raising else WHERE
+            # A raising where also watches APP: it raises on released lines too.
+            where = (
+                Package(APP) | Where(self._where)
+                if self.raising
+                else rng.choice([WHERE, Package(APP), ~Package(APP)])
+            )
         buffer_entries = rng.choice([1, 3, 50])
         group_by = None
         if rng.random() < 0.5:
@@ -554,7 +596,7 @@ class RandomDriver:
             stall_timeout=rng.choice([None, 0.5]),
             buffer_entries=buffer_entries,
             max_line_bytes=4096,
-            package_hold=rng.choice([0.0, 1.0]),
+            package_hold=rng.choice([0.0, 1.0, 3.0, 10.0]),
             exit_drain=0.5,
             stop_grace=0.5,
         )
@@ -574,6 +616,14 @@ class RandomDriver:
         self.drained = 0  # runs that waited in STOPPING(drain)
         self.drain_kills = 0  # kill() handled in STOPPING(drain)
         self.drain_progress_ends = 0  # drains a consumer report ended
+        # Package attribution (design 5.8).
+        self.answered_lookups: list[int] = []  # request ids, for stale copies
+        self.lookup_weight = rng.choice([3.0, 0.3])
+        self.max_held = 0
+        self.stale_results = 0
+        self.failed_while_held = 0  # lookups that failed with lines held
+        self.held_at_connection_end = 0  # events that retired a connection
+        self.held_at_conclusion = 0  # ... that concluded the run
 
     def _where(self, entry: LogEntry) -> bool:
         if entry.message == "boom":
@@ -598,6 +648,8 @@ class RandomDriver:
         before = core.state
         draining = core.mode is Mode.DRAIN
         live_before = core.connection
+        held_before = core._attribution.held
+        concluded_before = core.concluded
         issued = len(harness.commands)
         late = core.late_failure(event) if isinstance(event, CallbackFailed) else None
         if isinstance(event, CallbackFailed) and core.mode is Mode.DRAIN:
@@ -634,6 +686,10 @@ class RandomDriver:
         live = harness.core.connection
         if live_before is not None and live != live_before:
             self.retired.add(live_before)
+            self.held_at_connection_end += held_before > 0
+        if core.concluded and not concluded_before:
+            self.held_at_conclusion += held_before > 0
+        self.max_held = max(self.max_held, core._attribution.held)
         outcome = harness.core.outcome
         if self.outcome is None:
             self.outcome = outcome
@@ -668,8 +724,18 @@ class RandomDriver:
             (3.0, self.consume),
             (0.15, self.control),
         ]
-        if harness.pending:
-            weighted.append((3.0, self.answer))
+        if self.answered_lookups:
+            weighted.append((0.3, self.stale))
+        kinds = {command.kind for command in harness.pending.values()}
+        if kinds - {"lookup"}:
+            weighted.append((3.0, self.answer_other))
+        if "lookup" in kinds:
+            # Slow re-lookups in some runs, so that lines are held at a
+            # connection end and at the conclusion too; the first lookups,
+            # which intake waits for, are not slowed.
+            slow = core._attribution.ready
+            weight = self.lookup_weight if slow else 3.0
+            weighted.append((weight, self.answer_lookup))
         if conn is not None and conn.spawn_issued and conn.pid is None:
             weighted.append((3.0, self.spawn))
         if conn is not None and conn.pid is not None and core.intake_open:
@@ -776,9 +842,25 @@ class RandomDriver:
         self.harness.reported = outbox.counts()
         self.send(ConsumerDetached(outbox.counts()))
 
-    def answer(self) -> None:
+    def answer_lookup(self) -> None:
+        self.answer(lookup=True)
+
+    def answer_other(self) -> None:
+        self.answer(lookup=False)
+
+    def answer(self, *, lookup: bool | None = None) -> None:
+        """Answer a pending command: any, a lookup (True) or another (False).
+
+        `step` asks for another command (lookups have their own weight); the
+        end of the run answers any.
+        """
         rng = self.rng
-        command = rng.choice(list(self.harness.pending.values()))
+        pending = [
+            command
+            for command in self.harness.pending.values()
+            if lookup is None or (command.kind == "lookup") is lookup
+        ]
+        command = rng.choice(pending)
         del self.harness.pending[command.request]
         # The first attempt's clock and start marker rarely fail, so that few
         # runs end before they read anything.
@@ -794,10 +876,29 @@ class RandomDriver:
             case "state":
                 outcome = STATE_DEVICE if good else STATE_OFFLINE
             case "lookup":
-                outcome = LOOKUP_OK if good else LOOKUP_FAILED
+                outcome = (
+                    rng.choice([LOOKUP_OK, LOOKUP_ABSENT, LOOKUP_ABSENT, OTHER_LOOKUP])
+                    if good
+                    else LOOKUP_FAILED
+                )
+                self.answered_lookups.append(command.request)
+                if not good and self.harness.core._attribution.held:
+                    self.failed_while_held += 1
             case _:
                 outcome = MARKER_OK if good else TimeoutError("marker")
         self.send(CommandDone(command.request, outcome))
+
+    def stale(self) -> None:
+        """A late copy of an answered lookup's result: it changes nothing (X-3)."""
+        rng = self.rng
+        attribution = self.harness.core._attribution
+        before = (attribution.uid_packages, attribution.held, attribution.deadline())
+        request = rng.choice(self.answered_lookups)
+        outcome = rng.choice([LOOKUP_OK, LOOKUP_ABSENT, OTHER_LOOKUP, LOOKUP_FAILED])
+        self.send(CommandDone(request, outcome))
+        after = (attribution.uid_packages, attribution.held, attribution.deadline())
+        assert after == before, "a stale lookup result changed the attribution"
+        self.stale_results += 1
 
     def spawn(self) -> None:
         connection = self.harness.core.connection
@@ -847,7 +948,8 @@ class RandomDriver:
         if pick < 0.125 and self.raising:
             return line("boom")
         tag = rng.choice(["App", "App", "Other"])
-        return line(f"m{rng.randint(0, 99)}", tag=tag, pid=rng.choice([1, 2]))
+        uid = rng.choice(_UIDS)
+        return line(f"m{rng.randint(0, 99)}", tag=tag, pid=rng.choice([1, 2]), uid=uid)
 
     def close_pipe(self) -> None:
         conn = self.harness.core._conn

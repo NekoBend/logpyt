@@ -16,8 +16,11 @@ One `Pipeline` serves one parse session. For each `FramedLine` it runs, in order
 6. ``group_by``: the entry joins the `Grouper`, and the groups it closes come
    out; `Pipeline.finish` closes the rest with reason ``"end"``.
 
-Live attribution (holding a line until its package is known) is not here yet
-(PR-11). Exceptions from the parser and from ``where`` propagate unchanged.
+Live attribution (holding a line until its package is known) belongs to the
+core, not here: `logpyt._core.attribution` (design 5.8) sets each live line's
+package, and the core builds its pipelines without ``uid_packages``, which only
+offline reading (`logpyt.read_file`) passes. Exceptions from the parser and from
+``where`` propagate unchanged.
 
 Wall-clock time: the pipeline reads no clock itself. The ``ParseContext`` the
 caller passes in is its only source of wall time: ``ctx.now()`` dates the lines

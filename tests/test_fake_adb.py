@@ -13,10 +13,13 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from logpyt import adb
+from logpyt.exceptions import AdbError
 from logpyt.streams import AsyncLogStream, LogStream
 from tests.conftest import (
     WATCHDOG_ENV,
     FakeAdb,
+    dumpsys_package,
     err,
     lines,
     out,
@@ -90,6 +93,69 @@ def test_pidof_is_keyed_by_package_and_unconfigured_packages_exit_1(
     missing = _adb(fake_adb, "shell", "pidof", "com.b")
     assert missing.returncode == 1
     assert missing.stdout == b""
+
+
+def _lookup(fake: FakeAdb, package: str) -> int | None:
+    """The uid the library's own lookup (design 5.8, A.8) reads from the fake."""
+    argv = adb._package_uid_argv(fake.path, None, package)
+    return adb._parse_package_uid(adb._run_adb(argv, timeout=TIMEOUT), package)
+
+
+def test_dumpsys_is_keyed_by_package_and_unconfigured_packages_exit_1(
+    fake_adb: FakeAdb,
+) -> None:
+    fake_adb.dumpsys("com.a", run(out(dumpsys_package("com.a", 10065))))
+    fake_adb.command("default", run(out("fallback\n")))
+
+    assert _lookup(fake_adb, "com.a") == 10065
+    missing = _adb(fake_adb, "-s", "SER", "shell", "dumpsys", "package", "com.b")
+    other = _adb(fake_adb, "shell", "dumpsys", "activity")
+
+    assert (missing.returncode, missing.stdout) == (1, b"")  # no default
+    assert other.stdout == b"fallback\n"  # not a lookup: the shell's runs
+    keys = [(call["command"], call["key"]) for call in fake_adb.calls()]
+    assert keys == [
+        ("dumpsys", "dumpsys:com.a"),
+        ("dumpsys", "dumpsys:com.b"),
+        ("shell", "shell"),
+    ]
+    assert [child.args for child in fake_adb.children("dumpsys")] == [
+        ("shell", "dumpsys", "package", "com.a"),
+        ("-s", "SER", "shell", "dumpsys", "package", "com.b"),
+    ]
+
+
+def test_dumpsys_runs_are_used_per_lookup_of_each_package(fake_adb: FakeAdb) -> None:
+    """Each package counts its own lookups: an install changes the answer."""
+    fake_adb.dumpsys(
+        "com.a",
+        run(out(dumpsys_package("com.a"))),
+        run(out(dumpsys_package("com.a", 10123, key="appId"))),
+    )
+    fake_adb.dumpsys("com.b", run(err("error: device offline\n"), exit_code=1))
+
+    answers = [_lookup(fake_adb, "com.a")]
+    with pytest.raises(AdbError, match="device offline"):
+        _lookup(fake_adb, "com.b")
+    answers += [_lookup(fake_adb, "com.a"), _lookup(fake_adb, "com.a")]
+
+    assert answers == [None, 10123, 10123]  # the last run repeats
+    assert [call["index"] for call in fake_adb.calls("dumpsys")] == [0, 0, 1, 2]
+
+
+@pytest.mark.parametrize("key", ["userId", "appId"])
+def test_dumpsys_package_text_is_read_like_the_device_output(key: str) -> None:
+    """The helper's text parses as the recorded API 24 / 36 output does (A.8)."""
+    installed = dumpsys_package("com.a", 10077, key=key)
+    absent = dumpsys_package("com.a")
+
+    def parse(stdout: str, package: str = "com.a") -> int | None:
+        result = adb._AdbResult(argv=(), returncode=0, stdout=stdout, stderr="")
+        return adb._parse_package_uid(result, package)
+
+    assert parse(installed) == 10077
+    assert parse(installed, "com.a.b") is None
+    assert parse(absent) is None
 
 
 def test_unconfigured_commands_exit_1_until_a_default_run_is_set(

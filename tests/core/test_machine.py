@@ -626,15 +626,26 @@ def test_connecting_intake_waits_for_every_first_lookup() -> None:
 
 
 def test_lines_after_a_failed_lookup_are_unattributed() -> None:
-    """A failed lookup opens intake; app lines then count as unattributed (4.4)."""
+    """A failed lookup opens intake; an app line waits for the retry (5.8).
+
+    The retry starts LOOKUP_INTERVAL after the failed lookup; when it fails
+    too, the line is evaluated without a package and counted (4.4).
+    """
     harness = Harness.make(where=Package(APP))
     harness.connecting_spawned()
 
     harness.answer("lookup", LOOKUP_FAILED)
+    assert harness.core.intake_open
     harness.stdout(line("x"))
+    assert harness.core._attribution.held == 1
+    assert harness.core.stats().unattributed == 0
+    assert harness.core.next_deadline() == pytest.approx(100.5)
+    harness.until_deadline()  # the retry starts
+    harness.answer("lookup", LOOKUP_FAILED)
 
     stats = harness.core.stats()
-    assert stats.unattributed == 1
+    assert harness.core._attribution.held == 0
+    assert (stats.unattributed, stats.filtered) == (1, 1)
     assert "unattributed" in stats.incomplete
 
 
@@ -1253,11 +1264,14 @@ def test_running_lookup_hold_idle() -> None:
     assert harness.core.intake_open
     harness.stdout(line("before"))
     assert harness.core.state is S.RUNNING
-    assert harness.core.stats().unattributed == 1
+    # Tag("App") decides the verdict without the package: not held, and not
+    # unattributed (design 5.8, tri-state).
+    assert harness.core._attribution.held == 0
+    assert harness.core.stats().unattributed == 0
 
     harness.answer("lookup", LOOKUP_OK)
     harness.stdout(line("after"))
-    assert harness.core.stats().unattributed == 1
+    assert harness.core.stats().unattributed == 0
     assert harness.core.armed_timers() == {"idle"}
     harness.advance(0.5)
 
@@ -1283,8 +1297,9 @@ def test_running_hold_expired() -> None:
     assert harness.core.intake_open
     assert harness.core.armed_timers() == frozenset()
     harness.stdout(line("x"))
+    # Tag("App") decides the verdict without the package (tri-state, 5.8).
     assert harness.messages() == ["x"]
-    assert harness.core.stats().unattributed == 1
+    assert harness.core.stats().unattributed == 0
     # The lookup still runs; its answer fills the map for the later lines.
     harness.answer("lookup", LOOKUP_OK)
     harness.stdout(line("y"))
@@ -2328,7 +2343,7 @@ def test_group_by_larger_than_the_outbox_is_rejected() -> None:
         )
 
 
-_SEEDS = range(200)
+_SEEDS = range(400)
 
 
 @pytest.mark.parametrize("seed", _SEEDS, ids=[f"seed{seed}" for seed in _SEEDS])
@@ -2342,8 +2357,10 @@ def test_line_conservation_invariant(seed: int) -> None:
     Design A.21, with consumer callbacks that fail now and then (also in the
     drain, on the last item and after a kill) and kills in the drain: a
     STOPPED Finished leaves an attached consumer only the terminal change;
-    every CallbackFailed the core gets is the outcome or late. At the end the
-    counters balance from the stats alone.
+    every CallbackFailed the core gets is the outcome or late. Design 5.8:
+    lines held for attribution count in the balance, and a stale lookup
+    result changes nothing (`RandomDriver.stale`). At the end the counters
+    balance from the stats alone and nothing is held.
     """
     driver = RandomDriver(seed)
 
@@ -2363,6 +2380,7 @@ def test_line_conservation_invariant(seed: int) -> None:
         + stats.below_cursor
     )
     assert harness.core.next_deadline() is None
+    assert harness.core._attribution.held == 0
     assert harness.send(Tick(), at=harness.now + 10.0) == []
     # Design A.21: the consumer ends detached (C6). A callback failure the
     # core handled while the run was live ended it FAILED; one on a record
@@ -2419,6 +2437,21 @@ def test_random_runs_reach_the_main_paths() -> None:
             and failed_on is not None
             and not (isinstance(failed_on, StateChange) and failed_on.new in TERMINAL)
         )
+        # Design 5.8: held lines, re-lookups, stale results, expiry and
+        # failures, and held lines at a connection end and at the conclusion.
+        lookups = [
+            cmd
+            for cmd in commands
+            if isinstance(cmd, RunCommand) and cmd.kind == "lookup"
+        ]
+        reach["held lines"] += driver.max_held > 0
+        reach["held 3+"] += driver.max_held >= 3
+        reach["re-lookups"] += len(lookups) > 1
+        reach["stale lookup results"] += driver.stale_results > 0
+        reach["unattributed"] += stats.unattributed > 0
+        reach["lookup failed while held"] += driver.failed_while_held > 0
+        reach["held at a connection end"] += driver.held_at_connection_end > 0
+        reach["held at the conclusion"] += driver.held_at_conclusion > 0
 
     assert reach["read lines"] >= 0.8 * len(_SEEDS)
     floors = {"reconnected": 20, "stall resumed": 10, "flushed": 10}
@@ -2426,6 +2459,10 @@ def test_random_runs_reach_the_main_paths() -> None:
     floors |= {"drained": 8, "drain failure": 4, "last item failure": 2}
     floors |= {"drain killed": 2, "drain ended by progress": 2}
     floors |= {"late failure after kill": 1}
+    floors |= {"held lines": 40, "held 3+": 30, "re-lookups": 60}
+    floors |= {"stale lookup results": 90, "unattributed": 40}
+    floors |= {"lookup failed while held": 6, "held at a connection end": 4}
+    floors |= {"held at the conclusion": 3}
     assert {name: reach[name] for name in floors} == {
         name: max(reach[name], floor) for name, floor in floors.items()
     }

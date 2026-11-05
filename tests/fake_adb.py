@@ -18,6 +18,7 @@ and the last run repeats once the list is exhausted::
     {
       "logcat": [RUN, ...],
       "pidof": {"com.example": [RUN, ...]},
+      "dumpsys": {"com.example": [RUN, ...]},   # shell dumpsys package <pkg>
       "devices": [RUN, ...],
       "default": [RUN, ...]          # any other command
     }
@@ -32,10 +33,13 @@ and the last run repeats once the list is exhausted::
          | {"touch": "name"}         # create <dir>/signals/<name>
 
 After the steps the process exits with ``exit``, or, when ``hang`` is true,
-sleeps until it is killed. A command with no configured run exits 1 silently.
+sleeps until it is killed. A command with no configured run exits 1 silently;
+so does ``pidof`` or ``dumpsys`` of a package with no runs (``default`` does
+not apply to them).
 
 The parent assigns ``--fake-index`` (the per-command invocation number that
-selects the run; ``pidof`` counts per package) and ``--fake-seq`` (the global
+selects the run; ``pidof`` and ``dumpsys`` count per package, so a package's
+lookups can change their answer, as a reinstall does) and ``--fake-seq`` (the global
 spawn number) under its own lock, so this process takes no lock and keeps no
 counter that a kill could leave half-written. ``--fake-parent`` is the
 spawning process's pid. Before any step runs it records
@@ -87,9 +91,11 @@ _GLOBAL_OPTS_WITH_VALUE = frozenset({"-s", "-t", "-H", "-P", "-L"})
 def split_command(args: list[str]) -> tuple[str, str, list[str]]:
     """Return (command, key, rest) for an adb argument vector.
 
-    ``key`` selects the per-invocation counter: the command name, or
-    ``pidof:<package>`` for ``shell pidof <package>``. The fixture calls this
-    too, so parent and child always agree on the key.
+    ``key`` selects the per-invocation counter: the command name,
+    ``pidof:<package>`` for ``shell pidof <package>``, or
+    ``dumpsys:<package>`` for ``shell dumpsys package <package>`` (the uid
+    lookup of design 5.8, A.8). The fixture calls this too, so parent and
+    child always agree on the key.
     """
     i = 0
     while i < len(args) and args[i].startswith("-"):
@@ -100,6 +106,8 @@ def split_command(args: list[str]) -> tuple[str, str, list[str]]:
     command = rest[0]
     if command == "shell" and len(rest) >= 3 and rest[1] == "pidof":
         return "pidof", f"pidof:{rest[2]}", rest[1:]
+    if command == "shell" and len(rest) == 4 and rest[1:3] == ["dumpsys", "package"]:
+        return "dumpsys", f"dumpsys:{rest[3]}", rest[1:]
     return command, command, rest[1:]
 
 
@@ -158,8 +166,8 @@ def _record_call(
 def _select_run(
     config: dict[str, Any], command: str, key: str, index: int
 ) -> dict[str, Any] | None:
-    if command == "pidof":
-        runs = config.get("pidof", {}).get(key.split(":", 1)[1])
+    if command in {"pidof", "dumpsys"}:
+        runs = config.get(command, {}).get(key.split(":", 1)[1])
     else:
         runs = config.get(command, config.get("default"))
     if not runs:

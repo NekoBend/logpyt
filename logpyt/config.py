@@ -371,6 +371,8 @@ class StreamConfig(
             checks whether the device is there.
         stall_timeout: Seconds the intake may stay closed by backpressure before
             logpyt disconnects and later resumes; None disables the stall resume.
+            Lines held for package attribution count against the buffer too, so
+            they alone can close the intake (see ``package_hold``).
         reconnect: The reconnect policy; None ends the run at the first
             unrequested connection end.
         resume_overlap: Seconds of overlap requested when resuming.
