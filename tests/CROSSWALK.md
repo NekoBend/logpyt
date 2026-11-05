@@ -84,3 +84,44 @@ Rules:
 | tests/behavior/test_offline_behavior.py::test_reader_filter_by_yields_only_matching_entries | tests/behavior/test_offline_behavior.py::test_reader_where_yields_only_matching_entries |
 | tests/behavior/test_package_filter_behavior.py::test_file_reader_package_filter_yields_nothing | tests/behavior/test_package_filter_behavior.py::test_read_file_package_condition_needs_a_uid_map |
 | tests/behavior/test_package_filter_behavior.py::test_read_file_package_condition_yields_nothing | tests/behavior/test_package_filter_behavior.py::test_read_file_package_condition_needs_a_uid_map |
+| tests/test_pid_monitor.py::TestPidMonitor::test_get_package | mocked private internals; behavior covered by tests/core/test_attribution.py::test_first_lookup_before_reading_attributes_the_backlog |
+| tests/test_pid_monitor.py::TestPidMonitor::test_init | API removed by decision D-15 |
+| tests/test_pid_monitor.py::TestPidMonitor::test_resolve_pids_exception | mocked private internals; behavior covered by tests/core/test_attribution.py::test_a_failed_lookup_releases_the_lines_that_waited_for_it |
+| tests/test_pid_monitor.py::TestPidMonitor::test_resolve_pids_failure | mocked private internals; behavior covered by tests/core/test_attribution.py::test_a_failed_lookup_releases_the_lines_that_waited_for_it |
+| tests/test_pid_monitor.py::TestPidMonitor::test_resolve_pids_success | mocked private internals; behavior covered by tests/conformance/test_attribution.py::test_package_lines_are_attributed_by_uid_lookup |
+| tests/test_pid_monitor.py::TestPidMonitor::test_run_loop_adaptive_backoff_when_unchanged | API removed by decision D-8 |
+| tests/test_pid_monitor.py::TestPidMonitor::test_run_loop_large_package_set_limits_resolve_calls_per_cycle | mocked private internals; behavior covered by tests/core/test_attribution.py::test_relookups_are_one_at_a_time_and_rate_limited |
+| tests/test_pid_monitor.py::TestPidMonitor::test_run_loop_partial_resolve_preserves_unpolled_packages | mocked private internals; behavior covered by tests/core/test_attribution.py::test_each_package_waits_its_own_interval |
+| tests/test_pid_monitor.py::TestPidMonitor::test_run_loop_resets_backoff_on_change | API removed by decision D-8 |
+| tests/test_pid_monitor.py::TestPidMonitor::test_run_loop_updates_map | mocked private internals; behavior covered by tests/core/test_attribution.py::test_a_reinstall_under_a_new_uid_is_looked_up_again |
+| tests/test_pid_monitor.py::TestPidMonitor::test_start_stop | API removed by decision D-15 |
+| tests/test_pid_monitor.py::TestPidMonitor::test_update_pid_map_applies_add_remove_and_change | mocked private internals; behavior covered by tests/core/test_attribution.py::test_a_mapped_package_found_uninstalled_has_no_uid_again |
+| tests/test_pid_monitor.py::TestPidMonitor::test_update_pid_map_no_change_keeps_map_object | API removed by decision D-8 |
+| tests/test_stream.py::test_auto_reconnect | tests/conformance/test_reconnect.py::test_reconnect_after_a_nonzero_exit |
+| tests/test_stream.py::test_join_timeout_honored_when_callback_thread_blocked | tests/conformance/test_lifecycle.py::test_join_timeout_raises_timeout_error_while_the_consumer_is_busy |
+| tests/test_stream.py::test_join_waits_for_callback_thread_completion | tests/conformance/test_callbacks.py::test_join_returns_after_the_last_callback |
+| tests/test_stream.py::test_queue_full_warning_rate_limited | API removed by decision U-4 |
+| tests/test_stream.py::test_read_loop_caps_readline_size | mocked private internals; behavior covered by tests/core/test_framing.py::test_oversized_line_keeps_following_lines |
+| tests/test_stream.py::test_read_timeout | tests/conformance/test_reconnect.py::test_read_timeout_without_reconnect_fails |
+| tests/test_stream.py::test_stop_does_not_hang_when_callback_queue_is_full | tests/conformance/test_lifecycle.py::test_never_iterated_pull_stop_join_returns |
+| tests/test_stream.py::test_stream_callbacks | tests/conformance/test_callbacks.py::test_push_delivers_every_line_in_order |
+| tests/test_stream.py::test_stream_context_manager | tests/conformance/test_lifecycle.py::test_with_block_stops_and_joins |
+| tests/test_stream.py::test_stream_error_callback | tests/conformance/test_lifecycle.py::test_spawn_failure_fails_and_is_never_retried |
+| tests/test_stream.py::test_stream_grouper_flushes_buffered_entries_on_stdout_eof | tests/conformance/test_callbacks.py::test_group_by_delivers_groups_and_flushes_at_the_end |
+| tests/test_stream.py::test_stream_grouper_only_groups_stdout_not_stderr | API removed by decision D-9 |
+| tests/test_stream.py::test_stream_join_raises_exception | tests/conformance/test_lifecycle.py::test_engine_crash_raises_from_every_wait |
+| tests/test_stream.py::test_stream_join_reraises_same_error_on_second_call | tests/conformance/test_lifecycle.py::test_nonzero_exit_without_reconnect_fails |
+| tests/test_stream.py::test_stream_kill_transitions_to_killed_and_join_raises | tests/conformance/test_lifecycle.py::test_kill_discards_backlog_and_join_is_prompt |
+| tests/test_stream.py::test_stream_lifecycle | tests/conformance/test_lifecycle.py::test_start_iterate_stop |
+| tests/test_stream.py::test_stream_non_zero_exit_is_raised_from_join | tests/conformance/test_lifecycle.py::test_nonzero_exit_without_reconnect_fails |
+| tests/test_stream.py::test_stream_package_filter_drops_non_matching_entries | tests/conformance/test_attribution.py::test_package_lines_are_attributed_by_uid_lookup |
+| tests/test_stream.py::test_stream_package_resolution | tests/conformance/test_attribution.py::test_package_lines_are_attributed_by_uid_lookup |
+| tests/test_stream.py::test_stream_parse_error_propagates_to_join | API removed by decision U-1 |
+| tests/test_stream.py::test_stream_pause_suspends_dispatch_and_resume_restores_it | API removed by decision D-7 |
+| tests/test_stream.py::test_stream_raising_on_start_callback_does_not_break_teardown | tests/conformance/test_callbacks.py::test_on_event_raising_on_connecting_fails_cleanly |
+| tests/test_stream.py::test_stream_startup_failure_is_raised_from_join | tests/conformance/test_lifecycle.py::test_missing_adb_fails_at_the_clock_read |
+| tests/test_stream.py::test_stream_stderr_callback_receives_entry | tests/conformance/test_lifecycle.py::test_adb_stderr_is_logged_and_kept_in_the_error |
+| tests/test_stream.py::test_sync_queue_overflow_policy_drop_oldest_is_configurable | API removed by decision U-4 |
+| tests/behavior/test_sync_stream_behavior.py::test_a_zero_adb_exit_makes_join_return_normally | tests/behavior/test_sync_stream_behavior.py::test_a_zero_adb_exit_is_the_outcome |
+| tests/behavior/test_sync_stream_behavior.py::test_kill_makes_join_raise_killed_error | tests/behavior/test_sync_stream_behavior.py::test_kill_ends_killed_and_join_returns |
+| tests/behavior/test_sync_stream_behavior.py::test_stderr_output_reaches_only_stderr_callback | tests/behavior/test_sync_stream_behavior.py::test_stderr_lines_are_logged_not_delivered |

@@ -27,8 +27,8 @@ task step without an ``await`` (async).
 
 - One delivery iterator serves pull and push (the dispatcher is
   ``for item in it: on_item(item)``). Each step is one critical section:
-  `Outbox.done` if a record is in hand (except an item skipped under the
-  kill flag, below), `Outbox.pop`, then ``ConsumerProgress(outbox.counts())``;
+  `Outbox.done` if a record is in hand, `Outbox.pop` (no item under the
+  kill flag, below), then ``ConsumerProgress(outbox.counts())``;
   with nothing popped it detaches if the outbox ended, else waits for a put
   and repeats. An event's ``on_event`` runs inside the step (outside the
   section), and the step repeats once it returned (and an awaitable it
@@ -39,15 +39,20 @@ task step without an ``await`` (async).
   ``on_event`` or to the caller: the once-per-batch yield (5.4) comes before
   the step's `Outbox.done`, so a cancelled ``__anext__`` cancels only its
   wait and never loses a record it popped.
-- An item skipped under the kill flag (F2-7) is never settled: its callback
-  never ran. The step pops on instead of handing it out, and no later step
-  settles it (a pop leaves it unsettled for good), so only the
-  `KillRequest` ends the run. A settled skip would let the run end STOPPED
-  and complete before that request is handed over: in the drain by a
-  report (the control inbox hands reports over first), in STOPPING(stop)
-  by the connection end. ``kill()`` sets the flag only where it posts the
-  `KillRequest`, never before ``start()`` (D-6): a skip with no request
-  behind it would keep a drain waiting.
+- Under the kill flag (F2-7) the step takes no item: while items wait and
+  the outbox is not closed, it reports and waits. The core's
+  `DiscardUndelivered`, issued with the kill, removes them and counts them
+  in ``undelivered`` (design 3.4), and the events behind them still come.
+  Nothing is settled past the kill, so only the `KillRequest` ends the run:
+  an item taken and settled would let the run end STOPPED and complete
+  before that request is handed over, in the drain by a report (the
+  control inbox hands reports over first) and in STOPPING(stop) by the
+  connection end. Items still waiting once the outbox is closed belong to
+  a run that ended FAILED before the core handled the kill; they are
+  delivered like any items left after a FAILED end (design A.21).
+  ``kill()`` sets the flag only where it posts the `KillRequest`, never
+  before ``start()`` (D-6): a flag with no request behind it would keep a
+  drain waiting.
 - A record whose callback raised is never settled. The consumer posts
   `CallbackFailed`, takes nothing more, calls no further callback, and
   detaches once the outbox is closed; a pull iterator whose ``on_event``
@@ -154,8 +159,8 @@ class OutboxCounts:
             was handed out and the iterator was asked for the next record,
             also after a ``BaseException`` that is not a callback failure
             (``KeyboardInterrupt``, a real cancellation) interrupted it. A
-            record whose callback raised and an item skipped under the kill
-            flag (F2-7) are never counted, so the core cannot end a run
+            record whose callback raised is never counted, and no item is
+            taken under the kill flag (F2-7), so the core cannot end a run
             STOPPED before its `CallbackFailed` or `KillRequest` (design
             A.21).
 

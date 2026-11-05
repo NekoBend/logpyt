@@ -373,14 +373,16 @@ def test_drain_kill_ends_killed() -> None:
 
 
 @pytest.mark.parametrize("where", ["drain", "live"])
-def test_kill_flag_skips_end_killed(where: str) -> None:
-    """kill() while the consumer skips the rest under the kill flag (F2-7).
+def test_kill_flag_takes_nothing_and_ends_killed(where: str) -> None:
+    """kill() while items wait: the consumer takes none of them (F2-7).
 
-    A skipped item is never settled (its callback never ran), so the reports
-    of the steps that skip, which the control inbox hands over before the
-    waiting KillRequest, cannot end the run STOPPED and complete. drain:
-    kill() in STOPPING(drain); live: in STOPPING(stop), with the connection
-    end handled before the control inbox. Both end KILLED.
+    Under the kill flag the consumer's step settles the record in hand,
+    takes no item and reports. That report, which the control inbox hands
+    over before the waiting KillRequest, shows the items unhandled, so it
+    cannot end the run STOPPED and complete. The kill discards them, counted
+    in ``undelivered`` with the kill() WARNING (design 3.4). drain: kill() in
+    STOPPING(drain); live: in STOPPING(stop), with the connection end handled
+    before the control inbox.
     """
     harness = Harness.make().running()
     harness.consume()
@@ -392,17 +394,10 @@ def test_kill_flag_skips_end_killed(where: str) -> None:
     inbox = ControlInbox()
     inbox.post(KillRequest())  # kill(): the flag is set, the request posted
     outbox = harness.outbox
-    finished = False  # the callback of the record in hand ran and returned
-    while True:  # the C1 steps; under the flag every item is skipped
-        if outbox.in_hand and finished:
-            outbox.done()
-        record = outbox.pop()
-        inbox.post(ConsumerProgress(outbox.counts()))
-        if record is None:
-            break
-        finished = not isinstance(record, LogEntry | LogGroup)
-    assert outbox.entries == 0
-    assert outbox.in_hand  # m3, skipped
+    assert outbox.entries == 4
+    taken = outbox.counts().taken_entries  # what the consumer took before
+    # The step under the flag: no item is popped; the counts are reported.
+    inbox.post(ConsumerProgress(outbox.counts()))
     if where == "live":
         harness.end_connection(0)  # the data side comes first
         assert harness.core.mode is Mode.DRAIN
@@ -412,7 +407,10 @@ def test_kill_flag_skips_end_killed(where: str) -> None:
 
     assert harness.core.state is S.KILLED
     assert harness.finished == [Finished(None)]
-    assert "killed" in harness.core.stats().incomplete
+    stats = harness.core.stats()
+    assert (stats.delivered, stats.undelivered) == (taken, 4)
+    assert set(stats.incomplete) == {"undelivered", "killed"}
+    assert _discard_warnings(harness) == [_warning("kill()")]
 
 
 def test_drain_detach_ends_stopped() -> None:

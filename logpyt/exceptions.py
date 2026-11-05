@@ -1,9 +1,9 @@
 """Exceptions for logpyt stream operations.
 
 Two generations live here during the 3.0.0 migration (design section 8.1): the 2.x
-``LogStream*Error`` classes, which the current streams still raise, and the 3.0
-hierarchy rooted at `LogpytError` (design section 4.1), which nothing raises yet.
-The driver rewrites switch to the 3.0 classes and the last one deletes the 2.x ones.
+``LogStream*Error`` classes, which the 2.x `AsyncLogStream` still raises, and the
+3.0 hierarchy rooted at `LogpytError` (design section 4.1), which `LogStream`
+raises. The async driver rewrite (PR-13) switches over and deletes the 2.x ones.
 """
 
 from __future__ import annotations

@@ -1,7 +1,8 @@
 """Stream lifecycle states, events and statistics of logpyt 3.0 (design section 2.5).
 
-Nothing emits these yet. Until the driver rewrites switch over (design section 8.1),
-the 2.x streams keep reporting `logpyt.streams.common.StreamState`.
+`LogStream` emits these. Until the async driver rewrite switches over (design
+section 8.1, PR-13), the 2.x `AsyncLogStream` keeps reporting
+`logpyt.streams.common.StreamState`.
 """
 
 from dataclasses import dataclass

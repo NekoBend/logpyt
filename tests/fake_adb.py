@@ -19,6 +19,8 @@ and the last run repeats once the list is exhausted::
       "logcat": [RUN, ...],
       "pidof": {"com.example": [RUN, ...]},
       "dumpsys": {"com.example": [RUN, ...]},   # shell dumpsys package <pkg>
+      "date": [RUN, ...],            # shell date ... (the device clock)
+      "get-state": [RUN, ...],       # get-state (the stream's state check)
       "devices": [RUN, ...],
       "default": [RUN, ...]          # any other command
     }
@@ -31,11 +33,24 @@ and the last run repeats once the list is exhausted::
          | {"sleep": seconds}
          | {"wait": "name"}          # block until <dir>/signals/<name> exists
          | {"touch": "name"}         # create <dir>/signals/<name>
+         | {"hold_stdout": {"until": "name", "then": "text"}}
+
+``hold_stdout`` starts a grandchild that holds this process's stdout: it gets
+the handle explicitly (``Popen(stdout=<this stdout>)``, so Windows passes it
+too), waits for the signal ``name`` (bounded like ``wait``), writes ``then``
+to that stdout and exits. The fake adb goes on at once, so once it has exited
+its stdout pipe stays open until the grandchild lets go, as when adb starts a
+process that inherits its output (design 5.10, 9.2).
 
 After the steps the process exits with ``exit``, or, when ``hang`` is true,
 sleeps until it is killed. A command with no configured run exits 1 silently;
 so does ``pidof`` or ``dumpsys`` of a package with no runs (``default`` does
-not apply to them).
+not apply to them). ``shell date`` is the exception: with no ``date`` runs it
+prints the host's epoch seconds (``date +%s`` of a device whose clock is the
+host's) and exits 0, because every stream connection reads the device clock
+first (design 3.2); ``default`` does not apply to it either. A hanging
+``logcat`` run whose only output is ``- waiting for device -`` on stderr is
+what adb does for a serial that is not attached (FINDINGS.md, check 4).
 
 The parent assigns ``--fake-index`` (the per-command invocation number that
 selects the run; ``pidof`` and ``dumpsys`` count per package, so a package's
@@ -61,6 +76,7 @@ import base64
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -92,9 +108,10 @@ def split_command(args: list[str]) -> tuple[str, str, list[str]]:
     """Return (command, key, rest) for an adb argument vector.
 
     ``key`` selects the per-invocation counter: the command name,
-    ``pidof:<package>`` for ``shell pidof <package>``, or
+    ``pidof:<package>`` for ``shell pidof <package>``,
     ``dumpsys:<package>`` for ``shell dumpsys package <package>`` (the uid
-    lookup of design 5.8, A.8). The fixture calls this too, so parent and
+    lookup of design 5.8, A.8), or ``date`` for ``shell date ...`` (the
+    device clock of design 5.6). The fixture calls this too, so parent and
     child always agree on the key.
     """
     i = 0
@@ -108,6 +125,8 @@ def split_command(args: list[str]) -> tuple[str, str, list[str]]:
         return "pidof", f"pidof:{rest[2]}", rest[1:]
     if command == "shell" and len(rest) == 4 and rest[1:3] == ["dumpsys", "package"]:
         return "dumpsys", f"dumpsys:{rest[3]}", rest[1:]
+    if command == "shell" and len(rest) >= 2 and rest[1] == "date":
+        return "date", "date", rest[1:]
     return command, command, rest[1:]
 
 
@@ -168,11 +187,18 @@ def _select_run(
 ) -> dict[str, Any] | None:
     if command in {"pidof", "dumpsys"}:
         runs = config.get(command, {}).get(key.split(":", 1)[1])
+    elif command == "date":
+        runs = config.get("date") or [_host_clock_run()]
     else:
         runs = config.get(command, config.get("default"))
     if not runs:
         return None
     return runs[min(index, len(runs) - 1)]
+
+
+def _host_clock_run() -> dict[str, Any]:
+    """``date +%s`` of a device whose clock is the host's: the unscripted answer."""
+    return {"steps": [{"out": f"{int(time.time())}\n"}], "exit": 0}
 
 
 def _orphaned(parent: int) -> bool:
@@ -199,6 +225,39 @@ def _wait_for_signal(state: Path, name: str, parent: int) -> None:
             sys.stderr.write(f"fake_adb: timed out waiting for signal {name!r}\n")
             sys.exit(_EXIT_WAIT_TIMEOUT)
         time.sleep(_POLL)
+
+
+# The grandchild of a ``hold_stdout`` step: argv is the signal path, the time
+# limit in seconds and the text to write once the signal exists (or at the limit).
+_HOLDER = """\
+import os, sys, time
+path, limit, text = sys.argv[1], float(sys.argv[2]), sys.argv[3]
+deadline = time.monotonic() + limit
+while not os.path.exists(path) and time.monotonic() < deadline:
+    time.sleep(0.005)
+sys.stdout.buffer.write(text.encode("utf-8"))
+sys.stdout.buffer.flush()
+"""
+
+
+def _hold_stdout(state: Path, spec: dict[str, str]) -> None:
+    """Start a grandchild that holds our stdout until a signal (see the module docs)."""
+    sys.stdout.buffer.flush()
+    signal_path = state / "signals" / spec["until"]
+    subprocess.Popen(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            _HOLDER,
+            str(signal_path),
+            str(_WAIT_TIMEOUT),
+            spec.get("then", ""),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=sys.stdout.fileno(),
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def _run_steps(state: Path, steps: list[dict[str, Any]], parent: int) -> None:
@@ -229,6 +288,8 @@ def _run_steps(state: Path, steps: list[dict[str, Any]], parent: int) -> None:
             _wait_for_signal(state, step["wait"], parent)
         elif "touch" in step:
             (state / "signals" / step["touch"]).touch()
+        elif "hold_stdout" in step:
+            _hold_stdout(state, step["hold_stdout"])
         else:
             sys.stderr.write(f"fake_adb: unknown step {step!r}\n")
             sys.exit(_EXIT_UNKNOWN_STEP)

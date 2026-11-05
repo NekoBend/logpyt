@@ -296,7 +296,7 @@ def test_only_the_fake_adb_is_spawned_with_path_emptied(
         return AsyncLogStream().adb_path
 
     assert asyncio.run(use_the_async_helpers()) == fake_adb.path
-    assert LogStream().adb_path == fake_adb.path
+    assert LogStream()._adb_path == fake_adb.path
     commands = ["devices", "wait-for-device", "connect", "wait-for-device", "connect"]
     assert [call["command"] for call in fake_adb.calls()] == commands
     assert [child.command for child in fake_adb.children()] == commands
@@ -852,7 +852,7 @@ def test_sync_wait_ends_on_ctrl_c_and_reaps_the_child(fake_adb: FakeAdb) -> None
 
 def test_runner_returns_the_exit_status_and_output(fake_adb: FakeAdb) -> None:
     """The runner reports a failure status; the parsers decide what it means."""
-    fake_adb.command("shell", run(out("o\n"), err("e\n"), exit_code=3))
+    fake_adb.date(run(out("o\n"), err("e\n"), exit_code=3))
     argv = adb._device_clock_argv(fake_adb.path, None)
 
     result = adb._run_adb(argv, timeout=TIMEOUT)
@@ -862,7 +862,7 @@ def test_runner_returns_the_exit_status_and_output(fake_adb: FakeAdb) -> None:
 
 
 def test_runner_decodes_invalid_utf8_with_replacement(fake_adb: FakeAdb) -> None:
-    fake_adb.command("shell", run(raw(b"\xff\xfe ok\r\n")))
+    fake_adb.date(run(raw(b"\xff\xfe ok\r\n")))
 
     result = adb._run_adb(adb._device_clock_argv(fake_adb.path, None), timeout=TIMEOUT)
 
@@ -873,7 +873,7 @@ def test_runner_decodes_invalid_utf8_with_replacement(fake_adb: FakeAdb) -> None
 async def test_async_runner_decodes_invalid_utf8_with_replacement(
     fake_adb: FakeAdb,
 ) -> None:
-    fake_adb.command("shell", run(raw(b"\xff\xfe ok\n"), err("e\n"), exit_code=1))
+    fake_adb.date(run(raw(b"\xff\xfe ok\n"), err("e\n"), exit_code=1))
     argv = adb._device_clock_argv(fake_adb.path, None)
 
     result = await adb._async_run_adb(argv, timeout=TIMEOUT)

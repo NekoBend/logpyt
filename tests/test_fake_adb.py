@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -15,13 +16,18 @@ import pytest
 
 from logpyt import adb
 from logpyt.exceptions import AdbError
+from logpyt.parsers import ParseContext, ThreadTimeLogParser
 from logpyt.streams import AsyncLogStream, LogStream
 from tests.conftest import (
     WATCHDOG_ENV,
     FakeAdb,
+    device_date,
     dumpsys_package,
     err,
+    hold_stdout,
     lines,
+    logcat_line,
+    not_found,
     out,
     raw,
     run,
@@ -29,6 +35,7 @@ from tests.conftest import (
     touch,
     wait,
     wait_until,
+    waiting_for_device,
 )
 
 if TYPE_CHECKING:
@@ -36,6 +43,7 @@ if TYPE_CHECKING:
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _FAKE_ADB_SCRIPT = Path(__file__).with_name("fake_adb.py")
+_DEVICE_FIXTURES = Path(__file__).with_name("fixtures") / "device"
 TIMEOUT = 10.0
 
 
@@ -158,6 +166,138 @@ def test_dumpsys_package_text_is_read_like_the_device_output(key: str) -> None:
     assert parse(absent) is None
 
 
+# -- the device clock, the state check and an absent device (design 3.2, 5.6) ---
+
+
+def _clock(fake: FakeAdb) -> int:
+    """The device clock the library's own clock read gets from the fake."""
+    argv = adb._device_clock_argv(fake.path, None)
+    return adb._parse_device_clock(adb._run_adb(argv, timeout=TIMEOUT))
+
+
+def _state(fake: FakeAdb, serial: str | None = None) -> str | None:
+    """The device state the library's own state check gets from the fake."""
+    argv = adb._get_state_argv(fake.path, serial)
+    return adb._parse_get_state(adb._run_adb(argv, timeout=TIMEOUT))
+
+
+def test_shell_date_answers_the_host_clock_unless_scripted(fake_adb: FakeAdb) -> None:
+    """Every stream connection reads the clock first, so the fake has an answer."""
+    fake_adb.command("default", run(err("fallback\n"), exit_code=4))
+    before = int(time.time())
+
+    answer = _clock(fake_adb)
+
+    assert before <= answer <= int(time.time())
+    assert [(c["command"], c["key"]) for c in fake_adb.calls()] == [("date", "date")]
+    assert fake_adb.children()[0].args == ("shell", "date", "+%s")
+
+
+def test_shell_date_runs_are_used_per_clock_read(fake_adb: FakeAdb) -> None:
+    fake_adb.date(
+        run(out(device_date(1_793_756_125))),
+        run(err("adb: device offline\n"), exit_code=1),
+    )
+
+    first = _clock(fake_adb)
+    with pytest.raises(AdbError, match="device offline"):
+        _clock(fake_adb)
+    with pytest.raises(AdbError, match="device offline"):
+        _clock(fake_adb)  # the last run repeats
+
+    assert first == 1_793_756_125
+    assert [call["index"] for call in fake_adb.calls("date")] == [0, 1, 2]
+
+
+def test_get_state_runs_answer_the_state_check(fake_adb: FakeAdb) -> None:
+    fake_adb.get_state(
+        run(out("device\n")),
+        run(err("error: device offline\n"), exit_code=1),
+        not_found("emulator-9999"),
+    )
+
+    states = [_state(fake_adb, "emulator-9999") for _ in range(3)]
+
+    assert states == ["device", "offline", None]
+    calls = fake_adb.calls("get-state")
+    assert [call["args"] for call in calls] == [
+        ["-s", "emulator-9999", "get-state"]
+    ] * 3
+
+
+def test_waiting_for_device_writes_its_notice_and_never_exits(
+    fake_adb: FakeAdb,
+) -> None:
+    """The hang of an adb that waits for an absent device: stderr only."""
+    fake_adb.logcat(waiting_for_device())
+    proc = subprocess.Popen(
+        [fake_adb.path, "-s", "emulator-9999", "logcat"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert proc.stderr is not None
+        notice = proc.stderr.readline()
+        with pytest.raises(subprocess.TimeoutExpired):
+            proc.wait(timeout=0.2)
+    finally:
+        _end(proc)
+    assert proc.stdout is not None
+    assert proc.stdout.read() == b""
+    assert notice == b"- waiting for device -\n"
+
+
+@pytest.mark.parametrize("level", ["api24", "api36"])
+def test_device_absent_answers_like_the_recorded_absent_serial(
+    fake_adb: FakeAdb, level: str
+) -> None:
+    """device_absent() reproduces R4_absent_serial.json (FINDINGS.md, check 4)."""
+    recording = _DEVICE_FIXTURES / level / "R4_absent_serial.json"
+    facts = json.loads(recording.read_text(encoding="utf-8"))["facts"]
+    serial = "emulator-9999"
+    fake_adb.device_absent(serial)
+
+    state = _adb(fake_adb, "-s", serial, "get-state")
+    date = _adb(fake_adb, "-s", serial, "shell", "date")
+    logcat = subprocess.Popen(
+        [fake_adb.path, "-s", serial, "logcat"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert logcat.stderr is not None
+        notice = logcat.stderr.readline().decode().rstrip("\n")
+        assert logcat.poll() is None
+    finally:
+        _end(logcat)
+
+    assert (state.returncode, state.stderr.decode().splitlines()) == (
+        facts["get_state"]["rc"],
+        facts["get_state"]["stderr"],
+    )
+    assert (date.returncode, date.stderr.decode().splitlines()) == (
+        facts["shell_date"]["rc"],
+        facts["shell_date"]["stderr"],
+    )
+    assert [notice] == facts["logcat_live"]["stderr"]
+    assert _state(fake_adb, serial) is None
+    with pytest.raises(AdbError, match="not found"):
+        _clock(fake_adb)
+
+
+def test_logcat_line_is_the_live_wire_format() -> None:
+    """The helper's lines parse as the U-1 format: year, usec, zone and uid."""
+    parser = ThreadTimeLogParser()
+    app = parser.parse(logcat_line("hi", uid=10065, pid=42, tag="App"), ParseContext())
+    system = parser.parse(logcat_line("sys", uid="root"), ParseContext())
+
+    assert app is not None
+    assert system is not None
+    assert (app.uid, app.pid, app.tag, app.message) == (10065, 42, "App", "hi")
+    assert app.timestamp.isoformat() == "2026-11-04T05:11:16.661446+00:00"
+    assert (system.uid, system.uid_raw) == (0, "root")
+
+
 def test_unconfigured_commands_exit_1_until_a_default_run_is_set(
     fake_adb: FakeAdb,
 ) -> None:
@@ -193,6 +333,29 @@ def test_wait_and_touch_synchronize_with_the_test(fake_adb: FakeAdb) -> None:
     finally:
         _end(proc)
     assert stdout == b"before\nafter\n"
+
+
+def test_hold_stdout_keeps_the_pipe_open_after_adb_exits(fake_adb: FakeAdb) -> None:
+    """A grandchild holds adb's stdout: the pipe ends only after it let go.
+
+    adb has exited before the release, so the text after it can only come
+    from the grandchild through the same pipe.
+    """
+    fake_adb.logcat(run(out("adb\n"), hold_stdout("go", then="grandchild\n")))
+    proc = subprocess.Popen(
+        [fake_adb.path, "logcat"], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL
+    )
+    try:
+        assert proc.wait(timeout=TIMEOUT) == 0
+        fake_adb.release("go")
+        assert proc.stdout is not None
+        stdout = proc.stdout.read()
+    finally:
+        fake_adb.release("go")
+        _end(proc)
+        if proc.stdout is not None:
+            proc.stdout.close()
+    assert stdout == b"adb\ngrandchild\n"
 
 
 def test_hang_runs_until_killed(fake_adb: FakeAdb) -> None:
@@ -256,24 +419,27 @@ def test_a_hanging_child_exits_once_its_parent_is_gone(fake_adb: FakeAdb) -> Non
 
 
 def test_sync_stream_reads_from_the_fake_adb(fake_adb: FakeAdb) -> None:
-    fake_adb.logcat(run(out(threadtime("hello")), wait("done")))
+    fake_adb.logcat(run(out(logcat_line("hello")), wait("done")))
     received: list[LogEntry] = []
     got_one = threading.Event()
 
-    def on_entry(entry: LogEntry, _handle: object) -> None:
+    def on_entry(entry: LogEntry) -> None:
         received.append(entry)
         got_one.set()
 
-    stream = LogStream(stdout_callback=on_entry)
+    stream = LogStream(on_item=on_entry)
     stream.start()
     try:
         assert got_one.wait(TIMEOUT)
+        stream.stop()
+        stream.join(timeout=TIMEOUT)
     finally:
         fake_adb.release("done")
-        stream.join(timeout=TIMEOUT)
+        stream.kill()
 
     assert [e.message for e in received] == ["hello"]
-    # Only that the spawn reached the fake: the library owns the rest of argv.
+    # The clock read, then the spawn: the library owns the rest of argv.
+    assert [call["command"] for call in fake_adb.calls()] == ["date", "logcat"]
     assert "logcat" in fake_adb.calls("logcat")[0]["args"]
 
 

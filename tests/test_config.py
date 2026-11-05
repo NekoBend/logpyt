@@ -272,6 +272,23 @@ def test_max_line_bytes_has_a_floor_of_4096() -> None:
 
 
 @pytest.mark.parametrize(
+    "value", [8192.0, "8192", b"8192", True], ids=["float", "str", "bytes", "bool"]
+)
+def test_max_line_bytes_takes_only_an_int(value: object) -> None:
+    """Like read_file(max_line_bytes=) (design A.19): no lax coercion to an int."""
+    _rejects(lambda: _config(max_line_bytes=value), "max_line_bytes")
+    _rejects(
+        lambda: StreamConfig.model_validate_json('{"max_line_bytes": "8192"}'),
+        "max_line_bytes",
+    )
+    assert _config(max_line_bytes=8192).max_line_bytes == 8192
+    assert (
+        StreamConfig.model_validate_json('{"max_line_bytes": 8192}').max_line_bytes
+        == 8192
+    )
+
+
+@pytest.mark.parametrize(
     "field", ["adb_path", "serial", "read_timeout", "stall_timeout", "reconnect"]
 )
 def test_optional_fields_accept_none(field: str) -> None:

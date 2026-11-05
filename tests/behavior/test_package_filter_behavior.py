@@ -1,33 +1,41 @@
-"""Behavior of package filtering and PID resolution, sync and async.
+"""Behavior of package filtering and package attribution, sync and async.
 
-A package filter keeps the lines whose pid belongs to the package. The stream
-learns that mapping from ``adb shell pidof <package>``, which the ``fake_adb``
-fixture answers per invocation (``fake_adb.pidof(pkg, run(...), ...)``).
+A package condition keeps the lines that belong to the package. These tests
+pin what a user of the public API relies on, so they must survive an internal
+rewrite: no private attributes, no mocked internals, only the ``fake_adb``
+fixture from ``tests/conftest.py``. Every lifecycle call and join is bounded;
+a missing precondition or a hang is reported with ``pytest.fail`` (or a
+``TimeoutError``) instead of an assertion.
 
-These tests pin what a user of the public API relies on, so they must survive
-an internal rewrite: no private attributes, no mocked internals, only the
-``fake_adb`` fixture from ``tests/conftest.py``. Known 2.0.x bugs are written
-for the correct behavior and marked ``xfail(strict=True, raises=AssertionError)``
-with their id from ``.docs/review-findings-2.0.1.md``. A missing precondition
-or a hang is reported with ``pytest.fail`` (or a ``TimeoutError``) instead of an
-assertion, so it fails the test rather than passing for the known bug.
+Sync: the 3.0 ``LogStream`` (ported, design 8.3). It attributes a line by the
+uid column of the live wire format (``-v uid``, ``logcat_line``): at start it
+looks each watched package up with ``adb shell dumpsys package <package>``
+(design 5.8, A.8), which the fixture answers per invocation
+(``fake_adb.dumpsys(pkg, run(out(dumpsys_package(pkg, uid))), ...)``), and
+intake stays closed until that answer (or ``package_hold``), so no line is
+read before the first lookup (F5-2). A line from an app uid it does not know
+asks for a re-lookup at once (rate-limited to 0.5 s per package, A.22). A
+restarted app keeps its uid (D-8); a reinstall changes it. The 2.x tests
+followed pids through ``adb shell pidof``; each sync test keeps the scenario
+its 2.x version pinned in those terms, and says where 3.0 changes the
+outcome. To know what the stream has read, a sync test watches
+``stream.stats``: once every line it logged was read and judged (delivered or
+filtered), the stream is stopped, the normal end of a 3.0 run (an adb that
+exits by itself is the run's AdbExitError outcome, design 3.2).
 
-Synchronization. A pidof invocation starts only after the previous one's
-answer has been applied (the library polls one lookup at a time), so a
-``touch`` in the SECOND pidof run is the signal that the FIRST answer is in
-effect; the fake logcat waits on it before logging lines that must already
-resolve. To know what the stream has read, a test watches a
-``ThreadTimeLogParser`` subclass passed through the public ``parser`` argument
-(the ``LogParser`` protocol's ``parse``). Lines are parsed,
-filtered and queued in order, so once a sentinel line is parsed every earlier
-line has been through the package filter. That sentinel gates the next step:
-a held pidof answer is released only after the stream parsed the startup
-backlog, and the fake logcat stays open (``wait("done")``) until the lines a
-test asserts on were parsed, so the sync reader's EOF defect (F1-1) cannot
-drop them. Only then does logcat exit 0 and the test join the stream, which
-delivers everything it read. Which fake adb children were spawned, and in
-what order, comes from the fixture's registry (``fake_adb.children()``).
-Every lifecycle call and join is bounded.
+Async: still the 2.x ``AsyncLogStream`` until PR-13 (design 8.1), so its tests
+keep the 2.x API, pid lookups and their strict xfails. A pidof invocation
+starts only after the previous one's answer has been applied (the library
+polls one lookup at a time), so a ``touch`` in the SECOND pidof run is the
+signal that the FIRST answer is in effect; the fake logcat waits on it before
+logging lines that must already resolve. To know what the stream has read, an
+async test watches a ``ThreadTimeLogParser`` subclass passed through the 2.x
+``parser`` argument. Lines are parsed, filtered and queued in order, so once a
+sentinel line is parsed every earlier line has been through the package
+filter. The fake logcat stays open (``wait("done")``) until the lines a test
+asserts on were parsed; only then does logcat exit 0 and the test join the
+stream. Which fake adb children were spawned, and in what order, comes from
+the fixture's registry (``fake_adb.children()``).
 """
 
 from __future__ import annotations
@@ -44,6 +52,7 @@ from logpyt import (
     AsyncLogStream,
     Filter,
     LogStream,
+    StreamConfig,
     ThreadTimeLogParser,
     read_file,
 )
@@ -51,6 +60,8 @@ from logpyt.filters import Condition, Level, MessageContains, Package, Tag
 from tests.conftest import (
     FakeAdb,
     async_wait_until,
+    dumpsys_package,
+    logcat_line,
     out,
     run,
     threadtime,
@@ -65,7 +76,7 @@ if TYPE_CHECKING:
 
     from logpyt.models import LogEntry
     from logpyt.parsers import ParseContext
-    from logpyt.streams import AsyncStreamHandle, StreamHandle
+    from logpyt.streams import AsyncStreamHandle
     from tests.conftest import Step
 
 # Upper bound for every wait, join and lifecycle call. A healthy run finishes far
@@ -78,18 +89,20 @@ TIMEOUT = 10.0
 # guess cannot make a test pass, it only shortens the wait.
 GRACE = 1.0
 
-# How long the backlog tests wait for the stream to parse logcat's startup
-# backlog once it is in the pipe and the first lookup is in flight (held). A
-# 2.0.0 stream, whose readers run before the lookup is spawned, parses it
-# within milliseconds. A stream that looks the package up before it reads
-# (F5-2's planned fix) never does until the answer, and gives a held lookup up
-# after its own limit (2.0.0's pidof timeout is 5 s; the 3.0.0 design's
-# ``package_hold`` is 2 s), so this must stay below both.
+# How long the async backlog test waits for the stream to parse logcat's
+# startup backlog once it is in the pipe and the first lookup is in flight
+# (held). A 2.0.0 stream, whose readers run before the lookup is spawned,
+# parses it within milliseconds. A stream that looks the package up before it
+# reads (F5-2's planned fix) never does until the answer, and gives a held
+# lookup up after its own limit (2.0.0's pidof timeout is 5 s; the 3.0.0
+# design's ``package_hold`` is 2 s), so this must stay below both.
 READ_GRACE = 1.0
 
 # How long a test waits for the stream to look the package up again after the
-# app logged under a pid it does not know. A fixed stream does that within a
-# fraction of a second; a 2.0.0 stream waits for the backed-off poll (F5-2).
+# app logged under a pid (async) or a uid (sync) it does not know. A fixed
+# stream does that within a fraction of a second (sync: at most 0.5 s after
+# the previous lookup of the package, A.22); a 2.0.0 stream waits for the
+# backed-off poll (F5-2).
 REPOLL_GRACE = 2.0
 
 POLL_INTERVAL = 0.1  # the smallest pid_poll_interval the library allows
@@ -102,18 +115,30 @@ PACKAGE = "com.example"
 APP_PID = 1234
 NEW_PID = 4321  # the same app after a restart
 OTHER_PID = 5678  # some other app's process
+APP_UID = 10065  # the package's uid (sync)
+NEW_UID = 10123  # its uid after a reinstall
+OTHER_UID = 10099  # some other app's uid
 
 FILLER = "filler"
 BACKLOG = ["backlog 1", "backlog 2", "backlog 3"]
 
 # Every gate a fake adb may be blocked on; teardown opens all of them so no fake
 # adb child outlives the test waiting for a signal.
-_GATES = ("resolved", "answer", "restart", "restarted", "launched", "done")
+_GATES = (
+    "resolved",
+    "answer",
+    "restart",
+    "restarted",
+    "live",
+    "reinstall",
+    "done",
+)
 
 
 def _line(
     message: str, *, pid: int = APP_PID, level: str = "I", tag: str = "App"
 ) -> Step:
+    """A 2.x ``threadtime`` line, without a uid column (the async tests)."""
     return out(threadtime(message, pid=pid, tid=pid, level=level, tag=tag))
 
 
@@ -124,6 +149,28 @@ def _filler() -> Step:
 
 def _pid(pid: int) -> Step:
     return out(f"{pid}\n")
+
+
+def _uid_line(
+    message: str,
+    *,
+    uid: int = APP_UID,
+    pid: int = APP_PID,
+    level: str = "I",
+    tag: str = "App",
+) -> Step:
+    """A line of the live wire format, with its uid column (the sync tests)."""
+    return out(logcat_line(message, uid=uid, pid=pid, level=level, tag=tag))
+
+
+def _uid_filler() -> Step:
+    """A line from another app's uid, logged last (the sync tests)."""
+    return _uid_line(FILLER, uid=OTHER_UID, pid=OTHER_PID)
+
+
+def _installed(uid: int | None = APP_UID) -> Step:
+    """The output of ``dumpsys package PACKAGE`` for an install with ``uid``."""
+    return out(dumpsys_package(PACKAGE, uid))
 
 
 def _resolve_steadily(fake: FakeAdb) -> None:
@@ -149,7 +196,7 @@ def _restart_once(fake: FakeAdb) -> None:
 def _logcat_until_parsed(fake: FakeAdb, *steps: Step) -> None:
     """Logcat runs ``steps``, logs the ``FILLER`` sentinel and stays open until "done".
 
-    Pair it with a ``_ParseWatcher(FILLER)`` and ``_end_logcat_once_parsed``.
+    Pair it with a ``_ParseWatcher(FILLER)`` and ``_end_logcat_once_parsed_async``.
     """
     fake.logcat(run(*steps, _filler(), wait("done")))
 
@@ -208,9 +255,9 @@ class _Recorded:
 
 
 class _Collector(_Recorded):
-    """A sync data callback that records every entry it receives."""
+    """A sync ``on_item`` callback that records every entry it receives."""
 
-    def __call__(self, entry: LogEntry, _handle: StreamHandle) -> None:
+    def __call__(self, entry: LogEntry) -> None:
         self.entries.append(entry)
 
     def received(self, message: str) -> bool:
@@ -312,22 +359,21 @@ def _backoff_factor(*, backed_off: bool) -> float:
 
 
 def _start_sync(
-    filter_by: Condition,
+    where: Condition,
     collector: _Collector,
     *,
-    parser: ThreadTimeLogParser | None = None,
-    device_id: str | None = None,
-    backed_off: bool = False,
-) -> LogStream:
-    stream = LogStream(
-        device_id=device_id,
-        parser=parser,
-        filter_by=filter_by,
-        stdout_callback=collector,
-        pid_poll_interval=POLL_INTERVAL,
-        pid_poll_backoff_factor=_backoff_factor(backed_off=backed_off),
-        pid_max_poll_interval=BACKED_OFF_INTERVAL,
-    )
+    serial: str | None = None,
+    package_hold: float = 2.0,
+) -> LogStream[LogEntry]:
+    """Start a 3.0 ``LogStream`` with ``where`` and ``collector`` as ``on_item``.
+
+    2.x ``filter_by``/``device_id`` are ``where``/``StreamConfig.serial``
+    (design 2.2, 2.3); its pid poll settings have no counterpart (D-8). A
+    test whose lines wait for a lookup passes a ``package_hold`` that a slow
+    machine cannot exceed, so the lookup's timing never decides the outcome.
+    """
+    config = StreamConfig(serial=serial, package_hold=package_hold)
+    stream = LogStream(config, where=where, on_item=collector)
     _bounded(stream.start, "start()")
     return stream
 
@@ -351,7 +397,7 @@ async def _start_async(
     return stream
 
 
-def _join(stream: LogStream) -> None:
+def _join(stream: LogStream[LogEntry]) -> None:
     """Join the stream (bounded); it must end without an error."""
     _bounded(stream.join, "join()")
 
@@ -361,7 +407,7 @@ async def _join_async(stream: AsyncLogStream) -> None:
     await _bounded_async(stream.join(), "join()")
 
 
-def _shutdown(fake: FakeAdb, stream: LogStream) -> None:
+def _shutdown(fake: FakeAdb, stream: LogStream[LogEntry]) -> None:
     """Open every gate, then stop the stream and join it, both bounded."""
     for gate in _GATES:
         fake.release(gate)
@@ -377,21 +423,35 @@ async def _shutdown_async(fake: FakeAdb, stream: AsyncLogStream) -> None:
     await _join_async(stream)
 
 
-def _end_logcat_once_parsed(fake: FakeAdb, watcher: _ParseWatcher) -> None:
-    """Let the fake logcat exit 0 once the stream has parsed the sentinel line.
+def _all_judged(stream: LogStream[LogEntry], count: int) -> None:
+    """Wait until the stream has read ``count`` lines and judged each of them.
 
-    Every line logged before the sentinel has then been read and filtered, so
-    the sync reader's EOF defect (F1-1: it stops at process exit and drops what
-    is still in the pipe) cannot drop one, and the join that follows delivers
-    them all.
+    A judged line was delivered to the consumer or filtered out, so nothing
+    the test logged is still held for its package; the stop that follows
+    changes no verdict. Fails (never xfails) when that takes ``TIMEOUT``.
     """
-    if not watcher.parsed.wait(TIMEOUT):
-        pytest.fail(_not_parsed(watcher))
-    fake.release("done")
+    try:
+        wait_until(
+            lambda: (
+                (stats := stream.stats).lines == count
+                and stats.delivered + stats.filtered == count
+            ),
+            timeout=TIMEOUT,
+        )
+    except TimeoutError:
+        pytest.fail(
+            f"precondition: the stream did not judge {count} lines: {stream.stats}"
+        )
 
 
 async def _end_logcat_once_parsed_async(fake: FakeAdb, watcher: _ParseWatcher) -> None:
-    """Async variant of ``_end_logcat_once_parsed``."""
+    """Let the fake logcat exit 0 once the stream has parsed the sentinel line.
+
+    Every line logged before the sentinel has then been read and filtered, so
+    the reader's EOF defect (F1-1: it stops at process exit and drops what is
+    still in the pipe) cannot drop one, and the join that follows delivers
+    them all.
+    """
     if not await _parsed_within(watcher, TIMEOUT):
         pytest.fail(_not_parsed(watcher))
     fake.release("done")
@@ -400,7 +460,7 @@ async def _end_logcat_once_parsed_async(fake: FakeAdb, watcher: _ParseWatcher) -
 # -- signals the test gives the fake adb ----------------------------------------------
 
 
-def _unblock_if_never_looked_up(fake: FakeAdb) -> None:
+async def _unblock_if_never_looked_up_async(fake: FakeAdb) -> None:
     """Open the "resolved" gate when the stream never looks the package up (F5-1).
 
     A stream that monitors the package starts its first pidof together with
@@ -408,15 +468,6 @@ def _unblock_if_never_looked_up(fake: FakeAdb) -> None:
     once logcat was spawned and ``GRACE`` passes with no lookup, the test opens
     the gate so the assertion shows what the stream delivered.
     """
-    wait_until(lambda: fake.children("logcat"), timeout=TIMEOUT)
-    try:
-        wait_until(lambda: fake.children("pidof"), timeout=GRACE)
-    except TimeoutError:
-        fake.release("resolved")
-
-
-async def _unblock_if_never_looked_up_async(fake: FakeAdb) -> None:
-    """Async variant of ``_unblock_if_never_looked_up``."""
     await async_wait_until(lambda: fake.children("logcat"), timeout=TIMEOUT)
     try:
         await async_wait_until(lambda: fake.children("pidof"), timeout=GRACE)
@@ -429,7 +480,9 @@ def _after_restart_is_known(fake: FakeAdb, collector: _Recorded) -> bool:
     return _signalled(fake, "restarted") or "after 1" in collector.messages()
 
 
-def _unblock_after_restart(fake: FakeAdb, collector: _Collector) -> None:
+async def _unblock_after_restart_async(
+    fake: FakeAdb, collector: _AsyncCollector
+) -> None:
     """Open the "restarted" gate once the stream knows ``NEW_PID``, or never will.
 
     A stream that looks the package up again soon after the app logged under
@@ -439,20 +492,6 @@ def _unblock_after_restart(fake: FakeAdb, collector: _Collector) -> None:
     stream that looked up again but shows neither sign gets the gate opened
     after ``TIMEOUT``, by when that lookup's answer is long in effect.
     """
-    try:
-        wait_until(lambda: _repolled(fake), timeout=REPOLL_GRACE)
-    except TimeoutError:
-        fake.release("restarted")
-        return
-    with contextlib.suppress(TimeoutError):
-        wait_until(lambda: _after_restart_is_known(fake, collector), timeout=TIMEOUT)
-    fake.release("restarted")
-
-
-async def _unblock_after_restart_async(
-    fake: FakeAdb, collector: _AsyncCollector
-) -> None:
-    """Async variant of ``_unblock_after_restart``."""
     try:
         await async_wait_until(lambda: _repolled(fake), timeout=REPOLL_GRACE)
     except TimeoutError:
@@ -493,7 +532,9 @@ def _backlog_logcat(fake: FakeAdb) -> None:
     )
 
 
-def _answer_once_backlog_parsed(fake: FakeAdb, watcher: _ParseWatcher) -> bool:
+async def _answer_once_backlog_parsed_async(
+    fake: FakeAdb, watcher: _ParseWatcher
+) -> bool:
     """Release the held pidof answers once the stream has parsed logcat's backlog.
 
     Returns True when the stream parsed the backlog while every lookup was
@@ -503,21 +544,6 @@ def _answer_once_backlog_parsed(fake: FakeAdb, watcher: _ParseWatcher) -> bool:
     first), or ``READ_GRACE`` after the backlog was in the pipe with the lookup
     in flight and still not parsed.
     """
-    wait_until(lambda: _first_spawned(fake), timeout=TIMEOUT)
-    if _first_spawned(fake) == "pidof":
-        fake.release("answer")
-        return False
-    fake.wait_for("backlog", timeout=TIMEOUT)
-    wait_until(lambda: fake.children("pidof"), timeout=TIMEOUT)
-    raced = watcher.parsed.wait(READ_GRACE)
-    fake.release("answer")
-    return raced
-
-
-async def _answer_once_backlog_parsed_async(
-    fake: FakeAdb, watcher: _ParseWatcher
-) -> bool:
-    """Async variant of ``_answer_once_backlog_parsed``."""
     await async_wait_until(lambda: _first_spawned(fake), timeout=TIMEOUT)
     if _first_spawned(fake) == "pidof":
         fake.release("answer")
@@ -546,8 +572,9 @@ def _restart_logcat(fake: FakeAdb) -> None:
     )
 
 
-# D-8 (buffer lines of not-yet-resolved pids) is open: a fixed stream may drop
-# or keep "after 1", the first line logged before any lookup saw the restart.
+# D-8 (buffer lines of not-yet-resolved pids) is open for the 2.x async stream:
+# a fixed stream may drop or keep "after 1", the first line logged before any
+# lookup saw the restart. The sync stream settles it (A.22 D2, see its test).
 _RESTART_DELIVERIES = (["before", "after 2"], ["before", "after 1", "after 2"])
 
 
@@ -592,16 +619,18 @@ def _runs_one_plain_command(words: list[str], package: str) -> bool:
 
 
 def test_filter_package_delivers_only_that_packages_lines(fake_adb: FakeAdb) -> None:
-    """Filter(package=...) delivers exactly the lines whose pid belongs to the package,
+    """Filter(package=...) delivers exactly the lines whose uid belongs to the package,
     each with its package set to it.
+
+    2.x gated the lines on its second pid lookup; 3.0 reads nothing before the
+    first lookup answered (F5-2), so the lines follow at once.
     """
-    _resolve_steadily(fake_adb)
+    fake_adb.dumpsys(PACKAGE, run(_installed()))
     fake_adb.logcat(
         run(
-            wait("resolved"),
-            _line("mine 1"),
-            _line("theirs", pid=OTHER_PID),
-            _line("mine 2"),
+            _uid_line("mine 1"),
+            _uid_line("theirs", uid=OTHER_UID, pid=OTHER_PID),
+            _uid_line("mine 2"),
             wait("done"),
         )
     )
@@ -622,25 +651,25 @@ def test_advanced_filter_package_condition_delivers_that_packages_lines(
     package set, like Filter(package=...) does (F5-1; 2.x wrapped it in the removed
     AdvancedFilter).
     """
-    _resolve_steadily(fake_adb)
-    _logcat_until_parsed(
-        fake_adb,
-        wait("resolved"),
-        _line("mine 1"),
-        _line("theirs", pid=OTHER_PID),
-        _line("mine 2"),
+    fake_adb.dumpsys(PACKAGE, run(_installed()))
+    fake_adb.logcat(
+        run(
+            _uid_line("mine 1"),
+            _uid_line("theirs", uid=OTHER_UID, pid=OTHER_PID),
+            _uid_line("mine 2"),
+            _uid_filler(),
+            wait("done"),
+        )
     )
-    watcher = _ParseWatcher(FILLER)
     collector = _Collector()
-    stream = _start_sync(Package(PACKAGE), collector, parser=watcher)
+    stream = _start_sync(Package(PACKAGE), collector)
     try:
-        _unblock_if_never_looked_up(fake_adb)
-        _end_logcat_once_parsed(fake_adb, watcher)
-        _join(stream)
+        _all_judged(stream, 4)
     finally:
         _shutdown(fake_adb, stream)
 
     assert collector.delivered() == [("mine 1", PACKAGE), ("mine 2", PACKAGE)]
+    assert stream.stats.unattributed == 0
 
 
 def test_advanced_filter_package_combination_delivers_the_matching_lines(
@@ -649,116 +678,128 @@ def test_advanced_filter_package_combination_delivers_the_matching_lines(
     """(Package(...) & Level("E")) | MessageContains(...), the README's shape, delivers
     the package's error lines and anyone's matching message, nothing else (F5-1).
     """
-    _resolve_steadily(fake_adb)
-    _logcat_until_parsed(
-        fake_adb,
-        wait("resolved"),
-        _line("mine info", level="I"),
-        _line("mine error", level="E"),
-        _line("theirs error", pid=OTHER_PID, level="E"),
-        _line("theirs CRITICAL", pid=OTHER_PID, level="I"),
+    fake_adb.dumpsys(PACKAGE, run(_installed()))
+    fake_adb.logcat(
+        run(
+            _uid_line("mine info", level="I"),
+            _uid_line("mine error", level="E"),
+            _uid_line("theirs error", uid=OTHER_UID, pid=OTHER_PID, level="E"),
+            _uid_line("theirs CRITICAL", uid=OTHER_UID, pid=OTHER_PID, level="I"),
+            _uid_filler(),
+            wait("done"),
+        )
     )
-    watcher = _ParseWatcher(FILLER)
     collector = _Collector()
     condition = (Package(PACKAGE) & Level("E")) | MessageContains("CRITICAL")
-    stream = _start_sync(condition, collector, parser=watcher)
+    stream = _start_sync(condition, collector)
     try:
-        _unblock_if_never_looked_up(fake_adb)
-        _end_logcat_once_parsed(fake_adb, watcher)
-        _join(stream)
+        _all_judged(stream, 5)
     finally:
         _shutdown(fake_adb, stream)
 
-    assert collector.messages() == ["mine error", "theirs CRITICAL"]
+    assert collector.delivered() == [("mine error", PACKAGE), ("theirs CRITICAL", None)]
 
 
 def test_package_under_not_in_an_or_is_looked_up(fake_adb: FakeAdb) -> None:
     """A Package anywhere in the condition is looked up, here under Not inside an Or,
     so the package's lines are attributed and left out (F5-1).
     """
-    _resolve_steadily(fake_adb)
-    _logcat_until_parsed(
-        fake_adb,
-        wait("resolved"),
-        _line("mine"),
-        _line("theirs", pid=OTHER_PID),
+    fake_adb.dumpsys(PACKAGE, run(_installed()))
+    fake_adb.logcat(
+        run(
+            _uid_line("mine"),
+            _uid_line("theirs", uid=OTHER_UID, pid=OTHER_PID),
+            _uid_filler(),
+            wait("done"),
+        )
     )
-    watcher = _ParseWatcher(FILLER)
     collector = _Collector()
-    stream = _start_sync(Tag("nothing") | ~Package(PACKAGE), collector, parser=watcher)
+    stream = _start_sync(Tag("nothing") | ~Package(PACKAGE), collector)
     try:
-        _unblock_if_never_looked_up(fake_adb)
-        _end_logcat_once_parsed(fake_adb, watcher)
-        _join(stream)
+        _all_judged(stream, 3)
     finally:
         _shutdown(fake_adb, stream)
 
-    assert {child.args[-1] for child in fake_adb.children("pidof")} == {PACKAGE}
+    assert {child.args[-1] for child in fake_adb.children("dumpsys")} == {PACKAGE}
     assert collector.delivered() == [("theirs", None), (FILLER, None)]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="F5-2: lines read before the first PID lookup finishes are dropped "
-    "(the startup backlog)",
-)
 def test_backlog_before_the_first_pid_lookup_is_delivered(fake_adb: FakeAdb) -> None:
     """The package's lines that logcat prints at once on start (its ring-buffer backlog)
-    are delivered even though no PID lookup has finished yet (F5-2).
+    are delivered, attributed, although no lookup had answered when adb printed
+    them (F5-2).
 
-    Every pidof answer is held until the stream has parsed the backlog, so a
-    stream that reads while it looks up always reads the backlog first; one
-    that looks up before reading gets the answer (``_answer_once_backlog_parsed``).
+    The lookup's answer is held until the backlog is in adb's pipe. 3.0 reads
+    nothing before that answer (intake stays closed until the first lookup
+    returns or ``package_hold`` expires, design 5.8), so the backlog is
+    attributed; a stream that read while it looked up would have judged the
+    backlog without its package. The live line follows once the backlog was
+    delivered.
     """
-    _backlog_logcat(fake_adb)
-    watcher = _ParseWatcher(FILLER)
+    fake_adb.dumpsys(PACKAGE, run(wait("answer"), _installed()))
+    fake_adb.logcat(
+        run(
+            *(_uid_line(message) for message in BACKLOG),
+            _uid_filler(),
+            touch("backlog"),
+            wait("live"),
+            _uid_line("live"),
+            wait("done"),
+        )
+    )
     collector = _Collector()
-    stream = _start_sync(Filter(package=PACKAGE), collector, parser=watcher)
-    raced = False
+    stream = _start_sync(Filter(package=PACKAGE), collector, package_hold=TIMEOUT)
+    read_while_held = -1
     try:
-        raced = _answer_once_backlog_parsed(fake_adb, watcher)
+        fake_adb.wait_for("backlog", timeout=TIMEOUT)
+        wait_until(lambda: fake_adb.children("dumpsys"), timeout=TIMEOUT)
+        read_while_held = stream.stats.lines
+        fake_adb.release("answer")
+        _require_delivered(collector, BACKLOG[-1])
+        fake_adb.release("live")
         _require_delivered(collector, "live")
     finally:
         _shutdown(fake_adb, stream)
 
-    assert collector.messages() == [*BACKLOG, "live"], (
-        f"backlog parsed while every lookup was held: {raced}"
-    )
+    assert read_while_held == 0  # intake stays closed until the first answer
+    assert collector.delivered() == [(m, PACKAGE) for m in [*BACKLOG, "live"]]
+    assert stream.stats.unattributed == 0
 
 
 def test_app_launched_after_start_is_picked_up(fake_adb: FakeAdb) -> None:
-    """An app that is not running when the stream starts (pidof finds nothing) has its
-    lines delivered once a later PID poll finds it.
+    """An app that is not installed when the stream starts (the lookup finds nothing)
+    has its lines delivered once a later lookup finds it.
+
+    The first line from the app's uid, unknown then, is held and asks for the
+    re-lookup that finds it (design 5.8), so no line of it is lost.
     """
-    fake_adb.pidof(
-        PACKAGE,
-        run(exit_code=1),  # pidof's answer while no such process exists
-        run(_pid(APP_PID)),
-        run(touch("launched"), _pid(APP_PID)),
-    )
-    fake_adb.logcat(run(wait("launched"), _line("hello"), wait("done")))
+    fake_adb.dumpsys(PACKAGE, run(_installed(None)), run(_installed()))
+    fake_adb.logcat(run(_uid_line("hello"), wait("done")))
     collector = _Collector()
-    stream = _start_sync(Filter(package=PACKAGE), collector)
+    stream = _start_sync(Filter(package=PACKAGE), collector, package_hold=TIMEOUT)
     try:
         assert collector.received("hello")
     finally:
         _shutdown(fake_adb, stream)
 
     assert collector.delivered() == [("hello", PACKAGE)]
+    assert len(fake_adb.calls("dumpsys")) >= 2
+    assert stream.stats.unattributed == 0
 
 
 def test_restarted_app_is_followed_to_its_new_pid(fake_adb: FakeAdb) -> None:
-    """After the app restarts under a new pid, its new-pid lines are delivered once a
-    PID poll has seen the restart.
+    """After the app restarts under a new pid, its new-pid lines are delivered.
+
+    Changed in 3.0: lines are attributed by uid, which a restart keeps (D-8),
+    so the new pid's lines are the package's at once and no lookup follows
+    the restart.
     """
-    _restart_once(fake_adb)
+    fake_adb.dumpsys(PACKAGE, run(_installed()))
     fake_adb.logcat(
         run(
-            wait("resolved"),
-            _line("before"),
-            wait("restarted"),
-            _line("after", pid=NEW_PID),
+            _uid_line("before"),
+            wait("restart"),
+            _uid_line("after", pid=NEW_PID),
             wait("done"),
         )
     )
@@ -772,58 +813,74 @@ def test_restarted_app_is_followed_to_its_new_pid(fake_adb: FakeAdb) -> None:
         _shutdown(fake_adb, stream)
 
     assert collector.delivered() == [("before", PACKAGE), ("after", PACKAGE)]
+    assert len(fake_adb.calls("dumpsys")) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="F5-2: once PID polling has backed off, a restarted app's lines are "
-    "dropped until the next scheduled poll",
-)
 def test_restarted_app_is_picked_up_without_waiting_for_a_backed_off_poll(
     fake_adb: FakeAdb,
 ) -> None:
-    """When the app restarts after PID polling has backed off, its new-pid lines are
-    delivered within seconds, not after the backed-off poll interval (F5-2).
+    """When the app comes back under a uid the stream does not know, its lines are
+    delivered within seconds, without waiting for a scheduled lookup (F5-2).
 
-    Whether the first new-pid line, logged before any lookup saw the restart, is
-    kept is open (D-8); only a later one is required.
+    3.0 has no lookup poll to back off: the first line from an unknown app uid
+    asks for a re-lookup at once (at most 0.5 s after the previous one, A.22).
+    A restart keeps the uid (D-8), so the 3.0 form of this scenario is a
+    reinstall under a new uid while the package is mapped. That first line
+    ("after 1") is not held (D-8) and, matching nothing without its package,
+    is filtered out; the answer that names its uid counts it in
+    ``stats.unattributed`` (A.22 D2, which settles the D-8 question the 2.x
+    test left open). The next line ("after 2") is the package's.
     """
-    _restart_logcat(fake_adb)
-    watcher = _ParseWatcher(FILLER)
-    collector = _Collector()
-    stream = _start_sync(
-        Filter(package=PACKAGE), collector, parser=watcher, backed_off=True
+    fake_adb.dumpsys(PACKAGE, run(_installed()), run(_installed(NEW_UID)))
+    fake_adb.logcat(
+        run(
+            _uid_line("before"),
+            wait("reinstall"),
+            _uid_line("after 1", uid=NEW_UID, pid=NEW_PID),
+            wait("restarted"),
+            _uid_line("after 2", uid=NEW_UID, pid=NEW_PID),
+            _uid_filler(),
+            wait("done"),
+        )
     )
+    collector = _Collector()
+    stream = _start_sync(Filter(package=PACKAGE), collector)
     try:
-        # "before" follows the 2nd lookup, which found nothing new: from here
-        # the next scheduled poll is BACKED_OFF_INTERVAL away.
         _require_delivered(collector, "before")
-        fake_adb.release("restart")
-        _unblock_after_restart(fake_adb, collector)
-        _end_logcat_once_parsed(fake_adb, watcher)
-        _join(stream)
+        fake_adb.release("reinstall")
+        try:
+            wait_until(lambda: stream.stats.unattributed == 1, timeout=REPOLL_GRACE)
+            picked_up = True
+        except TimeoutError:
+            picked_up = False
+        fake_adb.release("restarted")
+        _all_judged(stream, 4)
     finally:
         _shutdown(fake_adb, stream)
 
-    assert collector.messages() in _RESTART_DELIVERIES
+    assert picked_up, f"no re-lookup answer within {REPOLL_GRACE} s: {stream.stats}"
+    assert collector.delivered() == [("before", PACKAGE), ("after 2", PACKAGE)]
+    assert stream.stats.unattributed == 1
 
 
 def test_pid_lookup_queries_the_selected_device(fake_adb: FakeAdb) -> None:
-    """With device_id set, every PID lookup goes to that device (adb -s <serial>), not
-    to whichever device adb would pick.
+    """With a serial set, every package lookup goes to that device (adb -s <serial>),
+    not to whichever device adb would pick.
+
+    2.x ``device_id`` is ``StreamConfig.serial``, and the pid lookup is the
+    uid lookup (design 5.8).
     """
     serial = "emulator-5554"
-    fake_adb.pidof(PACKAGE, run(touch("resolved"), _pid(APP_PID)))
+    fake_adb.dumpsys(PACKAGE, run(touch("looked up"), _installed()))
     fake_adb.logcat(run(wait("done")))
     collector = _Collector()
-    stream = _start_sync(Filter(package=PACKAGE), collector, device_id=serial)
+    stream = _start_sync(Filter(package=PACKAGE), collector, serial=serial)
     try:
-        fake_adb.wait_for("resolved", timeout=TIMEOUT)
+        fake_adb.wait_for("looked up", timeout=TIMEOUT)
     finally:
         _shutdown(fake_adb, stream)
 
-    lookups = [child.args for child in fake_adb.children("pidof")]
+    lookups = [child.args for child in fake_adb.children("dumpsys")]
     assert lookups
     assert all(args[:2] == ("-s", serial) for args in lookups), lookups
 

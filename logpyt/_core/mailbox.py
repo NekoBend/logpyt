@@ -355,9 +355,9 @@ class Outbox:
         applies, or a ``BaseException`` that is not a callback failure
         (``KeyboardInterrupt``, a real cancellation) interrupted it and the
         consumer asked for the next record. Never for a record whose callback
-        raised, nor for an item skipped under the kill flag (F2-7): that one
-        stays unsettled, so the core cannot end the run STOPPED before its
-        `CallbackFailed` or `KillRequest`.
+        raised: it stays unsettled, so the core cannot end the run STOPPED
+        before its `CallbackFailed`. Under the kill flag (F2-7) the consumer
+        takes no item, so none is settled before the `KillRequest`.
 
         Raises:
             RuntimeError: No record is in hand.
@@ -373,9 +373,9 @@ class Outbox:
         """Take the next record, or None when none waits.
 
         A record still in hand that was not settled stays unsettled for good;
-        a conforming consumer settles first, pops on past an item it skipped
-        under the kill flag (F2-7) on purpose, and after its own failure pops
-        nothing more (design A.21).
+        a conforming consumer settles first, takes no item under the kill
+        flag (F2-7), and after its own failure pops nothing more (design
+        A.21).
         """
         if not self._queue:
             return None
@@ -467,8 +467,8 @@ class ControlInbox:
     the kill and the kill before the stop. In STOPPING(drain) a report can
     itself end the run STOPPED (design A.21), so a waiting kill, handed over
     after it even when posted first, changes nothing; that STOPPED is
-    truthful because a consumer settles only the records it finished with,
-    never an item it skipped under the kill flag (`Outbox.done`). The stop
+    truthful because a consumer settles only the records it finished with
+    and takes no item under the kill flag (`Outbox.done`). The stop
     comes before the detach, so a raced ``stop(flush=...)`` still sets
     ``flush_failed`` as it would alone. A
     result that waits together with a request is taken after it, even if it

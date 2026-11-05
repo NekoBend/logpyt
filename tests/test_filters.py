@@ -12,6 +12,7 @@ import pytest
 
 import logpyt
 from logpyt import filters
+from logpyt.config import StreamConfig
 from logpyt.filters import (
     And,
     AnrCondition,
@@ -869,14 +870,19 @@ def test_combinations_keep_children_that_override_packages() -> None:
 def test_streams_monitor_nested_overrides(
     stream_type: type[LogStream | AsyncLogStream],
 ) -> None:
-    """The 2.x streams start a pid monitor for the packages that overrides of
-    packages() name anywhere in the condition, not only at its root.
+    """The streams watch the packages that overrides of packages() name
+    anywhere in the condition, not only at its root: LogStream's core
+    attributes them (design 5.8), the 2.x AsyncLogStream starts a pid monitor.
     """
     condition = (_App("com.a") & Level("E")) | ~Where(_App("com.b"))
-    stream = stream_type(adb_path="adb", filter_by=condition)
-    monitor = stream._pid_monitor
-    assert monitor is not None
-    assert sorted(monitor.packages) == ["com.a", "com.b"]
+    if stream_type is LogStream:
+        stream = LogStream(StreamConfig(adb_path="adb"), where=condition)
+        watched = stream._run.core._attribution._packages
+    else:
+        monitor = AsyncLogStream(adb_path="adb", filter_by=condition)._pid_monitor
+        assert monitor is not None
+        watched = monitor.packages
+    assert sorted(watched) == ["com.a", "com.b"]
 
 
 class _Once(Condition):
@@ -1474,9 +1480,9 @@ def test_repr_shows_the_tree() -> None:
 
 
 def test_entry_points_take_any_condition(tmp_path: Path) -> None:
-    """LogStream, AsyncLogStream (filter_by=) and read_file (where=) take any
-    Condition; a bare function raises TypeError that points to Where, read_file
-    when it is called.
+    """LogStream (where=), the 2.x AsyncLogStream (filter_by=) and read_file
+    (where=) take any Condition; a bare function raises TypeError that points to
+    Where, read_file when it is called.
     """
     path = tmp_path / "app.log"
     path.write_text(
@@ -1488,14 +1494,16 @@ def test_entry_points_take_any_condition(tmp_path: Path) -> None:
     anr = AnrCondition(package="com.android.settings")
     assert [e.level for e in read_file(path, where=anr, year=2026)] == ["E"]
     assert [e.level for e in read_file(path, where=~anr, year=2026)] == ["I"]
-    assert LogStream(adb_path="adb", filter_by=anr | Tag("x")).filter_by is not None
+    assert (
+        LogStream(StreamConfig(adb_path="adb"), where=anr | Tag("x"))._where is not None
+    )
     assert AsyncLogStream(adb_path="adb", filter_by=Where(bool)).filter_by is not None
 
     def keep(entry: LogEntry) -> bool:
         return entry.level == "E"
 
-    with pytest.raises(TypeError, match=r"filter_by must be a Condition.*Where"):
-        LogStream(adb_path="adb", filter_by=keep)  # ty: ignore[invalid-argument-type]
+    with pytest.raises(TypeError, match=r"where must be a Condition.*Where"):
+        LogStream(StreamConfig(adb_path="adb"), where=keep)  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError, match=r"filter_by must be a Condition.*Where"):
         AsyncLogStream(adb_path="adb", filter_by=keep)  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError, match=r"where must be a Condition.*Where"):
@@ -1517,7 +1525,7 @@ def test_pidof_names_are_validated_where_they_reach_adb() -> None:
             return frozenset({"com.a;reboot"})
 
     with pytest.raises(ValueError, match="is not a package name"):
-        LogStream(adb_path="adb", filter_by=Smuggler())
+        LogStream(StreamConfig(adb_path="adb"), where=Smuggler())
     with pytest.raises(ValueError, match="is not a package name"):
         AsyncLogStream(adb_path="adb", filter_by=Smuggler())
     with pytest.raises(ValueError, match="is not a package name"):

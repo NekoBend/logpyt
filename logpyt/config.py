@@ -1,7 +1,7 @@
 """Stream configuration shared by both drivers (design section 2.2, decision D-1).
 
-Nothing reads it yet: the 2.x streams keep their own constructor arguments until
-the driver rewrites switch over (design section 8.1).
+`LogStream` reads it; the 2.x `AsyncLogStream` keeps its own constructor
+arguments until its rewrite switches over (design section 8.1, PR-13).
 
 The ``logcat_args`` whitelist mirrors how the Android 7.0 logcat parses its
 arguments (``getopt_long`` with ``:cdDLt:T:gG:sQf:r:n:v:b:BSpP:m:e:``,
@@ -25,6 +25,7 @@ from pydantic import (
     NonNegativeInt,
     PositiveFloat,
     PositiveInt,
+    StrictInt,
     ValidationInfo,
     field_validator,
     model_validator,
@@ -380,7 +381,8 @@ class StreamConfig(
         resume_window_bytes: Cap on the bytes kept to deduplicate a resume.
         buffer_entries: Outbox capacity in entries; a group counts its members.
         buffer_bytes: Outbox capacity in bytes.
-        max_line_bytes: Longer lines are truncated; at least 4096.
+        max_line_bytes: Longer lines are truncated; an int (no float or str),
+            at least 4096.
         stop_grace: Seconds between terminating adb and killing it.
         exit_drain: Seconds to wait for pipe EOF after adb exited, counted only
             while the intake is open.
@@ -403,7 +405,9 @@ class StreamConfig(
     resume_window_bytes: PositiveInt = 4 * 1024 * 1024
     buffer_entries: PositiveInt = 10_000
     buffer_bytes: PositiveInt = 16 * 1024 * 1024
-    max_line_bytes: int = Field(DEFAULT_MAX_LINE_BYTES, ge=MIN_MAX_LINE_BYTES)
+    # Strict, like read_file(max_line_bytes=) (design A.19): pydantic's lax mode
+    # would read 8192.0 or "8192" as 8192.
+    max_line_bytes: StrictInt = Field(DEFAULT_MAX_LINE_BYTES, ge=MIN_MAX_LINE_BYTES)
     stop_grace: PositiveFloat = 2.0
     exit_drain: PositiveFloat = 2.0
     close_timeout: PositiveFloat = 5.0
