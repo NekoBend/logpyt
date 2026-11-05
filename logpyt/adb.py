@@ -56,7 +56,7 @@ from typing import TYPE_CHECKING, Literal
 from logpyt.exceptions import AdbError
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Callable, Iterator, Sequence
 
 __all__ = [
     "DeviceInfo",
@@ -386,7 +386,12 @@ async def _async_spawn_adb(argv: Sequence[str]) -> asyncio.subprocess.Process:
     )
 
 
-def _run_adb(argv: Sequence[str], *, timeout: float | None) -> _AdbResult:
+def _run_adb(
+    argv: Sequence[str],
+    *,
+    timeout: float | None,
+    spawn: Callable[[Sequence[str]], subprocess.Popen[bytes]] | None = None,
+) -> _AdbResult:
     """Run one adb command to its end and return what it printed.
 
     The exit status is returned, not checked. The wait runs in slices of
@@ -394,6 +399,11 @@ def _run_adb(argv: Sequence[str], *, timeout: float | None) -> _AdbResult:
     (seconds; None waits without a limit) expires while adb runs, or anything
     interrupts the wait (Ctrl+C included), the child is killed and reaped
     before the exception propagates.
+
+    ``spawn`` starts the child in place of `_spawn_adb`, with the same
+    arguments and errors. The stream driver passes one that also tracks the
+    child in the same step, so the end of its run and interpreter exit can
+    kill it early; a child killed that way ends the wait like any other exit.
 
     Once adb has exited, its pipes get ``_REAP_TIMEOUT`` more to reach EOF. If
     a process adb started still holds them then, a WARNING is logged and the
@@ -412,7 +422,7 @@ def _run_adb(argv: Sequence[str], *, timeout: float | None) -> _AdbResult:
     args = tuple(argv)
     started = time.monotonic()
     try:
-        proc = _spawn_adb(args)
+        proc = (_spawn_adb if spawn is None else spawn)(args)
     except OSError as exc:
         raise _spawn_failure(args, exc) from exc
     deadline = None if timeout is None else started + timeout

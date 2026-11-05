@@ -66,6 +66,20 @@ def _adb_ended(fake: FakeAdb) -> None:
     wait_until(ended, timeout=TIMEOUT)
 
 
+def _in_the_drain(driver: Driver, fake: FakeAdb, stream: LogStream[LogEntry]) -> None:
+    """Wait until adb ended and the core concluded the run: it waits in the drain.
+
+    adb's end alone does not show that the core handled it (the exit waiter
+    may be late, and the engine takes control events before queued data),
+    so the run could still be STOPPING(stop) when the test acts. Waiting for
+    the conclusion makes the drain the path under test (design A.21); a run
+    that did not drain would read a terminal state here.
+    """
+    _adb_ended(fake)
+    driver.wait_concluded(stream)
+    assert stream.state is S.STOPPING  # the drain waits for the consumer
+
+
 def _ended(stream: LogStream[LogEntry]) -> bool:
     return stream.state in {S.STOPPED, S.KILLED, S.FAILED}
 
@@ -92,8 +106,7 @@ def test_last_item_failure_after_exit_fails(driver: Driver, fake_adb: FakeAdb) -
     try:
         assert busy.wait(TIMEOUT)
         driver.stop(stream)
-        _adb_ended(fake_adb)
-        assert stream.state is S.STOPPING  # the drain waits for the consumer
+        _in_the_drain(driver, fake_adb, stream)
     finally:
         release.set()
 
@@ -325,8 +338,7 @@ def test_kill_ends_a_stuck_drain(driver: Driver, fake_adb: FakeAdb, how: str) ->
             fake_adb.wait_for("sent")
             wait_until(lambda: stream.stats.lines == 3, timeout=TIMEOUT)
             driver.stop(stream)
-            _adb_ended(fake_adb)
-            assert stream.state is S.STOPPING
+            _in_the_drain(driver, fake_adb, stream)
             driver.kill(stream)
         else:
             error = RuntimeError("the body")
@@ -395,8 +407,7 @@ def test_kill_flag_skip_is_killed(
         wait_until(lambda: stream.stats.lines == count, timeout=TIMEOUT)
         if phase == "drain":
             driver.stop(stream)
-            _adb_ended(fake_adb)
-            assert stream.state is S.STOPPING
+            _in_the_drain(driver, fake_adb, stream)
     finally:
         proceed.set()
     driver.join(stream)
@@ -458,7 +469,7 @@ def test_kill_flag_skips_count_undelivered(
             wait_until(lambda: stream.stats.lines == count, timeout=TIMEOUT)
             if mode == "drain":
                 driver.stop(stream)
-                _adb_ended(fake_adb)
+                _in_the_drain(driver, fake_adb, stream)
         finally:
             proceed.set()
     driver.join(stream)

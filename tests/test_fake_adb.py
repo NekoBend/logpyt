@@ -338,24 +338,36 @@ def test_wait_and_touch_synchronize_with_the_test(fake_adb: FakeAdb) -> None:
 def test_hold_stdout_keeps_the_pipe_open_after_adb_exits(fake_adb: FakeAdb) -> None:
     """A grandchild holds adb's stdout: the pipe ends only after it let go.
 
-    adb has exited before the release, so the text after it can only come
-    from the grandchild through the same pipe.
+    A reader that reads to EOF does not reach it while adb has exited and
+    the grandchild still holds the pipe; after the release, the text it then
+    writes comes through the same pipe and EOF follows.
     """
     fake_adb.logcat(run(out("adb\n"), hold_stdout("go", then="grandchild\n")))
     proc = subprocess.Popen(
         [fake_adb.path, "logcat"], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL
     )
+    assert proc.stdout is not None
+    pipe = proc.stdout
+    chunks: list[bytes] = []
+    eof = threading.Event()
+
+    def read_to_eof() -> None:
+        chunks.append(pipe.read())
+        eof.set()
+
+    reader = threading.Thread(target=read_to_eof, daemon=True)
+    reader.start()
     try:
         assert proc.wait(timeout=TIMEOUT) == 0
+        assert not eof.wait(0.2)  # adb exited; the grandchild holds the pipe
         fake_adb.release("go")
-        assert proc.stdout is not None
-        stdout = proc.stdout.read()
+        assert eof.wait(TIMEOUT)
     finally:
         fake_adb.release("go")
         _end(proc)
-        if proc.stdout is not None:
-            proc.stdout.close()
-    assert stdout == b"adb\ngrandchild\n"
+        reader.join(TIMEOUT)
+        pipe.close()
+    assert b"".join(chunks) == b"adb\ngrandchild\n"
 
 
 def test_hang_runs_until_killed(fake_adb: FakeAdb) -> None:

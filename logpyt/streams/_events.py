@@ -155,7 +155,8 @@ class StreamStats:
             or it came while no connection was reading (``CONNECTING`` or
             ``RECONNECTING``).
         killed: The run ended ``KILLED``.
-        failed: The run ended ``FAILED``.
+        failed: The run ended ``FAILED``, or a logpyt bug ended it (the
+            sync driver's crash; design A.23).
     """
 
     connections: int = 0

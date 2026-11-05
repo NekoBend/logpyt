@@ -4,7 +4,8 @@ For every driver (see ``conftest.py``): each reader closes its pipe when it
 ends, so a retired connection leaves no pipe open, and the process's fd count
 returns to its baseline. The pipes are checked on the very `subprocess.Popen`
 objects the stream spawned (the fake adb registry holds them), on every
-platform; the fd count where the OS lists the open fds (Linux, macOS).
+platform; the fd count where the OS lists the open fds (Linux, macOS). A
+one-shot command still running when the run ends is killed with it (G5).
 """
 
 from __future__ import annotations
@@ -13,10 +14,12 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import pytest
+
 from logpyt import Reconnect
 from logpyt.streams._events import StreamState
 from tests.conformance.conftest import TIMEOUT, Driver, config
-from tests.conftest import FakeAdb, logcat_line, out, run, wait, wait_until
+from tests.conftest import FakeAdb, logcat_line, out, run, touch, wait, wait_until
 
 if TYPE_CHECKING:
     from logpyt import LogEntry
@@ -83,3 +86,28 @@ def test_fds_return_to_baseline_after_reconnects(
     assert stream.stats.reconnects == RECONNECTS
     assert stream.state is StreamState.STOPPED
     assert fake_adb.survivors() == []
+
+
+@pytest.mark.parametrize("how", ["stop", "kill"])
+def test_the_end_kills_a_pending_clock_read(
+    driver: Driver, fake_adb: FakeAdb, how: str
+) -> None:
+    """stop() or kill() while the clock read before the first connection
+    hangs: the run ends at once, and once join() returned no adb is left,
+    the clock read's included. Its result would be ignored (G5), so its adb
+    is not left running to its timeout (5 s), nor past the process (9.2).
+    """
+    fake_adb.date(run(touch("clock"), hang=True))
+    stream = driver.open(config())
+    driver.start(stream)
+    fake_adb.wait_for("clock")
+    if how == "stop":
+        driver.stop(stream)
+    else:
+        driver.kill(stream)
+    driver.join(stream)
+
+    assert fake_adb.live_children() == []  # checked at once: no wait
+    expected = StreamState.STOPPED if how == "stop" else StreamState.KILLED
+    assert stream.state is expected
+    assert fake_adb.calls("logcat") == []
