@@ -1,6 +1,7 @@
 """Tests for log filters: the conditions of design section 2.7."""
 
 import contextlib
+import re
 import sys
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
@@ -804,6 +805,39 @@ def test_packages_takes_the_override_of_a_nested_condition() -> None:
     assert (Tag("y") | ~launcher).packages() == frozenset({"com.a", "com.launcher"})
 
 
+class _OneName(Condition):
+    """A condition whose packages() override returns ``names`` as given: one
+    str or bytes instead of a collection."""
+
+    __slots__ = ("names",)
+
+    def __init__(self, names: str | bytes) -> None:
+        self.names = names
+
+    def __call__(self, entry: LogEntry, /) -> bool:
+        return entry.package == "myapp"
+
+    def packages(self) -> frozenset[str]:
+        return self.names  # ty: ignore[invalid-return-type]
+
+
+@pytest.mark.parametrize("names", ["myapp", b"myapp"], ids=["str", "bytes"])
+def test_packages_refuses_one_string_from_a_nested_override(names: str | bytes) -> None:
+    """A str would be read one character at a time (m, y, a, p watched): the
+    walk raises TypeError for it, under |, ~ and Where alike."""
+    kind = type(names).__name__
+    pattern = (
+        rf"_OneName\.packages\(\) must return a collection of package names, not {kind}"
+    )
+    for condition in (
+        Tag("x") | _OneName(names),
+        ~_OneName(names),
+        Where(_OneName(names)),
+    ):
+        with pytest.raises(TypeError, match=pattern):
+            condition.packages()
+
+
 def test_combinations_keep_children_that_override_packages() -> None:
     """An And or Or child whose class overrides packages() stays one child instead of
     contributing its conditions, so its override still answers; it matches like the
@@ -997,7 +1031,7 @@ def test_packages_collects_every_package_in_the_tree() -> None:
     condition = (
         (Package(["com.a", "com.b"]) & Level("E"))
         | ~Package("com.c")
-        | Filter(package="com.d:remote", tag="x")
+        | Filter(package="com.d", tag="x")
         | Not(Not(Tag("y") | Package("com.e")))
         | CrashCondition(package="com.f")
         | AnrCondition(package="com.g")
@@ -1006,7 +1040,7 @@ def test_packages_collects_every_package_in_the_tree() -> None:
         | Where(Where(~Package("com.j") & Tag("z")))
     )
     assert condition.packages() == frozenset(
-        {"com.a", "com.b", "com.c", "com.d:remote", "com.e", "com.i", "com.j"}
+        {"com.a", "com.b", "com.c", "com.d", "com.e", "com.i", "com.j"}
     )
     assert Package("com.a").packages() == frozenset({"com.a"})
     assert Filter(package=["com.a", "com.b"]).packages() == frozenset(
@@ -1137,6 +1171,10 @@ VALID_PACKAGES = [
     "a",
     "A_b.c9",
     "com.android.settings",
+]
+# Process names: the grammar takes them (F5-3), but only the text-based
+# CrashCondition/AnrCondition(package=) do (D1: attribution names apps).
+PROCESS_NAMES = [
     "com.example.app:remote",
     "com.example:remote.sub_1",
 ]
@@ -1163,9 +1201,29 @@ INVALID_PACKAGES = [
 
 @pytest.mark.parametrize("name", VALID_PACKAGES)
 def test_package_accepts_package_names(name: str) -> None:
-    """Package names follow design 2.7's grammar (F5-3), ":process" included."""
+    """Package names follow design 2.7's grammar (F5-3)."""
     assert Package(name).values == frozenset({name})
     assert Filter(package=name).packages() == frozenset({name})
+    assert CrashCondition(package=name).package == name
+    assert AnrCondition(package=name).package == name
+
+
+@pytest.mark.parametrize("name", PROCESS_NAMES, ids=["remote", "dotted"])
+def test_package_rejects_a_process_name(name: str) -> None:
+    """D1: a line's uid names an app, so LogEntry.package is a package name
+    and Package of a process name would match no live line. It raises and
+    names the package; the text-based crash and ANR conditions keep taking
+    a process name."""
+    package = name.partition(":")[0]
+    pattern = rf"names a process.*package name is {re.escape(repr(package))}"
+    with pytest.raises(ValueError, match=pattern) as raised:
+        Package(name)
+    assert "a package condition takes that name" in str(raised.value)
+    assert "CrashCondition(package=) and AnrCondition(package=)" in str(raised.value)
+    with pytest.raises(ValueError, match=pattern):
+        Package(["com.example", name])
+    with pytest.raises(ValueError, match=pattern):
+        Filter(package=name)
     assert CrashCondition(package=name).package == name
     assert AnrCondition(package=name).package == name
 
@@ -1175,12 +1233,14 @@ def test_package_rejects_other_strings(name: str) -> None:
     """A string outside the grammar, such as shell syntax, raises ValueError (F5-3):
     it would reach the device shell through ``adb shell``.
     """
-    with pytest.raises(ValueError, match="is not a package name"):
+    with pytest.raises(ValueError, match="is not a package name") as raised:
         Package(name)
+    assert "process" not in str(raised.value)  # D1: Package takes none
     with pytest.raises(ValueError, match="is not a package name"):
         Package(["com.example", name])
-    with pytest.raises(ValueError, match="is not a package name"):
+    with pytest.raises(ValueError, match="is not a package name") as raised:
         Filter(package=name)
+    assert "process" not in str(raised.value)
     with pytest.raises(ValueError, match="is not a package name"):
         CrashCondition(package=name)
     with pytest.raises(ValueError, match="is not a package name"):

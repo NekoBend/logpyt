@@ -2408,7 +2408,13 @@ def test_random_runs_reach_the_main_paths() -> None:
 
     The bounds are about half of what the seeds reach today, so a change of
     the core that shifts the trajectories a little does not fail this test,
-    but one that makes most runs end at once does.
+    but one that makes most runs end at once does. Two paths of attribution
+    are too rare for these seeds (none reaches them): a line from an app id
+    that only mapped packages owe an answer, queued behind a held line, and
+    a held line's leaf call that goes stale when a mapped package moves
+    (design A.22 D2). The random runs of tests/core/test_attribution.py
+    reach them (test_random_runs_attribute_each_line_as_it_goes_on, and the
+    brute-force oracle's grown-held mode).
     """
     reach: Counter[str] = Counter()
     for seed in _SEEDS:
@@ -2460,6 +2466,9 @@ def test_random_runs_reach_the_main_paths() -> None:
             cmd.argv[-1] != APP for cmd in lookups[len(watched) :]
         )
         reach["shared uid"] += bool(core._attribution._shared)
+        # Lines that went on before an answer: waiting, and named (D2).
+        reach["lines waited for an answer"] += driver.max_unsettled > 0
+        reach["lines named by an answer"] += driver.named_by_an_answer > 0
 
     assert reach["read lines"] >= 0.8 * len(_SEEDS)
     floors = {"reconnected": 20, "stall resumed": 10, "flushed": 10}
@@ -2472,6 +2481,7 @@ def test_random_runs_reach_the_main_paths() -> None:
     floors |= {"lookup failed while held": 6, "held at a connection end": 4}
     floors |= {"held at the conclusion": 3}
     floors |= {"several packages": 45, "re-lookups of others": 20, "shared uid": 7}
+    floors |= {"lines waited for an answer": 30, "lines named by an answer": 9}
     assert {name: reach[name] for name in floors} == {
         name: max(reach[name], floor) for name, floor in floors.items()
     }

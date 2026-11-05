@@ -5,10 +5,14 @@ transition table (design 3.2): the first lookups at start, ``lookup done``,
 ``hold_expired`` (the policy's one deadline), every stdout line before
 ``where``, the end of a connection and the run's conclusion. Like the rest of
 the core it reads no clock and runs nothing: the core passes the monotonic
-time in and runs the lookups that `Attribution.next_lookup` asks for.
+time in and runs the lookups that `Attribution.next_lookup` asks for, and
+adds the lines that `Attribution.lookup_done` found unattributed
+(`Answer.unattributed`) to ``stats.unattributed``.
 
-Watched packages are ``where.packages()``; a ``<package>:<process>`` name
-watches ``<package>``, because a uid names an app, not one of its processes.
+Watched packages are ``where.packages()``. A uid names an app, not one of its
+processes, so they are package names: they are checked when the attribution
+is built (F5-3, and a process name ``<package>:<process>`` raises), and a bad
+name from an override of ``packages()`` fails there, not at the first lookup.
 With no watched package the core runs no attribution at all.
 
 The uid map
@@ -46,7 +50,8 @@ The uid map
   its uid away. With every watched package mapped, no line is ever held
   (D-8): uids are static for an install, so that re-lookup only catches a
   reinstall, and the lines of the new uid that come before its answer go on
-  without their package.
+  without their package; the answer counts those whose verdict depended on
+  it (see "Lines that went on before an answer").
 - Once every watched package has answered after an app id was first seen,
   and none named it, that app id goes into the negative cache. The negative
   cache and the app ids waiting for an answer share one LRU of `UID_CACHE`
@@ -61,8 +66,11 @@ The ordered hold and tri-state evaluation
   ``Package(a) | Tag("x")`` with tag ``x`` is true without it and goes on at
   once, with ``package=None`` and not counted as unattributed. Once a line is
   held, every later line queues behind it, in order, and is evaluated when it
-  reaches the head, with what is known by then (a line whose package is
-  still unknown then is held again, as the new head).
+  reaches the head, with what is known by then: a line from an unknown app
+  uid takes its package if a lookup mapped its app id meanwhile, and one
+  whose package is still unknown then is held again, as the new head, unless
+  only mapped packages owed its app id an answer when it came (see "Lines
+  that went on before an answer").
 - The head of the hold goes on when its package becomes known (a lookup
   mapped its uid, or put it in the negative cache), when a lookup changes the
   verdict to one that no longer depends on the package, or else when its
@@ -100,13 +108,92 @@ queues behind a held line, calls each leaf at most once, its evaluation at
 its release included (each such line keeps the verdicts of the leaves it
 called, and is evaluated by `evaluate` at its release too), and a subtree
 shared by several parents is evaluated at most twice for it (reached past an
-unknown verdict, and not). Any other line (its package is known, or only
-mapped packages are asked again for its uid) is evaluated by a plain
-``where(entry)``, or by `evaluate` when several watched packages share its
-uid. A combination whose class overrides ``packages()`` is one leaf, as
-`Condition.packages` does not look inside it either. And/Or decide like
-Kleene logic and stop at the first deciding verdict. The tree is walked
-without recursion (F7-4).
+unknown verdict, and not). Any other line is evaluated by a plain
+``where(entry)``, or by `evaluate` when it is attributed to a uid that
+several watched packages share, except one that goes on without its package
+while watched packages still owe its app id an answer (see "Lines that went
+on before an answer"). A combination whose class overrides ``packages()`` is
+one leaf, as `Condition.packages` does not look inside it either. And/Or
+decide like Kleene logic and stop at the first deciding verdict. The tree is
+walked without recursion (F7-4).
+
+Lines that went on before an answer
+-----------------------------------
+
+A line from an unknown app uid that only mapped packages still owe an answer
+goes on at once (D-8), with ``package=None``; if a later answer names its app
+id, it went on without its package. Such lines are not held, but counted:
+
+- A line from an unknown app uid that goes on with ``package=None``, and is
+  not counted as unattributed already (an expiry, a failed lookup, ``force``),
+  records the watched packages that still owe its app id an answer (none
+  issued after the app id was first seen) and that its verdict depends on:
+  `evaluate` with that package unknown is None. A package without a uid that
+  the hold's verdict already took as unknown stays unknown in that
+  evaluation, and is not recorded (the verdict was decided without it),
+  unless the line called a leaf that names it. A held line's packages
+  without a uid can grow: a mapped package whose re-lookup was issued before
+  the app id was first seen answers that it is not installed. A leaf that
+  names it, called before that while it was mapped, saw ``package=None``, and
+  the hold reuses that call, which can decide the verdict. Such a package is
+  asked about like a mapped one (``reopened``), and recorded if the verdict
+  depends on it, so the answer that maps it to the app id counts the line.
+  This covers a line that goes on at once, one queued behind a held line
+  (evaluated when it reaches the head), a held line that goes on because
+  the packages without a uid answered, and a line under ``force``.
+- A held line that takes its package at its release (a lookup mapped its
+  app id while it waited) reuses the leaves it called while it waited. One
+  that names its package was called with ``package=None`` while that
+  package was mapped elsewhere (a reinstall found while the line waited for
+  a package without a uid), so its verdict may be wrong for the line. When
+  the line's verdict depends on such a call (`evaluate` with those leaves
+  unknown and nothing called anew is None), the line goes on with its
+  verdict as it is and counts as unattributed then (`Verdict.unattributed`).
+- A line that only mapped packages owed when it came is never held (D-8),
+  also when it queues behind a held line. At the head it is evaluated with
+  what is known then, like every queued line: if a lookup mapped its app id
+  while it waited, it goes on with its package (a plain verdict, or with
+  the owners of a shared uid) and is not counted; if its app id is in the
+  negative cache now, by a plain verdict; else without its package, and it
+  records what it depends on, as above. An app id that the LRU evicted
+  while the line waited is seen anew at the head and owes every watched
+  package an answer: the line still goes on, not held, and records what it
+  depends on.
+- An answer for package ``p`` settles ``p`` for the recorded lines of every
+  app id. When it names the app id, the lines that depend on ``p`` were
+  ``p``'s: `Answer.unattributed` counts them, and they are forgotten.
+  Otherwise, when it was issued after the app id was first seen, ``p`` is
+  struck from what they depend on, and a line left with nothing is forgotten:
+  its verdict was right. A failed lookup settles nothing, so the next answer
+  does. Each line is therefore counted once at most, also when several
+  watched packages answer the same app id one after another (a
+  ``sharedUserId``): a line that depends on both is counted at the first such
+  answer and gone at the second, one that depends on the second only is
+  counted then.
+- The count changes no verdict, the hold or the lookups. Such a line's
+  verdict is `_decided` with ``package=None`` and the leaves it called
+  already (plain evaluation's order, each leaf called once), or the hold's
+  tri-state verdict. What it depends on is then evaluated with the same
+  calls, one package unknown at a time (all of them first: when that is
+  decided, so is each alone). A leaf already called is reused unless it
+  names the package asked about, as its call saw ``package=None``
+  (``reopened``); a user leaf that the verdict did not call is unknown, not
+  called (``called_only``). (The hold's walk may leave a shared leaf
+  uncalled where it first reaches it and call it later; reusing that call,
+  this walk can reach leaves the verdict never reached.) So no user leaf is
+  called twice, and none that the line's verdict did not call, so none that
+  plain evaluation would not call; the same holds for a held line that
+  takes its package at its release. Only lines from an app id that still
+  owes a mapped package an answer pay for these evaluations, until it
+  answers, and a line that the hold's verdict decides with a stale call
+  (for the package that call names). Each line that the hold's verdict
+  decides, and each held line that takes its package at its release, also
+  pays one pass over its calls to find the stale ones; with one, the latter
+  pays one evaluation more.
+- Memory (5.10): an app id keeps one count per distinct set of packages its
+  lines depend on (a subset of the watched packages), while it is in the LRU
+  or in the map; its counts go when the LRU evicts it or the map drops it,
+  and `discard` and `close` drop them all.
 
 Caveats (documented, design 5.8):
 
@@ -116,7 +203,9 @@ Caveats (documented, design 5.8):
   alphabetical order, and that is what a condition that reads
   ``entry.package`` itself sees, a `Package` inside a combination whose
   class overrides ``packages()`` included (that combination is called as a
-  whole).
+  whole). A line that goes on with ``package=None`` matches none of them
+  (one from the negative cache or a system uid, queued behind a held line
+  while a lookup gave that uid to them).
 - A watched package whose uid is a system uid (below 10000) gets one WARNING:
   every line of that uid, whatever its process, is attributed to it.
 - Isolated processes (app ids 90000-99999, A.14) are never attributed, and
@@ -126,10 +215,17 @@ Caveats (documented, design 5.8):
   no time-to-live): a watched package that an install during the capture
   gives that very app id is found only when a line from another app uid not
   yet in the cache asks for a lookup, and its lines before that go on
-  without their package. A reinstall under a new app id is found by the
-  re-lookup its first line asks for, but with every watched package mapped
-  nothing is held, so the lines before that lookup answered go on without
-  their package.
+  without their package (also those queued behind a held line when that
+  lookup answers). A reinstall under a new app id is found by the re-lookup
+  its first line asks for, but with every watched package mapped nothing is
+  held, so the lines before that lookup answered go on without their
+  package. Those whose verdict depended on it count in ``stats.unattributed``
+  when that answer comes, not when they go on (an answer that comes while
+  the run stops still counts them); those still waiting for it at the run's
+  conclusion (the re-lookup never answered), or whose app id the LRU evicted
+  after they went on, are not counted. What a line depends on is asked one
+  package at a time, so a verdict that only two packages of a shared uid
+  change together (``Package(a) & Package(b)``) is not counted.
 """
 
 from __future__ import annotations
@@ -153,12 +249,13 @@ from logpyt.filters import (
     Package,
     Tag,
     Where,
+    _attributed_packages,
     _combines,
     _Junction,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Mapping
 
     from logpyt.adb import _AdbResult
     from logpyt.models import LogEntry
@@ -166,6 +263,7 @@ if TYPE_CHECKING:
 __all__ = [
     "LOOKUP_INTERVAL",
     "UID_CACHE",
+    "Answer",
     "Attribution",
     "Lookup",
     "Verdict",
@@ -186,6 +284,9 @@ UID_CACHE: Final = 4096
 # `_Held.seen` of a line whose package was known when it arrived.
 _KNOWN: Final = -1
 _NOBODY: Final[frozenset[str]] = frozenset()
+# `Attribution._question`: the app id, its seen, and the packages to ask a
+# line's verdict about.
+type _Question = tuple[int, int, frozenset[str]]
 # The ``__call__`` of each built-in condition that `evaluate` may call where
 # plain evaluation would not have: documented to change nothing
 # (`logpyt.filters.Condition`). A `Package` is decided without a call (`_leaf`).
@@ -212,11 +313,26 @@ class Lookup:
 
 
 @dataclass(frozen=True, slots=True)
+class Answer:
+    """What a lookup result changed, for the core (`Attribution.lookup_done`)."""
+
+    warnings: tuple[str, ...] = ()
+    # Lines that went on without their package, which this answer named
+    # (design 4.4: the core counts them in stats.unattributed).
+    unattributed: int = 0
+
+
+_NOTHING: Final = Answer()
+
+
+@dataclass(frozen=True, slots=True)
 class Verdict:
     """A line that goes on: its entry (attributed), whether ``where`` matched.
 
     ``unattributed``: it was evaluated with ``package=None`` although its
-    verdict depended on a package that stayed unknown (design 4.4).
+    verdict depended on a package that stayed unknown, or it took its
+    package at its release but its verdict depended on a leaf it called
+    with ``package=None`` while it waited (design 4.4, module docs).
     """
 
     entry: LogEntry
@@ -234,9 +350,24 @@ class _Held:
     seen: int
     nbytes: int
     # The verdicts of the leaves it called; None for a line that may not wait
-    # for its package (a plain where at its release, `Attribution._plain`).
+    # for its package (it calls none before its release, `Attribution._settled`).
     calls: dict[int, bool] | None = None
     given_up: bool = False  # a lookup it waited for failed
+    # Its app id's seen when it came from an unknown app uid, also when it
+    # may not wait (seen is _KNOWN then): it is resolved again at the head
+    # (`Attribution.release`). Else _KNOWN.
+    since: int = _KNOWN
+
+
+@dataclass(slots=True, eq=False)
+class _Owing:
+    """The lines of one app id that went on without their package while
+    watched packages still owed it an answer (module docs).
+    """
+
+    seen: int  # the number of lookups issued when the app id was first seen
+    # The packages a line's verdict depends on -> how many lines.
+    lines: dict[frozenset[str], int]
 
 
 class Attribution:
@@ -248,6 +379,12 @@ class Attribution:
         serial: The device serial, or None.
         package_hold: The longest a line waits for its package, in seconds;
             also how long intake waits for the lookups at start.
+
+    Raises:
+        ValueError: A name ``where.packages()`` returns is not a package name
+            (F5-3), a process name (``<package>:<process>``) included.
+        TypeError: Such a name is not a str, or a ``packages()`` override
+            returns one str (or bytes) instead of a collection of names.
 
     """
 
@@ -263,6 +400,7 @@ class Attribution:
         "_hold",
         "_issued",
         "_last_issue",
+        "_owing",
         "_package_of",
         "_packages",
         "_passed",
@@ -289,7 +427,7 @@ class Attribution:
         serial: str | None,
         package_hold: float,
     ) -> None:
-        packages = sorted(_base_names(() if where is None else where.packages()))
+        packages = sorted(() if where is None else _attributed_packages(where))
         self._packages = tuple(packages)
         self._where = where
         self._watched = bool(packages)
@@ -322,6 +460,8 @@ class Attribution:
         # App id -> its watched packages, for an app id that several share.
         self._shared: dict[int, frozenset[str]] = {}
         self._seen: OrderedDict[int, int | None] = OrderedDict()
+        # App id -> its lines that went on before an answer (module docs).
+        self._owing: dict[int, _Owing] = {}
         # The hold.
         self._queue: deque[_Held] = deque()
         self._held_bytes = 0
@@ -359,6 +499,13 @@ class Attribution:
     def remembered(self) -> int:
         """The uids the map and the negative cache hold (at most `UID_CACHE`)."""
         return len(self._package_of) + len(self._seen)
+
+    @property
+    def unsettled(self) -> int:
+        """Lines that went on without their package and wait for an answer
+        that settles them (module docs).
+        """
+        return sum(sum(owing.lines.values()) for owing in self._owing.values())
 
     def negative(self, uid: int) -> bool:
         """Whether ``uid``'s app id is known to name no watched package (tests).
@@ -429,16 +576,19 @@ class Attribution:
         self._last_issue[package] = now
         return lookup
 
-    def lookup_done(self, ident: int, result: _AdbResult | Exception) -> list[str]:
-        """Take the result of lookup ``ident``; return the WARNINGs to log.
+    def lookup_done(self, ident: int, result: _AdbResult | Exception) -> Answer:
+        """Take the result of lookup ``ident``: the WARNINGs to log, and the
+        lines that went on without the package it names.
 
         A result whose id is not the lookup in flight is stale and changes
         nothing (X-3). A failure releases the held lines that waited for it
         (counted as unattributed by `release`); one WARNING per run says so.
+        An answer settles its package for the lines that went on while it was
+        owed (module docs); a failure settles nothing.
         """
         flight = self._flight
         if flight is None or flight.ident != ident:
-            return []
+            return _NOTHING
         self._flight = None
         if flight.first:
             self._first_left -= 1
@@ -457,15 +607,17 @@ class Attribution:
         if error is not None:
             self._give_up(flight)
             if self._warned_failure:
-                return []
+                return _NOTHING
             self._warned_failure = True
-            return [
+            warning = (
                 f"package lookup for {package} failed: {error}; lines whose "
                 "where verdict needs it are evaluated without a package and "
                 "counted in stats.unattributed"
-            ]
+            )
+            return Answer((warning,))
         self._answered[package] = flight.ident
-        return self._map(package, uid)
+        counted = self._settle(package, flight.ident, uid)
+        return Answer(tuple(self._map(package, uid)), counted)
 
     # -- lines -----------------------------------------------------------------------
 
@@ -484,19 +636,21 @@ class Attribution:
         if package is not None and package != entry.package:
             # The values are checked already, so no validation is lost (A.16).
             entry = entry.model_copy(update={"package": package})
+        since = seen
         if seen != _KNOWN:
             self._want(seen)
             if not self._candidates(seen):
                 # Only mapped packages are asked again (a reinstall): such a
-                # line is never held (D-8).
+                # line is never held (D-8), and goes on without its package.
                 seen = _KNOWN
         if self._queue:
             calls = None if seen == _KNOWN else {}  # no leaf twice (module docs)
-            self._push(_Held(entry, now, seen, entry_bytes(entry), calls))
+            nbytes = entry_bytes(entry)
+            self._push(_Held(entry, now, seen, nbytes, calls, since=since))
             return None
         if seen == _KNOWN:
-            return Verdict(entry, self._plain(entry, None))
-        line = _Held(entry, now, seen, entry_bytes(entry))
+            return self._settled(entry, since, None)
+        line = _Held(entry, now, seen, entry_bytes(entry), since=since)
         verdict = self._judge(line, now, force=force)
         if verdict is None:
             self._push(line)
@@ -508,6 +662,10 @@ class Attribution:
         ``force``: it goes on whatever is known (a connection end, a detached
         consumer, the run's conclusion).
 
+        A line from an unknown app uid is resolved again: it takes its
+        package if a lookup mapped its app id while it waited. One that may
+        not wait for its package when it came is never held (D-8).
+
         Raises:
             Exception: What ``where`` raised; that line has left the hold.
 
@@ -515,7 +673,7 @@ class Attribution:
         if not self._queue:
             return None
         line = self._pop()
-        if line.seen != _KNOWN:
+        if line.since != _KNOWN:  # it came from an unknown app uid
             package, seen = self._resolve(line.entry.uid)
             if seen == _KNOWN or not self._candidates(seen):
                 line.seen = _KNOWN
@@ -528,21 +686,30 @@ class Attribution:
         return verdict
 
     def discard(self) -> int:
-        """Drop the held lines and the wanted re-lookups; return how many lines."""
+        """Drop the held lines and the wanted re-lookups; return how many lines.
+
+        The lines that went on before an answer are dropped too, uncounted.
+        """
         count = len(self._queue)
         self._queue.clear()
         self._held_bytes = 0
         self._wanted.clear()
         self._passed.clear()
+        self._owing.clear()
         return count
 
     def close(self) -> None:
-        """The run concluded: no lookup runs or is waited for any more (G5)."""
+        """The run concluded: no lookup runs or is waited for any more (G5).
+
+        The lines that went on before an answer that never came are dropped,
+        uncounted.
+        """
         self._closed = True
         self._flight = None
         self._first.clear()
         self._wanted.clear()
         self._passed.clear()
+        self._owing.clear()
         self._ready = True
 
     # -- helpers ---------------------------------------------------------------------
@@ -660,6 +827,8 @@ class Attribution:
                 self._package_of[key] = owners[0]
             else:
                 self._package_of.pop(key, None)
+                if key not in self._seen:
+                    self._owing.pop(key, None)  # neither in the map nor the LRU
             if len(owners) > 1:
                 self._shared[key] = frozenset(owners)
             else:
@@ -667,17 +836,52 @@ class Attribution:
         self._trim()
         return warnings
 
+    def _settle(self, package: str, ident: int, uid: int | None) -> int:
+        """Answer ``ident`` gave ``package`` ``uid`` (None: not installed):
+        settle it for the lines that went on while it was owed.
+
+        Returns how many lines it names: their app id is ``uid``'s and their
+        verdict depends on ``package`` (module docs).
+        """
+        app = None if uid is None else uid % _PER_USER
+        counted = 0
+        for key in list(self._owing):
+            owing = self._owing[key]
+            lines = owing.lines
+            depending = [names for names in lines if package in names]
+            if key == app:
+                for names in depending:
+                    counted += lines.pop(names)
+            elif ident > owing.seen:  # it says the app id is not package's
+                for names in depending:
+                    count = lines.pop(names)
+                    rest = names - {package}
+                    if rest:
+                        lines[rest] = lines.get(rest, 0) + count
+            if not lines:
+                del self._owing[key]
+        return counted
+
     def _trim(self) -> None:
-        """Keep the map and the negative cache within `UID_CACHE` uids (LRU)."""
+        """Keep the map and the negative cache within `UID_CACHE` uids (LRU).
+
+        An app id evicted takes its lines that went on before an answer with
+        it (5.10).
+        """
         room = max(0, UID_CACHE - len(self._package_of))
         seen = self._seen
         while len(seen) > room:
-            seen.popitem(last=False)
+            app, _ = seen.popitem(last=False)
+            self._owing.pop(app, None)
 
     def _sharing(self, entry: LogEntry) -> frozenset[str]:
-        """The watched packages that share ``entry``'s app id, if several do."""
+        """The watched packages that share ``entry``'s app id, if several do
+        and the line is theirs: a line that goes on with ``package=None`` (it
+        came from the negative cache or a system uid that a lookup gave to
+        them while it was queued) matches no `Package` leaf.
+        """
         uid = entry.uid
-        if uid is None or not self._shared:
+        if uid is None or entry.package is None or not self._shared:
             return _NOBODY
         return self._shared.get(uid % _PER_USER, _NOBODY)
 
@@ -687,8 +891,8 @@ class Attribution:
         A plain ``where(entry)``, unless the line may have waited for its
         package (``calls`` is not None: the verdicts of the leaves it called
         while its package was unknown are reused, and no leaf is called
-        twice) or several watched packages share its uid (each `Package` leaf
-        matches any of them).
+        twice) or it is attributed to a uid that several watched packages
+        share (each `Package` leaf matches any of them, `_sharing`).
         """
         where = self._where
         assert where is not None  # noqa: S101  (attribution needs a condition)
@@ -699,6 +903,155 @@ class Attribution:
             calls = {}
         return _decided(where, entry, calls, self._declared, owners)
 
+    def _known(self, entry: LogEntry, calls: dict[int, bool] | None) -> Verdict:
+        """The verdict of a line whose package is settled (maybe None): `_plain`.
+
+        A held line that takes its package at its release reuses the leaves
+        it called while it waited, with ``package=None``. One of them that
+        names its package was called while that package was not one the line
+        may belong to (mapped elsewhere: a reinstall), so its verdict may be
+        wrong for the line. When the line's verdict depends on such a call
+        (`evaluate` with those leaves unknown, calling nothing new, is None),
+        the line is unattributed; its verdict stays, and no leaf is called
+        again (module docs).
+        """
+        package = entry.package
+        if not calls or package is None:
+            return Verdict(entry, self._plain(entry, calls))
+        stale = _calls_naming(calls, package, self._declared)  # before new calls
+        matched = self._plain(entry, calls)
+        if not stale:
+            return Verdict(entry, matched)
+        where = self._where
+        assert where is not None  # noqa: S101  (attribution needs a condition)
+        verdict = evaluate(
+            where,
+            entry,
+            unknown=_NOBODY,
+            calls={key: value for key, value in calls.items() if key not in stale},
+            declared=self._declared,
+            owners=self._sharing(entry),
+            called_only=True,
+        )
+        return Verdict(entry, matched, unattributed=verdict is None)
+
+    def _settled(
+        self, entry: LogEntry, since: int, calls: dict[int, bool] | None
+    ) -> Verdict:
+        """The verdict of a line that does not wait for its package (any more).
+
+        ``since`` is `_Held.since`. A line from an unknown app uid that
+        watched packages still owe an answer goes on without its package: its
+        verdict is `_decided` with its leaf calls (each leaf once), and what
+        it depends on is recorded (`_owe`). Any other line takes `_known`.
+        """
+        question = self._question(entry, since, _NOBODY)
+        if question is None:
+            return self._known(entry, calls)
+        where = self._where
+        assert where is not None  # noqa: S101  (attribution needs a condition)
+        if calls is None:
+            calls = {}
+        matched = _decided(where, entry, calls, self._declared)
+        self._owe(entry, calls, question, _NOBODY)
+        return Verdict(entry, matched)
+
+    def _question(
+        self, entry: LogEntry, since: int, asked: frozenset[str]
+    ) -> _Question | None:
+        """What to ask about a line that goes on without its package, if
+        anything (module docs).
+
+        ``since``: its `_Held.since`; ``asked``: the packages without a uid
+        that its verdict took as unknown already. None for a line whose
+        package is known, that came from a known uid, whose app id is in the
+        negative cache now (`admit` and `release` have just resolved it), or
+        that nothing is asked about.
+        """
+        uid = entry.uid
+        if since == _KNOWN or uid is None or entry.package is not None:
+            return None
+        if self._closed:
+            # No answer comes any more. The core never gets here: it closes
+            # the attribution after its last line went on; a line admitted
+            # after `close` records nothing.
+            return None
+        app = uid % _PER_USER
+        seen = self._seen.get(app)
+        if seen is None:
+            return None
+        names = frozenset(self._owed(seen)).difference(asked)
+        return (app, seen, names) if names else None
+
+    def _owe(
+        self,
+        entry: LogEntry,
+        calls: dict[int, bool],
+        question: _Question,
+        asked: frozenset[str],
+    ) -> None:
+        """Record what a line that goes on without its package depends on.
+
+        ``calls``: the verdicts of the leaves it called; ``question`` from
+        `_question`, with the same ``asked``. It records the packages of the
+        question that its verdict depends on, for their answers to settle
+        (`_settle`).
+        """
+        app, seen, names = question
+        depends = self._depends(entry, calls, names, asked)
+        if depends:
+            owing = self._owing.get(app)
+            if owing is None:
+                owing = self._owing[app] = _Owing(seen, {})
+            owing.lines[depends] = owing.lines.get(depends, 0) + 1
+
+    def _depends(
+        self,
+        entry: LogEntry,
+        calls: dict[int, bool],
+        names: frozenset[str],
+        asked: frozenset[str],
+    ) -> frozenset[str]:
+        """The packages of ``names`` that ``entry``'s verdict depends on.
+
+        Tri-state: `evaluate` with the package unknown, besides ``asked``, is
+        None. It reuses ``calls`` and calls no user leaf that the verdict did
+        not call: such a leaf is unknown (`evaluate`, ``reopened``). All of
+        ``names`` are asked first: when that is decided, so is each one alone
+        (an unknown leaf more never decides a verdict).
+        """
+        if not names or not self._undecided(entry, calls, names, asked):
+            return _NOBODY
+        if len(names) == 1:
+            return names
+        return frozenset(
+            name
+            for name in sorted(names)
+            if self._undecided(entry, calls, frozenset((name,)), asked)
+        )
+
+    def _undecided(
+        self,
+        entry: LogEntry,
+        calls: dict[int, bool],
+        names: frozenset[str],
+        asked: frozenset[str],
+    ) -> bool:
+        """Whether `evaluate` leaves ``entry``'s verdict undecided with
+        ``names`` (reopened) and ``asked`` unknown.
+        """
+        where = self._where
+        assert where is not None  # noqa: S101  (attribution needs a condition)
+        verdict = evaluate(
+            where,
+            entry,
+            unknown=asked | names,
+            calls=calls,
+            declared=self._declared,
+            reopened=names,
+        )
+        return verdict is None
+
     def _judge(self, line: _Held, now: float, *, force: bool) -> Verdict | None:
         """The verdict of a line at the head of the hold, or None if it must wait."""
         where = self._where
@@ -706,17 +1059,21 @@ class Attribution:
         entry = line.entry
         calls = line.calls
         if line.seen == _KNOWN:
-            return Verdict(entry, self._plain(entry, calls))
+            return self._settled(entry, line.since, calls)
         if calls is None:
             calls = line.calls = {}
+        candidates = self._candidates(line.seen)
         verdict = evaluate(
-            where,
-            entry,
-            unknown=self._candidates(line.seen),
-            calls=calls,
-            declared=self._declared,
+            where, entry, unknown=candidates, calls=calls, declared=self._declared
         )
         if verdict is not None:
+            # A package that a leaf it called names grew into the candidates
+            # after that call (`_stale`): it is asked about, not taken as
+            # unknown (module docs).
+            asked = candidates - _stale(calls, candidates, self._declared)
+            question = self._question(entry, line.since, asked)
+            if question is not None:
+                self._owe(entry, calls, question, asked)
             return Verdict(entry, verdict)
         if force or line.given_up or now >= line.arrived + self._hold:
             matched = _decided(where, entry, calls, self._declared)
@@ -747,11 +1104,6 @@ class _Frame:
     index: int = 1
     decisive: bool = False
     undecided: bool = False
-
-
-def _base_names(names: Iterable[str]) -> frozenset[str]:
-    """The packages of ``names``: ``<package>:<process>`` watches ``<package>``."""
-    return frozenset(name.partition(":")[0] for name in names)
 
 
 def _is_combination(node: Condition) -> bool:
@@ -819,7 +1171,7 @@ def declared_packages(root: Condition) -> dict[int, frozenset[str]]:
                 pending.append(node.fn)
             continue
         if not _is_package(_unwrap(node)):
-            declared[id(node)] = _base_names(node.packages())
+            declared[id(node)] = frozenset(node.packages())
     return declared
 
 
@@ -831,6 +1183,8 @@ def evaluate(
     calls: dict[int, bool],
     declared: Mapping[int, frozenset[str]],
     owners: frozenset[str] = _NOBODY,
+    reopened: frozenset[str] = _NOBODY,
+    called_only: bool = False,
 ) -> bool | None:
     """``root``'s verdict for ``entry``: True, False, or None when it depends on
     the package (see the module docs).
@@ -847,6 +1201,15 @@ def evaluate(
         owners: The watched packages that share the line's uid, when several
             do (``unknown`` is empty then): a `Package` leaf matches any of
             them.
+        reopened: Packages of ``unknown`` whose leaves are unknown even when
+            ``calls`` holds their verdict: it was taken with ``package=None``
+            while the line was not thought to be theirs (what a line that
+            went on depends on, `Attribution._depends`). When it is not
+            empty, ``called_only`` holds too.
+        called_only: No leaf is called that ``calls`` does not hold, but a
+            built-in condition that changes nothing: any other is unknown
+            (whether a line's verdict depends on some of its calls,
+            `Attribution._known`).
 
     Raises:
         Exception: What a leaf raised.
@@ -859,7 +1222,8 @@ def evaluate(
     node: Condition | None = root
     guarded = False
     value: bool | None = None
-    context = (entry, unknown, calls, declared, owners)
+    called_only = called_only or bool(reopened)
+    context = (entry, unknown, calls, declared, owners, reopened, called_only)
     while node is not None:
         value = _down(node, frames, done, context, guarded=guarded)
         node, guarded, value = _up(frames, done, value=value)
@@ -872,6 +1236,8 @@ type _Context = tuple[
     dict[int, bool],
     Mapping[int, frozenset[str]],
     frozenset[str],
+    frozenset[str],
+    bool,
 ]
 
 
@@ -960,6 +1326,8 @@ def _leaf(
     calls: dict[int, bool],
     declared: Mapping[int, frozenset[str]],
     owners: frozenset[str],
+    reopened: frozenset[str],
+    called_only: bool,  # noqa: FBT001  (one of the evaluation's fields)
     *,
     guarded: bool,
 ) -> bool | None:
@@ -973,10 +1341,19 @@ def _leaf(
             return not package.values.isdisjoint(owners)
         return entry.package in package.values
     key = id(node)
-    called = calls.get(key)
-    if called is not None:
-        return called
-    if unknown and _left_unknown(node, unknown, declared, guarded=guarded):
+    # A call it made for a reopened package saw package=None (`evaluate`);
+    # reopened is part of unknown, so _left_unknown leaves it unknown.
+    if not reopened or _names(node, declared).isdisjoint(reopened):
+        called = calls.get(key)
+        if called is not None:
+            return called
+    # With called_only (reopened sets it), nothing is called that the line's
+    # verdict did not call: such a leaf is unknown as if guarded
+    # (`Attribution._depends`, `Attribution._known`).
+    guarded = guarded or called_only
+    if (unknown or called_only) and _left_unknown(
+        node, unknown, declared, guarded=guarded
+    ):
         return None
     value = bool(node(entry))
     calls[key] = value
@@ -997,10 +1374,47 @@ def _left_unknown(
     verdict may decide the junction once the package is known), and it is
     not a built-in condition that changes nothing.
     """
-    names = declared.get(id(node))
-    if names is None:
-        names = _base_names(node.packages())
+    names = _names(node, declared)
     return not names.isdisjoint(unknown) or (guarded and not _is_pure(node))
+
+
+def _names(node: Condition, declared: Mapping[int, frozenset[str]]) -> frozenset[str]:
+    """The packages a leaf other than a `Package` depends on (`declared_packages`)."""
+    names = declared.get(id(node))
+    return frozenset(node.packages()) if names is None else names
+
+
+def _stale(
+    calls: Mapping[int, bool],
+    candidates: frozenset[str],
+    declared: Mapping[int, frozenset[str]],
+) -> frozenset[str]:
+    """The packages of ``candidates`` that a leaf in ``calls`` names.
+
+    `evaluate` calls no leaf that names a package the line may belong to, so
+    such a call was made before that package became one: while it was mapped,
+    with ``package=None``. ``declared`` holds every leaf `evaluate` calls.
+    One pass over ``calls``.
+    """
+    stale: set[str] = set()
+    for key in calls:
+        names = declared.get(key, _NOBODY)
+        if not names.isdisjoint(candidates):
+            stale.update(names & candidates)
+    return frozenset(stale)
+
+
+def _calls_naming(
+    calls: Mapping[int, bool], package: str, declared: Mapping[int, frozenset[str]]
+) -> frozenset[int]:
+    """The leaves in ``calls`` (by id) that name ``package``, for a held line
+    that took ``package`` at its release.
+
+    It waited with ``package`` not one it may belong to (`evaluate` calls no
+    leaf that names one), so they were called with ``package=None`` while
+    ``package`` was mapped elsewhere. One pass over ``calls``.
+    """
+    return frozenset(key for key in calls if package in declared.get(key, _NOBODY))
 
 
 def _decided(

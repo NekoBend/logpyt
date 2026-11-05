@@ -525,11 +525,13 @@ _UIDS: tuple[int | str, ...] = (APP_UID, APP_UID, 10_070, 1_010_065, 1000, "root
 OTHER_LOOKUP = lookup(10_070)
 # The other watched packages of some runs, so that re-lookups of several
 # packages take turns (X-3) and packages share a uid; a lookup answers one of
-# these uids (None: not installed) for the package it asked for.
+# these uids (None: not installed) for the package it asked for. An answer of
+# 10_070 for a package mapped to APP_UID is a reinstall under a new uid.
 OTHER_APP = "com.example.other"
 THIRD_APP = "com.example.third"
+_ANSWER_UIDS = (APP_UID, None, None, 10_070)
 _LOOKUP_ANSWERS: dict[str, tuple[_AdbResult, ...]] = {
-    package: tuple(lookup(uid, package) for uid in (APP_UID, None, None, 10_070))
+    package: tuple(lookup(uid, package) for uid in _ANSWER_UIDS)
     for package in (APP, OTHER_APP, THIRD_APP)
 }
 
@@ -642,6 +644,10 @@ class RandomDriver:
         self.failed_while_held = 0  # lookups that failed with lines held
         self.held_at_connection_end = 0  # events that retired a connection
         self.held_at_conclusion = 0  # ... that concluded the run
+        # Lines that went on before an answer (design 5.8, D2): the most
+        # waiting at once, and those an answer named.
+        self.max_unsettled = 0
+        self.named_by_an_answer = 0
 
     def _where(self, entry: LogEntry) -> bool:
         if entry.message == "boom":
@@ -707,7 +713,7 @@ class RandomDriver:
             self.held_at_connection_end += held_before > 0
         if core.concluded and not concluded_before:
             self.held_at_conclusion += held_before > 0
-        self.max_held = max(self.max_held, core._attribution.held)
+        self._attribution_reach()
         outcome = harness.core.outcome
         if self.outcome is None:
             self.outcome = outcome
@@ -719,6 +725,12 @@ class RandomDriver:
             assert change.old is previous, f"broken chain: {previous} then {change}"
             self.changes.append(change)
         return out
+
+    def _attribution_reach(self) -> None:
+        """The most lines held, and waiting for an answer, at once (5.8)."""
+        attribution = self.harness.core._attribution
+        self.max_held = max(self.max_held, attribution.held)
+        self.max_unsettled = max(self.max_unsettled, attribution.unsettled)
 
     def _count_drain(self, event: Event, *, draining: bool) -> None:
         """Count drains, and how ``event`` ended one (for the reach test)."""
@@ -895,13 +907,50 @@ class RandomDriver:
                 outcome = STATE_DEVICE if good else STATE_OFFLINE
             case "lookup":
                 answers = _LOOKUP_ANSWERS[command.argv[-1]]
-                outcome = rng.choice(answers) if good else LOOKUP_FAILED
+                index = rng.randrange(len(answers)) if good else 0  # as choice
+                outcome = answers[index] if good else LOOKUP_FAILED
                 self.answered_lookups.append(command.request)
                 if not good and self.harness.core._attribution.held:
                     self.failed_while_held += 1
+                if good:
+                    self._answer_lookup(command, outcome, _ANSWER_UIDS[index])
+                    return
             case _:
                 outcome = MARKER_OK if good else TimeoutError("marker")
         self.send(CommandDone(command.request, outcome))
+
+    def _answer_lookup(
+        self, command: RunCommand, outcome: _AdbResult, uid: int | None
+    ) -> None:
+        """A lookup answer that names ``uid``: it counts at least the lines of
+        that uid that went on and depend on the package (design 5.8, D2),
+        and none of them waits any more.
+        """
+        core = self.harness.core
+        attribution = core._attribution
+        package = command.argv[-1]
+        pending = core._requests.get(command.request)
+        flight = attribution._flight
+        owing = None
+        if (
+            uid is not None
+            and pending is not None
+            and flight is not None
+            and pending.lookup == flight.ident
+        ):
+            owing = attribution._owing.get(uid)
+        named = (
+            0
+            if owing is None
+            else sum(count for names, count in owing.lines.items() if package in names)
+        )
+        before = core.stats().unattributed
+        self.send(CommandDone(command.request, outcome))
+        assert core.stats().unattributed - before >= named, "a named line not counted"
+        after = attribution._owing.get(uid) if uid is not None else None
+        if after is not None:
+            assert all(package not in names for names in after.lines), "still waits"
+        self.named_by_an_answer += named
 
     def stale(self) -> None:
         """A late copy of an answered lookup's result: it changes nothing (X-3)."""

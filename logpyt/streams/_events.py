@@ -130,7 +130,18 @@ class StreamStats:
             grouping raised on.
         unparsed: Lines the parser could not split into fields.
         truncated: Lines cut at ``max_line_bytes``.
-        unattributed: Lines evaluated with an unknown package.
+        unattributed: Lines whose ``where`` verdict depended on their package
+            but that were evaluated without it (section 5.8): the package was
+            still unknown when the line's ``package_hold`` expired, when a
+            lookup failed or when the line had to go on; a lookup named the
+            line's uid while it waited, but its verdict depended on a
+            condition it had called without the package (a package
+            reinstalled under a new uid while it was mapped); or a lookup
+            named the line's uid only after the line went on (such a
+            reinstall; counted when that answer comes; lines still waiting
+            for it when the run concludes, or whose uid was evicted after
+            they went on, are not counted). They are counted whether or not
+            they matched.
         gaps: `Gap` events.
         device_lost: Lines the device reported as lost.
         backlog_pruned: Lines logd reported pruned before the capture started.

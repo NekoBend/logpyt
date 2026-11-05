@@ -694,6 +694,11 @@ def test_arguments_are_keyword_only(tmp_path: Path) -> None:
         ({"uid_packages": {APP_UID: 7}}, TypeError, "str"),
         ({"uid_packages": {-1: APP}}, ValueError, ">= 0"),
         ({"uid_packages": {APP_UID: "com.x; reboot"}}, ValueError, "package name"),
+        (
+            {"uid_packages": {APP_UID: f"{APP}:remote"}},
+            ValueError,
+            rf"names a process.*package name is '{APP}'",
+        ),
         ({"max_line_bytes": True}, TypeError, "int"),
         ({"max_line_bytes": 4096.0}, TypeError, "int"),
         ({"max_line_bytes": CAP - 1}, ValueError, "at least 4096"),
@@ -710,6 +715,7 @@ def test_arguments_are_keyword_only(tmp_path: Path) -> None:
         "pkg-int",
         "uid-neg",
         "pkg-bad",
+        "pkg-process",
         "cap-bool",
         "cap-float",
         "cap-small",
@@ -763,6 +769,72 @@ def test_root_packages_override_may_return_a_list(
     ]
     with pytest.raises(ValueError, match=r"'com\.c'.*uid_packages"):
         read_file(log_file, where=_ListPackages())
+
+
+class _Process(Condition):
+    """A condition whose packages() override names a process."""
+
+    def __call__(self, entry: LogEntry, /) -> bool:
+        return entry.package == APP
+
+    def packages(self) -> frozenset[str]:
+        return frozenset({f"{APP}:remote"})
+
+
+@pytest.mark.parametrize(
+    ("value", "error", "match"),
+    [
+        (f"{APP}:remote", ValueError, rf"names a process, not a package: .*'{APP}'$"),
+        ("com.x; reboot", ValueError, "is not a package name: dot-separated"),
+        (7, TypeError, "a package name must be a str, not int"),
+    ],
+    ids=["process", "grammar", "int"],
+)
+def test_a_bad_uid_packages_value_names_its_uid(
+    tmp_path: Path, value: object, error: type[Exception], match: str
+) -> None:
+    """D1: the error names the uid_packages entry, and says nothing of what a
+    condition takes (CrashCondition) or of a ':<process>' suffix."""
+    with pytest.raises(error, match=match) as raised:
+        read_file(tmp_path / "missing.log", uid_packages={APP_UID: value})  # ty: ignore[invalid-argument-type]
+
+    message = str(raised.value)
+    assert message.startswith(f"uid_packages[{APP_UID}] is {value!r}: ")
+    assert "CrashCondition" not in message
+    assert ":<process>" not in message
+
+
+class _OneName(Condition):
+    """A condition whose packages() override returns one str."""
+
+    def __call__(self, entry: LogEntry, /) -> bool:
+        return entry.package == "myapp"
+
+    def packages(self) -> frozenset[str]:
+        return cast("frozenset[str]", "myapp")
+
+
+def test_a_str_from_packages_raises_at_the_call(tmp_path: Path) -> None:
+    """D1: a str from a packages() override at the root would be read one
+    character at a time; read_file raises TypeError, as a stream does."""
+    pattern = r"_OneName\.packages\(\) must return a collection of package names"
+
+    with pytest.raises(TypeError, match=rf"{pattern}, not str"):
+        read_file(tmp_path / "missing.log", where=_OneName(), uid_packages={})
+
+
+@pytest.mark.parametrize("mapped", [True, False], ids=["map", "no-map"])
+def test_a_process_name_from_packages_raises_at_the_call(
+    tmp_path: Path,
+    mapped: bool,  # noqa: FBT001  (a parameter)
+) -> None:
+    """D1: a uid names an app, so a name where.packages() returns is checked
+    like a Package name: a process name raises, with or without a map."""
+    uids = {APP_UID: APP} if mapped else None
+    pattern = rf"where\.packages\(\) returned '{APP}:remote': .*names a process"
+
+    with pytest.raises(ValueError, match=pattern):
+        read_file(tmp_path / "missing.log", where=_Process(), uid_packages=uids)
 
 
 def test_empty_uid_map_and_smallest_cap_are_accepted(
