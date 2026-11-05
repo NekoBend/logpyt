@@ -523,6 +523,15 @@ TERMINAL = frozenset({S.STOPPED, S.KILLED, S.FAILED})
 # another uid for APP (an install during the capture).
 _UIDS: tuple[int | str, ...] = (APP_UID, APP_UID, 10_070, 1_010_065, 1000, "root")
 OTHER_LOOKUP = lookup(10_070)
+# The other watched packages of some runs, so that re-lookups of several
+# packages take turns (X-3) and packages share a uid; a lookup answers one of
+# these uids (None: not installed) for the package it asked for.
+OTHER_APP = "com.example.other"
+THIRD_APP = "com.example.third"
+_LOOKUP_ANSWERS: dict[str, tuple[_AdbResult, ...]] = {
+    package: tuple(lookup(uid, package) for uid in (APP_UID, None, None, 10_070))
+    for package in (APP, OTHER_APP, THIRD_APP)
+}
 
 # How likely a consumer callback raises while the run drains (design A.21),
 # per record and on the last item: high enough that the seeds exercise both.
@@ -544,9 +553,10 @@ class RandomDriver:
     kill, detach and callback failures at random, and moves the clock. After
     every event it checks the global rules (see `send`).
 
-    Package attribution (design 5.8): ``where`` watches APP in most runs; the
-    lines come from APP's uid, another app uid, a secondary user and system
-    uids; a lookup answers APP's uid, another uid, "not installed" or fails;
+    Package attribution (design 5.8): ``where`` watches APP in most runs, and
+    one or two other packages in some; the lines come from APP's uid, another
+    app uid, a secondary user and system uids; a lookup answers APP's uid,
+    another uid, "not installed" or fails;
     and now and then a lookup's result is delivered again late (stale: X-3),
     which must change nothing. So lines are held, re-looked-up, released,
     expire, and go through the connection end and the conclusion while held.
@@ -570,7 +580,15 @@ class RandomDriver:
             where = (
                 Package(APP) | Where(self._where)
                 if self.raising
-                else rng.choice([WHERE, Package(APP), ~Package(APP)])
+                else rng.choice(
+                    [
+                        WHERE,
+                        Package(APP),
+                        ~Package(APP),
+                        Package(APP) | Package(OTHER_APP),
+                        Package(APP) | Package(OTHER_APP) | Package(THIRD_APP),
+                    ]
+                )
             )
         buffer_entries = rng.choice([1, 3, 50])
         group_by = None
@@ -876,11 +894,8 @@ class RandomDriver:
             case "state":
                 outcome = STATE_DEVICE if good else STATE_OFFLINE
             case "lookup":
-                outcome = (
-                    rng.choice([LOOKUP_OK, LOOKUP_ABSENT, LOOKUP_ABSENT, OTHER_LOOKUP])
-                    if good
-                    else LOOKUP_FAILED
-                )
+                answers = _LOOKUP_ANSWERS[command.argv[-1]]
+                outcome = rng.choice(answers) if good else LOOKUP_FAILED
                 self.answered_lookups.append(command.request)
                 if not good and self.harness.core._attribution.held:
                     self.failed_while_held += 1

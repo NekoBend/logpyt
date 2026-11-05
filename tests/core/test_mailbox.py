@@ -109,6 +109,46 @@ def test_admission_counts_held_lines_against_the_capacity() -> None:
     assert admission.open
     admission.hold(0, 90)  # bytes count too: 10 queued + 90 held
     assert not admission.open
+    admission.hold(0, 45)  # 55 bytes in all: above half
+    assert not admission.open
+    admission.hold(0, 40)  # 50 bytes: at half
+    assert admission.open
+
+
+def test_admission_reopens_only_when_held_bytes_are_low_too() -> None:
+    """Design 5.10: the low-water mark counts held bytes, not only held lines."""
+    admission = Admission(buffer_entries=100, buffer_bytes=100)
+
+    admission.hold(1, 100)
+    assert not admission.open
+    admission.hold(2, 90)  # few lines, but 90% of the bytes
+    assert not admission.open
+    admission.hold(2, 50)
+    assert admission.open
+
+
+@pytest.mark.parametrize(
+    ("queued", "taken", "expected"),
+    [((3, 30), (0, 0), False), ((3, 30), (1, 10), True), ((1, 60), (0, 0), False)],
+    ids=["entries-above-half", "at-half", "bytes-above-half"],
+)
+def test_held_back_needs_the_queued_items_at_or_below_half(
+    queued: tuple[int, int],
+    taken: tuple[int, int],
+    expected: bool,  # noqa: FBT001  (a parameter)
+) -> None:
+    """Design 5.10, 5.6: the held lines kept the outbox full only when the
+    queued items alone are at or below half of both capacities; otherwise
+    the consumer did (the stall INFO names the cause)."""
+    admission = Admission(buffer_entries=4, buffer_bytes=100)
+    admission.admit(*queued)
+    admission.release(_counts(*taken))
+
+    admission.hold(1, 10)
+
+    assert admission.held_back() is expected
+    admission.hold(0, 0)
+    assert not admission.held_back()  # nothing held
 
 
 def test_admission_ignores_an_older_report() -> None:

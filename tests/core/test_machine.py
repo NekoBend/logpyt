@@ -2452,6 +2452,14 @@ def test_random_runs_reach_the_main_paths() -> None:
         reach["lookup failed while held"] += driver.failed_while_held > 0
         reach["held at a connection end"] += driver.held_at_connection_end > 0
         reach["held at the conclusion"] += driver.held_at_conclusion > 0
+        # Several watched packages: their re-lookups take turns (X-3), and two
+        # of them may share a uid.
+        watched = core._attribution._packages
+        reach["several packages"] += len(watched) > 1
+        reach["re-lookups of others"] += any(
+            cmd.argv[-1] != APP for cmd in lookups[len(watched) :]
+        )
+        reach["shared uid"] += bool(core._attribution._shared)
 
     assert reach["read lines"] >= 0.8 * len(_SEEDS)
     floors = {"reconnected": 20, "stall resumed": 10, "flushed": 10}
@@ -2463,6 +2471,7 @@ def test_random_runs_reach_the_main_paths() -> None:
     floors |= {"stale lookup results": 90, "unattributed": 40}
     floors |= {"lookup failed while held": 6, "held at a connection end": 4}
     floors |= {"held at the conclusion": 3}
+    floors |= {"several packages": 45, "re-lookups of others": 20, "shared uid": 7}
     assert {name: reach[name] for name in floors} == {
         name: max(reach[name], floor) for name, floor in floors.items()
     }

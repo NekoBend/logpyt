@@ -22,14 +22,23 @@ The uid map
 - Keys are app ids (uid modulo 100000), so a secondary user's line matches by
   app id. A line's package is known when its app id is mapped, is a system
   uid (below 10000; a uid column that is no number and no known name parses
-  to ``uid=None`` and counts as one), or is in the negative cache.
+  to ``uid=None`` and counts as one), is an isolated process's (90000 and
+  above, A.14: a lookup names an app's own uid, never one of these), or is in
+  the negative cache.
 - Any other line comes from an unknown app uid. It asks for a re-lookup of
   every watched package that has no answer issued after the uid was first
-  seen, at least `LOOKUP_INTERVAL` after that package's last lookup (X-3),
-  packages without a uid first. A lookup issued before a uid was first seen
-  says nothing about it: the app may have been installed after the lookup
-  ran. So a result only ever settles the uids seen before its request, and a
-  result whose id is not the lookup in flight is ignored.
+  seen, at least `LOOKUP_INTERVAL` after that package's last lookup (X-3).
+  Of the re-lookups that are due, one that choices have passed over for
+  ``package_hold`` goes first, then packages without a uid (lines may wait
+  for them), then the others; within each, the longest since its last
+  lookup first, then by name. So lines wait for a mapped package's re-lookup
+  only once it has waited ``package_hold``, and a due re-lookup waits about
+  ``package_hold`` at most, plus one lookup of each other package, however
+  long lookups take and however many new uids come. A lookup issued before
+  a uid was first seen says nothing about it: the app may have been
+  installed after the lookup ran. So a result only ever settles the uids
+  seen before its request, and a result whose id is not the lookup in
+  flight is ignored.
 - A line waits only for a package without a uid (not installed, or installed
   during the capture). A mapped package is looked up again as well, so that a
   reinstall under a new uid is found (design 5.8, 9.4): an answer with another
@@ -52,7 +61,8 @@ The ordered hold and tri-state evaluation
   ``Package(a) | Tag("x")`` with tag ``x`` is true without it and goes on at
   once, with ``package=None`` and not counted as unattributed. Once a line is
   held, every later line queues behind it, in order, and is evaluated when it
-  reaches the head (with the package known by then).
+  reaches the head, with what is known by then (a line whose package is
+  still unknown then is held again, as the new head).
 - The head of the hold goes on when its package becomes known (a lookup
   mapped its uid, or put it in the negative cache), when a lookup changes the
   verdict to one that no longer depends on the package, or else when its
@@ -65,13 +75,14 @@ The ordered hold and tri-state evaluation
 - Held lines count against the outbox (5.10: the core reports `held` and
   `held_bytes` to `logpyt._core.mailbox.Admission`).
 
-`evaluate` decides with three values and never calls a condition that plain
-evaluation would not call (`And` and `Or` short-circuit from left to right,
-`logpyt.filters`). A `Package` leaf is unknown when it names a package the
-line may belong to, else false. The other built-in field and event conditions
-(`Tag`, `Level`, `MinLevel`, `MessageContains`, `CrashCondition`,
-`AnrCondition`, and a `Where` of one) are documented to change nothing, so
-they are called wherever the walk reaches them. Any other leaf (a user
+`evaluate` decides with three values and never calls a user condition that
+plain evaluation would not call (`And` and `Or` short-circuit from left to
+right, `logpyt.filters`). A `Package` leaf (or a `Where` of one) is unknown
+when it names a package the line may belong to, else false. The other
+built-in field and event conditions (`Tag`, `Level`, `MinLevel`,
+`MessageContains`, `CrashCondition`, `AnrCondition`, and a `Where` of one) are
+documented to change nothing, so they are called wherever the walk reaches
+them, also where plain evaluation would not. Any other leaf (a user
 subclass, `Where` of a function, a combination whose class overrides
 ``__call__`` or ``packages()``) is unknown without a call when its
 ``packages()`` names a package the line may belong to, or when an `And` or
@@ -83,31 +94,42 @@ of `logpyt.filters.Condition.packages`, a condition that matches on
 Where(fn)`` holds a line from an unknown app uid without calling ``fn``, and
 ``fn`` runs at its release only if the line is ``a``'s.
 
-A line whose package is unknown when it arrives calls each leaf at most once,
-its evaluation at its release included (each such line keeps the verdicts of
-the leaves it called), and a subtree shared by several parents is evaluated
-at most twice for it (reached past an unknown verdict, and not); a line whose
-package is known is evaluated by a plain ``where(entry)``, or by `evaluate`
-when several watched packages share its uid. A combination whose class
-overrides ``packages()`` is one leaf, as `Condition.packages` does not look
-inside it either. And/Or decide like Kleene logic and stop at the first
-deciding verdict. The tree is walked without recursion (F7-4).
+A line that may wait for its package (it comes from an unknown app uid that
+a package without a uid may own), whether it goes on at once, is held or
+queues behind a held line, calls each leaf at most once, its evaluation at
+its release included (each such line keeps the verdicts of the leaves it
+called, and is evaluated by `evaluate` at its release too), and a subtree
+shared by several parents is evaluated at most twice for it (reached past an
+unknown verdict, and not). Any other line (its package is known, or only
+mapped packages are asked again for its uid) is evaluated by a plain
+``where(entry)``, or by `evaluate` when several watched packages share its
+uid. A combination whose class overrides ``packages()`` is one leaf, as
+`Condition.packages` does not look inside it either. And/Or decide like
+Kleene logic and stop at the first deciding verdict. The tree is walked
+without recursion (F7-4).
 
 Caveats (documented, design 5.8):
 
 - Packages that share a uid (``sharedUserId``) match each other's lines: a
-  `Package` that names any of the watched packages on that uid matches them.
-  ``LogEntry.package`` names the first of them in alphabetical order, and
-  that is what a condition that reads ``entry.package`` itself sees.
+  `Package` (or a `Where` of one) that names any of the watched packages on
+  that uid matches them. ``LogEntry.package`` names the first of them in
+  alphabetical order, and that is what a condition that reads
+  ``entry.package`` itself sees, a `Package` inside a combination whose
+  class overrides ``packages()`` included (that combination is called as a
+  whole).
 - A watched package whose uid is a system uid (below 10000) gets one WARNING:
   every line of that uid, whatever its process, is attributed to it.
-- Isolated processes (uids 90000-99999 of a user) and processes of other apps
-  are never attributed: their uid names no watched package.
-- An app id in the negative cache is not looked up again (the cache has no
-  time-to-live): a watched package that an install during the capture gives
-  that very app id is not found. A reinstall under a new app id is found at
-  its first line, but with every watched package mapped nothing is held, so
-  the lines before that lookup answered go on without their package.
+- Isolated processes (app ids 90000-99999, A.14) are never attributed, and
+  their lines are never held and ask for no lookup; lines of other apps'
+  processes are never attributed either: their uid names no watched package.
+- An app id in the negative cache asks for no lookup any more (the cache has
+  no time-to-live): a watched package that an install during the capture
+  gives that very app id is found only when a line from another app uid not
+  yet in the cache asks for a lookup, and its lines before that go on
+  without their package. A reinstall under a new app id is found by the
+  re-lookup its first line asks for, but with every watched package mapped
+  nothing is held, so the lines before that lookup answered go on without
+  their package.
 """
 
 from __future__ import annotations
@@ -154,6 +176,9 @@ __all__ = [
 # Design 5.8: a uid is user * 100000 + app id; app ids start at 10000.
 _PER_USER: Final = 100_000
 _FIRST_APP_ID: Final = 10_000
+# A.14: isolated processes from here on (99000-99999 before API 29 is inside);
+# no lookup names one, as dumpsys gives an app's own uid.
+_FIRST_ISOLATED_ID: Final = 90_000
 # Design 5.8 (X-3): lookups of one package start at least this far apart.
 LOOKUP_INTERVAL: Final = 0.5
 # Design 5.10: the uids the map and the negative cache remember, together.
@@ -163,11 +188,10 @@ _KNOWN: Final = -1
 _NOBODY: Final[frozenset[str]] = frozenset()
 # The ``__call__`` of each built-in condition that `evaluate` may call where
 # plain evaluation would not have: documented to change nothing
-# (`logpyt.filters.Condition`).
+# (`logpyt.filters.Condition`). A `Package` is decided without a call (`_leaf`).
 _PURE_CALLS: Final = frozenset(
     {
         Tag.__call__,
-        Package.__call__,
         Level.__call__,
         MinLevel.__call__,
         MessageContains.__call__,
@@ -209,7 +233,8 @@ class _Held:
     # _KNOWN, or the number of lookups issued when its app id was first seen.
     seen: int
     nbytes: int
-    # The verdicts of the leaves it called; None until it was evaluated.
+    # The verdicts of the leaves it called; None for a line that may not wait
+    # for its package (a plain where at its release, `Attribution._plain`).
     calls: dict[int, bool] | None = None
     given_up: bool = False  # a lookup it waited for failed
 
@@ -240,6 +265,7 @@ class Attribution:
         "_last_issue",
         "_package_of",
         "_packages",
+        "_passed",
         "_queue",
         "_ready",
         "_seen",
@@ -277,6 +303,8 @@ class Attribution:
         self._first: deque[str] = deque(packages)
         self._first_left = len(packages)
         self._wanted: set[str] = set()
+        # Wanted packages that were due when another one was chosen: since when.
+        self._passed: dict[str, float] = {}
         self._flight: Lookup | None = None
         self._issued = 0
         self._last_issue: dict[str, float] = {}
@@ -387,10 +415,13 @@ class Attribution:
             due = [name for name in self._wanted if self._due(name) <= now]
             if not due:
                 return None
-            # A package without a uid first: lines may be waiting for it.
-            unmapped = self._unmapped
-            package = min(due, key=lambda name: (name not in unmapped, name))
+            package = min(due, key=lambda name: self._rank(name, now))
             self._wanted.discard(package)
+            passed = self._passed
+            passed.pop(package, None)
+            for name in due:  # the others waited through this choice
+                if name != package:
+                    passed.setdefault(name, now)
         self._issued += 1
         argv = _package_uid_argv(self._adb_path, self._serial, package)
         lookup = Lookup(self._issued, package, argv, first=first)
@@ -460,7 +491,8 @@ class Attribution:
                 # line is never held (D-8).
                 seen = _KNOWN
         if self._queue:
-            self._push(_Held(entry, now, seen, entry_bytes(entry)))
+            calls = None if seen == _KNOWN else {}  # no leaf twice (module docs)
+            self._push(_Held(entry, now, seen, entry_bytes(entry), calls))
             return None
         if seen == _KNOWN:
             return Verdict(entry, self._plain(entry, None))
@@ -501,6 +533,7 @@ class Attribution:
         self._queue.clear()
         self._held_bytes = 0
         self._wanted.clear()
+        self._passed.clear()
         return count
 
     def close(self) -> None:
@@ -509,12 +542,27 @@ class Attribution:
         self._flight = None
         self._first.clear()
         self._wanted.clear()
+        self._passed.clear()
         self._ready = True
 
     # -- helpers ---------------------------------------------------------------------
 
     def _due(self, package: str) -> float:
         return self._last_issue.get(package, float("-inf")) + LOOKUP_INTERVAL
+
+    def _rank(self, package: str, now: float) -> tuple[int, float, str]:
+        """The order of the due re-lookups at ``now`` (`next_lookup`), lowest first.
+
+        A package that choices have passed over for ``package_hold`` goes
+        first, so none starves; then a package without a uid (lines may wait
+        for it); then the others. Within each, the longest since its last
+        lookup goes first (so packages without a uid take turns), then by name.
+        """
+        last = self._last_issue.get(package, float("-inf"))
+        since = self._passed.get(package)
+        if since is not None and now - since >= self._hold:
+            return 0, last, package
+        return (1 if package in self._unmapped else 2), last, package
 
     def _resolve(self, uid: int | None) -> tuple[str | None, int]:
         """``(package, seen)`` of a line's uid; ``seen`` is `_KNOWN` when known."""
@@ -524,8 +572,8 @@ class Attribution:
         package = self._package_of.get(app)
         if package is not None:
             return package, _KNOWN
-        if app < _FIRST_APP_ID:
-            return None, _KNOWN
+        if app < _FIRST_APP_ID or app >= _FIRST_ISOLATED_ID:
+            return None, _KNOWN  # a system uid, or an isolated process
         seen = self._seen
         state = seen.get(app, _KNOWN)
         if state is None:
@@ -636,14 +684,16 @@ class Attribution:
     def _plain(self, entry: LogEntry, calls: dict[int, bool] | None) -> bool:
         """The verdict of a line whose package is settled (maybe None).
 
-        A plain ``where(entry)``, unless the line called leaves while its
-        package was unknown (their verdicts are reused) or several watched
-        packages share its uid (each `Package` leaf matches any of them).
+        A plain ``where(entry)``, unless the line may have waited for its
+        package (``calls`` is not None: the verdicts of the leaves it called
+        while its package was unknown are reused, and no leaf is called
+        twice) or several watched packages share its uid (each `Package` leaf
+        matches any of them).
         """
         where = self._where
         assert where is not None  # noqa: S101  (attribution needs a condition)
         owners = self._sharing(entry)
-        if not calls and not owners:
+        if calls is None and not owners:
             return bool(where(entry))
         if calls is None:
             calls = {}
@@ -715,8 +765,24 @@ def _is_combination(node: Condition) -> bool:
     return _combines(node) and type(node).packages is Condition.packages
 
 
+def _unwrap(node: Condition) -> Condition:
+    """``node`` without the `Where` wrappers whose built-in ``__call__`` passes a
+    condition's verdict on: ``Where(c)`` matches like ``c``.
+    """
+    while (
+        type(node).__call__ is Where.__call__
+        and isinstance(node, Where)
+        and isinstance(node.fn, Condition)
+    ):
+        node = node.fn
+    return node
+
+
 def _is_package(node: Condition) -> bool:
-    """A `Package` leaf with its built-in ``__call__``: ``entry.package in values``."""
+    """A `Package` leaf with its built-in ``__call__``: ``entry.package in values``.
+
+    ``node`` is already `_unwrap`-ped: a `Where` of a `Package` matches like it.
+    """
     return type(node).__call__ is Package.__call__ and isinstance(node, Package)
 
 
@@ -725,22 +791,16 @@ def _is_pure(node: Condition) -> bool:
     one, with its built-in ``__call__``: calling it changes nothing, so
     `evaluate` may call it where plain evaluation would not have.
     """
-    while (
-        type(node).__call__ is Where.__call__
-        and isinstance(node, Where)
-        and isinstance(node.fn, Condition)
-    ):
-        node = node.fn
-    return type(node).__call__ in _PURE_CALLS
+    return type(_unwrap(node)).__call__ in _PURE_CALLS
 
 
 def declared_packages(root: Condition) -> dict[int, frozenset[str]]:
     """The packages each leaf of ``root`` depends on, by ``id()`` of the leaf.
 
-    For every leaf `evaluate` reaches but a `Package`: what its
-    ``packages()`` returns, as package names. Computed once per stream, so an
-    override of ``packages()`` is asked once more; a shared subtree is walked
-    once, without recursion.
+    For every leaf `evaluate` reaches but a `Package` (or a `Where` of one):
+    what its ``packages()`` returns, as package names. Computed once per
+    stream, so an override of ``packages()`` is asked once more; a shared
+    subtree is walked once, without recursion.
     """
     declared: dict[int, frozenset[str]] = {}
     walked: set[int] = set()
@@ -758,7 +818,7 @@ def declared_packages(root: Condition) -> dict[int, frozenset[str]]:
             elif isinstance(node, Where) and isinstance(node.fn, Condition):
                 pending.append(node.fn)
             continue
-        if not _is_package(node):
+        if not _is_package(_unwrap(node)):
             declared[id(node)] = _base_names(node.packages())
     return declared
 
@@ -904,13 +964,14 @@ def _leaf(
     guarded: bool,
 ) -> bool | None:
     """One leaf's verdict (see `evaluate`)."""
-    if _is_package(node):
-        assert isinstance(node, Package)  # noqa: S101  (for the type checker)
+    package = _unwrap(node)  # Where(Package(...)) sees every owner too
+    if _is_package(package):
+        assert isinstance(package, Package)  # noqa: S101  (for the type checker)
         if unknown:
-            return False if node.values.isdisjoint(unknown) else None
+            return False if package.values.isdisjoint(unknown) else None
         if owners:
-            return not node.values.isdisjoint(owners)
-        return entry.package in node.values
+            return not package.values.isdisjoint(owners)
+        return entry.package in package.values
     key = id(node)
     called = calls.get(key)
     if called is not None:
