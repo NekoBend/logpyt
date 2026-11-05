@@ -6,10 +6,13 @@ The child side and the config format are described in ``tests/fake_adb.py``.
     Patches ``subprocess.Popen`` and ``asyncio.create_subprocess_exec`` so
     that a spawn of ``fake.path`` runs ``tests/fake_adb.py`` instead, and
     patches ``resolve_adb`` to return ``fake.path``. Configure behavior with
-    ``logcat()`` / ``pidof()`` / ``dumpsys()`` / ``command()``, observe it
-    with ``calls()``,
-    ``wait_for()`` and ``release()``. Outside pytest, ``install_fake_adb()``
-    sets up the same interception (``bench/stream_bench.py`` uses it).
+    ``logcat()`` / ``pidof()`` / ``dumpsys()`` / ``date()`` /
+    ``get_state()`` / ``device_absent()`` / ``command()``, observe it with
+    ``calls()``, ``wait_for()`` and ``release()``. Every stream connection
+    reads the device clock first (``adb shell date +%s``), which the fake
+    answers with the host clock unless ``date()`` scripts it. Outside pytest,
+    ``install_fake_adb()`` sets up the same interception
+    (``bench/stream_bench.py`` uses it).
 
 Child registry
     Every fake adb child is registered, with its ``subprocess.Popen`` or
@@ -138,6 +141,15 @@ def touch(name: str) -> Step:
     return {"touch": name}
 
 
+def hold_stdout(until: str, then: str = "") -> Step:
+    """Start a grandchild that holds adb's stdout until ``release(until)``.
+
+    The grandchild then writes ``then`` to that stdout and exits; the fake adb
+    goes on with its next step at once (``tests/fake_adb.py``).
+    """
+    return {"hold_stdout": {"until": until, "then": then}}
+
+
 def run(
     *steps: Step,
     exit_code: int = 0,
@@ -165,6 +177,50 @@ def threadtime(
 ) -> str:
     """Format one ``-v threadtime`` line, newline included."""
     return f"{date} {time_} {pid:5d} {tid:5d} {level} {tag}: {message}\n"
+
+
+# The live wire format of design 5.6 (U-1): -v threadtime -v year -v usec -v zone
+# -v uid, as API 24 and 36 print it (tests/fixtures/device/*/R6_u1a_argv.json).
+LIVE_STAMP = "2026-11-04 05:11:16.661446 +0000"
+
+
+def logcat_line(
+    message: str,
+    *,
+    uid: int | str = 10065,
+    pid: int = 1234,
+    tid: int | None = None,
+    level: str = "I",
+    tag: str = "Tag",
+    stamp: str = LIVE_STAMP,
+) -> str:
+    """Format one line of the live wire format, newline included.
+
+    ``uid`` is the ``-v uid`` column: a number, or a short name such as
+    ``root`` (design 5.8). The default uid is an app uid; script its package
+    with ``FakeAdb.dumpsys(package, run(out(dumpsys_package(package, uid))))``.
+    """
+    thread = pid if tid is None else tid
+    return f"{stamp} {uid!s:>5} {pid:5d} {thread:5d} {level} {tag}: {message}\n"
+
+
+def device_date(seconds: int) -> str:
+    """The stdout of ``adb shell date +%s`` on a device whose clock is ``seconds``."""
+    return f"{seconds}\n"
+
+
+def waiting_for_device() -> Run:
+    """``adb logcat`` for a serial that is not attached: it waits, it never exits.
+
+    adb prints ``- waiting for device -`` on stderr and nothing on stdout,
+    still waiting after 10 s (FINDINGS.md, check 4; ``R4_absent_serial.json``).
+    """
+    return run(err("- waiting for device -\n"), hang=True)
+
+
+def not_found(serial: str) -> Run:
+    """``adb get-state`` for a serial adb does not know (``R4_absent_serial.json``)."""
+    return run(err(f"error: device '{serial}' not found\n"), exit_code=1)
 
 
 def dumpsys_package(
@@ -411,6 +467,37 @@ class FakeAdb:
         """
         self._config.setdefault("dumpsys", {})[package] = list(runs)
         self._write_config()
+
+    def date(self, *runs: Run) -> None:
+        """Set the runs for successive ``adb shell date ...`` calls (the device clock).
+
+        Unscripted, the fake prints the host's epoch seconds, so a stream's
+        clock read before each connection (design 3.2) succeeds. Script a
+        value with ``run(out(device_date(seconds)))``, a failure with
+        ``run(err("adb: device offline\\n"), exit_code=1)``.
+        """
+        self._config["date"] = list(runs)
+        self._write_config()
+
+    def get_state(self, *runs: Run) -> None:
+        """Set the runs for successive ``adb get-state`` calls.
+
+        A stream asks it after ``connect_timeout`` without output (design
+        3.2): ``run(out("device\\n"))`` is a quiet device that is there,
+        ``not_found(serial)`` one that is not.
+        """
+        self._config["get-state"] = list(runs)
+        self._write_config()
+
+    def device_absent(self, serial: str) -> None:
+        """Behave as adb does for ``serial`` when no such device is attached.
+
+        ``logcat`` waits without output (`waiting_for_device`), ``get-state``
+        says ``not found``, and ``shell date`` fails (FINDINGS.md, check 4).
+        """
+        self.logcat(waiting_for_device())
+        self.get_state(not_found(serial))
+        self.date(run(err(f"adb: device '{serial}' not found\n"), exit_code=1))
 
     def command(self, name: str, *runs: Run) -> None:
         """Set the runs for another adb command (``devices``, ``connect``...)."""

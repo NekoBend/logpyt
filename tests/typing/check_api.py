@@ -4,9 +4,9 @@ Every ``assert_type`` pins an inferred type. Every ``# ty: ignore[<rule>]`` line
 pins a call or assignment that ty must keep rejecting: pyproject.toml makes an
 unused ignore an error, so a line that stops failing breaks ``ty check``.
 
-The stream constructor overloads of design section 2.3 are checked on a stand-in
-class with the same signatures until ``LogStream`` itself has them (design
-section 11, risk 12: ty is pre-1.0 and may regress on self-typed overloads).
+The stream constructor overloads of design section 2.3 are checked on
+``LogStream`` itself (design section 11, risk 12: ty is pre-1.0 and may regress
+on self-typed overloads).
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Hashable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, assert_never, assert_type, overload
+from typing import TYPE_CHECKING, Literal, assert_never, assert_type
 
 from logpyt import (
     AdbError,
@@ -59,7 +59,7 @@ from logpyt.models.group import GroupReason
 from logpyt.streams._events import GapReason, IncompleteReason, StreamState
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Sequence
 
 
 def check_config() -> None:
@@ -209,11 +209,11 @@ def check_custom_conditions(entry: LogEntry) -> None:
 def check_filter_by_takes_any_condition() -> None:
     # X-7: the 2.x entry points were annotated ``Filter | None``.
     where = (Package("com.example") & Level("E")) | MessageContains("CRITICAL")
-    LogStream(filter_by=where)
+    LogStream(where=where)
     AsyncLogStream(filter_by=CrashCondition(package="com.example"))
     read_file("app.log", where=~Tag("noise"))
     read_file("app.log", where=Where(_is_error))
-    LogStream(filter_by=_is_error)  # ty: ignore[invalid-argument-type]
+    LogStream(where=_is_error)  # ty: ignore[invalid-argument-type]
     read_file("app.log", where=_is_error)  # ty: ignore[invalid-argument-type]
 
 
@@ -279,47 +279,7 @@ def check_log_group(group: LogGroup) -> None:
     group.reason = "end"  # ty: ignore[invalid-assignment]
 
 
-# -- the stream constructor overloads of design section 2.3, on a stand-in ----------
-
-
-class _StreamShape[T]:
-    """Has exactly the constructor overloads design section 2.3 gives LogStream."""
-
-    @overload
-    def __init__(
-        self: _StreamShape[LogEntry],
-        config: StreamConfig | None = None,
-        /,
-        *,
-        where: Condition | None = None,
-        group_by: None = None,
-        on_item: Callable[[LogEntry], object] | None = None,
-        on_event: Callable[[StreamEvent], object] | None = None,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self: _StreamShape[LogGroup],
-        config: StreamConfig | None = None,
-        /,
-        *,
-        where: Condition | None = None,
-        group_by: GroupBy,
-        on_item: Callable[[LogGroup], object] | None = None,
-        on_event: Callable[[StreamEvent], object] | None = None,
-    ) -> None: ...
-    def __init__(
-        self,
-        config: StreamConfig | None = None,
-        /,
-        *,
-        where: Condition | None = None,
-        group_by: GroupBy | None = None,
-        on_item: Callable[[LogEntry], object]
-        | Callable[[LogGroup], object]
-        | None = None,
-        on_event: Callable[[StreamEvent], object] | None = None,
-    ) -> None:
-        del config, where, group_by, on_item, on_event
+# -- LogStream: the constructor overloads and the methods of design section 2.3 -----
 
 
 def _on_event(event: StreamEvent) -> None:
@@ -331,21 +291,49 @@ def check_stream_overloads() -> None:
     groups: list[LogGroup] = []
     events: list[StreamEvent] = []
     config = StreamConfig(serial="emulator-5554", since="now")
-    assert_type(_StreamShape(), _StreamShape[LogEntry])
+    assert_type(LogStream(), LogStream[LogEntry])
     assert_type(
-        _StreamShape(config, on_item=entries.append, on_event=_on_event),
-        _StreamShape[LogEntry],
+        LogStream(config, on_item=entries.append, on_event=_on_event),
+        LogStream[LogEntry],
     )
     assert_type(
-        _StreamShape(where=Tag("x"), on_event=events.append),
-        _StreamShape[LogEntry],
+        LogStream(where=Tag("x"), on_event=events.append),
+        LogStream[LogEntry],
     )
     spec = GroupBy(keys=("pid",), gap_ms=50.0)
-    assert_type(_StreamShape(group_by=spec), _StreamShape[LogGroup])
+    assert_type(LogStream(group_by=spec), LogStream[LogGroup])
     assert_type(
-        _StreamShape(config, group_by=spec, on_item=groups.append),
-        _StreamShape[LogGroup],
+        LogStream(config, group_by=spec, on_item=groups.append),
+        LogStream[LogGroup],
     )
-    _StreamShape(group_by=spec, on_item=entries.append)  # ty: ignore[no-matching-overload]
-    _StreamShape(on_item=groups.append)  # ty: ignore[invalid-argument-type]
-    _StreamShape(config=config)  # ty: ignore[no-matching-overload]
+    LogStream(group_by=spec, on_item=entries.append)  # ty: ignore[no-matching-overload]
+    LogStream(on_item=groups.append)  # ty: ignore[invalid-argument-type]
+    LogStream(config=config)  # ty: ignore[no-matching-overload]
+
+
+def check_stream_methods(
+    stream: LogStream[LogEntry], grouped: LogStream[LogGroup]
+) -> None:
+    assert_type(stream.config, StreamConfig)
+    assert_type(stream.state, StreamState)
+    assert_type(stream.stats, StreamStats)
+    assert_type(stream.outcome, StreamError | None)
+    assert_type(stream.clone(), LogStream[LogEntry])
+    assert_type(grouped.clone(), LogStream[LogGroup])
+    assert_type(iter(stream), Iterator[LogEntry])
+    for entry in stream:
+        assert_type(entry, LogEntry)
+    for group in grouped:
+        assert_type(group, LogGroup)
+    with stream as entered:
+        assert_type(entered, LogStream[LogEntry])
+    stream.start()
+    stream.stop()
+    stream.stop(flush=5.0)
+    stream.kill()
+    stream.join()
+    stream.join(timeout=1.0)
+    stream.wait_running(timeout=30.0)
+    stream.assert_complete()
+    stream.stop(5.0)  # ty: ignore[too-many-positional-arguments]
+    stream.state = StreamState.RUNNING  # ty: ignore[invalid-assignment]

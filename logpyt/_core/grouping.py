@@ -3,8 +3,8 @@
 Design 2.8, D-10 and D-11. Entries go in, closed `LogGroup` objects come out.
 Gap decisions read only the entries' timestamps, as whole microseconds;
 `Grouper.flush_idle` reads only the host-monotonic time its caller passes. The
-stream core drives that idle flush from its timer (PR-10); the 2.x streams
-flush only at the end of the input.
+stream core drives that idle flush from its timer (PR-10); the 2.x
+`AsyncLogStream` flushes only at the end of the input.
 
 Timestamps sit on one timeline per run. It counts naive times by wall clock
 until the first aware timestamp, then switches once to a UTC epoch: each open

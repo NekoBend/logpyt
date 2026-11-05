@@ -1,932 +1,1247 @@
-"""Log stream implementation for capturing and processing ADB logcat output."""
+"""`LogStream`: the thread driver of a live stream (design 2.3, 2.4, 3.3-3.6, 5.3).
+
+`logpyt._core.machine.StreamCore` decides everything about a run (design 5.2):
+its states, every timer, the reconnect budget, flow control, framing, parsing,
+``where``, grouping, attribution and the outcome. This module only runs adb
+and the consumer, and carries out the commands the core returns, as
+`logpyt._core.protocol` documents them.
+
+Threads of one run (design 5.3), all daemon threads:
+
+- the engine (`_Run._engine`): takes one event at a time from the mailbox
+  (`_Run._take`), hands it to `StreamCore.handle` with the monotonic time and
+  carries out the commands (`_Run._carry_out`);
+- per connection, a stdout and a stderr reader (`_Run._read`: an unbuffered
+  ``read(65536)`` into the data inbox of at most 16 chunks, blocking while it
+  is full; each closes its pipe when it ends, X-5) and an exit waiter
+  (`_Run._wait_exit`: ``Popen.wait()`` returns at the exit, whatever holds the
+  pipes);
+- one short-lived worker per one-shot command (`_Run._run_command`);
+- in push mode, one dispatcher for the run's whole lifetime
+  (`_Run._dispatch`: ``for item in <the delivery iterator>: on_item(item)``).
+
+They share one `threading.Condition`. Its lock guards the mailbox (the
+core's `ControlInbox` plus the data inbox), the `Outbox` and what the engine
+publishes after every ``handle()``: ``state``, ``stats`` and whether intake is
+open. No user code runs under it: ``on_item`` and ``on_event`` run in the
+consumer context outside it, ``where`` and ``group_by`` run inside
+``handle()``, which the engine calls without it. Waits in user-facing calls
+(``join``, ``wait_running``, ``__next__``, with-exit) are sliced to 0.25 s so
+that Ctrl+C works on Windows (design 9.2).
+
+The consumer side follows the contract in `logpyt._core.protocol`: one
+delivery iterator (`_Run._deliver_next`) for pull and push, each step one
+critical section that settles the record in hand, pops the next and reports
+the outbox counts. A report waits in one slot for the engine, which posts it
+into the control inbox before it takes anything else, so a request posted
+after it never comes first; the consumer wakes the engine only when the report
+can matter there (nothing was popped, or the outbox is at its low-water mark
+while intake is closed), so a fast consumer does not wake the engine per item.
+"""
 
 from __future__ import annotations
 
 import contextlib
+import contextvars
+import inspect
 import logging
-import queue
-import subprocess
 import threading
 import time
-from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any, Literal, TextIO
+import weakref
+from collections import deque
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Final, Self, assert_never, cast, overload
 
 from logpyt import adb
-from logpyt._core.grouping import Grouper
-from logpyt.adb import _CREATE_NO_WINDOW, _check_package_name
-from logpyt.exceptions import (
-    LogStreamError,
-    LogStreamInternalError,
-    LogStreamKilledError,
-    LogStreamTimeoutError,
+from logpyt._core.machine import StreamCore
+from logpyt._core.mailbox import ControlInbox, Outbox
+from logpyt._core.protocol import (
+    STREAM_LOGGER,
+    CallbackFailed,
+    CommandDone,
+    ConsumerDetached,
+    ConsumerProgress,
+    Data,
+    Deliver,
+    Diagnostic,
+    DiscardUndelivered,
+    Eof,
+    Exited,
+    Finished,
+    Kill,
+    KillRequest,
+    RunCommand,
+    Spawn,
+    Spawned,
+    SpawnFailed,
+    Start,
+    StopRequest,
+    Terminate,
+    Tick,
 )
-from logpyt.filters import Condition, _require_condition
+from logpyt.config import StreamConfig, _parse_logcat_args
+from logpyt.exceptions import IncompleteCaptureError, UsageError
+from logpyt.filters import _require_condition
 from logpyt.groupers import GroupBy
-from logpyt.models import LogGroup
-from logpyt.parsers import LogParser, ParseContext, ThreadTimeLogParser
-from logpyt.parsers._fallback import unparsed_entry
-
-from .common import StreamState, build_pidof_command
+from logpyt.models import LogEntry, LogGroup
+from logpyt.streams._events import StateChange, StreamState
 
 if TYPE_CHECKING:
+    import subprocess
+    from collections.abc import Callable, Iterable, Iterator
     from types import TracebackType
+    from typing import IO, Literal
 
-    from logpyt.models import LogEntry
+    from logpyt._core.protocol import Command, Event, Item, OutboxCounts, Pipe, Record
+    from logpyt.exceptions import StreamError
+    from logpyt.filters import Condition
+    from logpyt.streams._events import StreamEvent, StreamStats
 
-__all__ = ["LogStream", "PidMonitor", "StreamHandle"]
+__all__ = ["LogStream"]
 
-# Cap a single readline() so a device that emits output without a newline cannot
-# grow the reader thread's memory without bound (mirrors the async _READ_LIMIT).
-_READ_LIMIT = 8 * 1024 * 1024
+_log = logging.getLogger(STREAM_LOGGER)
 
+# Design 5.3: one pipe read, and the data inbox's capacity in chunks.
+_READ_SIZE: Final = 65536
+_DATA_SLOTS: Final = 16
+# Design 5.3 and 9.2: the longest wait in a user-facing call, so Ctrl+C works.
+_SLICE: Final = 0.25
+# Design 3.4: with-exit waits this long after it killed the stream.
+_KILL_WAIT: Final = 1.0
+_TERMINAL: Final = frozenset(
+    {StreamState.STOPPED, StreamState.KILLED, StreamState.FAILED}
+)
+_TICK: Final = Tick()
 
-class PidMonitor:
-    """Monitors PIDs for specific packages using ADB."""
-
-    def __init__(
-        self,
-        adb_path: str,
-        device_id: str | None,
-        packages: list[str],
-        poll_interval: float = 2.0,
-        max_poll_interval: float = 30.0,
-        poll_backoff_factor: float = 2.0,
-        max_resolves_per_cycle: int = 32,
-    ) -> None:
-        """Initialize the PID monitor.
-
-        Args:
-            adb_path: Path to ADB executable.
-            device_id: Target device serial ID.
-            packages: List of package names to monitor.
-            poll_interval: Base interval in seconds between PID polls.
-            max_poll_interval: Maximum poll interval in seconds when idle.
-            poll_backoff_factor: Multiplier applied after unchanged polls.
-            max_resolves_per_cycle: Maximum packages to resolve per poll cycle.
-        """
-        self.adb_path = adb_path
-        self.device_id = device_id
-        self.packages = list(set(packages))
-        self.poll_interval = max(0.1, poll_interval)
-        self.max_poll_interval = max(self.poll_interval, max_poll_interval)
-        self.poll_backoff_factor = max(1.0, poll_backoff_factor)
-        self.max_resolves_per_cycle = max(1, max_resolves_per_cycle)
-        self._pid_map: dict[int, str] = {}
-        self._lock = threading.RLock()
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._resolve_cursor = 0
-
-    def start(self) -> None:
-        """Start the monitoring thread."""
-        if not self.packages:
-            return
-
-        # Fresh event per run so a slow previous thread (still inside a pidof call
-        # when stop()'s bounded join timed out) keeps observing its OWN set event
-        # and exits, instead of being resurrected when the next start() clears a
-        # shared one.
-        self._stop_event = threading.Event()
-        stop_event = self._stop_event
-        self._thread = threading.Thread(
-            target=self._run, args=(stop_event,), name="PidMonitor", daemon=True
-        )
-        self._thread.start()
-
-    def stop(self) -> None:
-        """Stop the monitoring thread."""
-        self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=1.0)
-
-    def get_package(self, pid: int) -> str | None:
-        """Get the package name for a given PID.
-
-        Args:
-            pid: The process ID.
-
-        Returns:
-            The package name if found, None otherwise.
-        """
-        with self._lock:
-            return self._pid_map.get(pid)
-
-    def _run(self, stop_event: threading.Event) -> None:
-        """Internal loop to poll PIDs."""
-        current_interval = self.poll_interval
-        while not stop_event.is_set():
-            packages = self.packages
-            total = len(packages)
-            cycle_limit = min(total, self.max_resolves_per_cycle)
-            polled_packages: list[str] = []
-            resolved_map: dict[int, str] = {}
-            for offset in range(cycle_limit):
-                package = packages[(self._resolve_cursor + offset) % total]
-                polled_packages.append(package)
-                pids = self._resolve_pids(package)
-                for pid in pids:
-                    resolved_map[pid] = package
-
-            if cycle_limit == total:
-                new_map = resolved_map
-            else:
-                polled_package_set = set(polled_packages)
-                with self._lock:
-                    new_map = {
-                        pid: package
-                        for pid, package in self._pid_map.items()
-                        if package not in polled_package_set
-                    }
-                new_map.update(resolved_map)
-
-            if total:
-                self._resolve_cursor = (self._resolve_cursor + cycle_limit) % total
-
-            changed = self._update_pid_map(new_map)
-
-            if changed:
-                current_interval = self.poll_interval
-            else:
-                current_interval = min(
-                    self.max_poll_interval,
-                    current_interval * self.poll_backoff_factor,
-                )
-
-            stop_event.wait(current_interval)
-
-    def _update_pid_map(self, new_map: dict[int, str]) -> bool:
-        """Apply PID map changes in place.
-
-        This avoids replacing the full mapping object when there are no changes,
-        while still preserving exact add/update/remove semantics.
-
-        Args:
-            new_map: Latest PID to package mapping snapshot.
-
-        Returns:
-            True if at least one mapping changed, False otherwise.
-        """
-        with self._lock:
-            if self._pid_map == new_map:
-                return False
-
-            current_pids = set(self._pid_map)
-            new_pids = set(new_map)
-
-            for stale_pid in current_pids - new_pids:
-                del self._pid_map[stale_pid]
-
-            for pid, package in new_map.items():
-                if self._pid_map.get(pid) != package:
-                    self._pid_map[pid] = package
-
-            return True
-
-    def _resolve_pids(self, package: str) -> list[int]:
-        """Resolve PIDs for a package using ADB."""
-        try:
-            cmd = build_pidof_command(self.adb_path, self.device_id, package)
-            # Use a timeout to prevent hanging
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=5.0,
-                creationflags=_CREATE_NO_WINDOW,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return [
-                    int(p) for p in result.stdout.split() if p.isdigit() and len(p) <= 7
-                ]
-        except Exception as exc:  # noqa: BLE001
-            # A polling monitor must never crash: any failure (device disconnected,
-            # command failed, malformed output, a name the builder refuses)
-            # degrades to returning no PIDs.
-            logging.getLogger("logpyt").debug(
-                "pidof resolution failed for %s: %s", package, exc
-            )
-        return []
+# The run whose on_item or on_event is running in this context (F3-7).
+_IN_CALLBACK: contextvars.ContextVar[_Run | None] = contextvars.ContextVar(
+    "logpyt_stream_callback", default=None
+)
 
 
-class StreamHandle:
-    """Handle to control a LogStream instance."""
+@dataclass(slots=True, eq=False)
+class _Consumer:
+    """The one consumer of a run: the push dispatcher or a pull iterator.
 
-    def __init__(self, stream: LogStream) -> None:
-        """Initialize the handle.
-
-        Args:
-            stream: The LogStream instance to control.
-        """
-        self._stream = stream
-
-    def stop(self) -> None:
-        """Stop the log stream gracefully."""
-        self._stream.stop()
-
-    def kill(self) -> None:
-        """Kill the log stream immediately."""
-        self._stream.kill()
-
-    def pause(self) -> None:
-        """Pause dispatching of log entries."""
-        self._stream.pause()
-
-    def resume(self) -> None:
-        """Resume dispatching of log entries."""
-        self._stream.resume()
-
-    def join(self, timeout: float | None = None) -> None:
-        """Wait for the stream to finish."""
-        self._stream.join(timeout)
-
-    @property
-    def state(self) -> StreamState:
-        """Get the current state of the stream."""
-        return self._stream.state
-
-
-# Type aliases for callbacks
-LogCallback = Callable[[Any, StreamHandle], None]
-StateCallback = Callable[[StreamState], None]
-ErrorCallback = Callable[[Exception], None]
-LifecycleCallback = Callable[[], None]
-
-
-class LogStream:
-    """Manages an ADB logcat subprocess and processes its output.
-
-    This class handles the lifecycle of the `adb logcat` process, parses its output
-    into `LogEntry` objects, applies filters and groupers, and dispatches the results
-    to user-provided callbacks.
-
-    Usage:
-        ```python
-        from logpyt import LogStream, LogEntry, StreamHandle
-
-        def my_callback(entry: LogEntry, handle: StreamHandle) -> None:
-            if entry.tag == "MyApp":
-                print(f"MyApp Log: {entry.message}")
-
-        stream = LogStream(stdout_callback=my_callback)
-        stream.start()
-
-        # Do other work...
-
-        stream.stop()
-        stream.join()
-        ```
-
-        Grouping usage:
-        ```python
-        from logpyt import GroupBy
-
-        # Group logs by PID and TID if within 50ms, handling interleaved logs;
-        # the callback then receives LogGroup objects.
-        stream = LogStream(
-            stdout_callback=my_callback,
-            group_by=GroupBy(keys=("pid", "tid"), gap_ms=50.0, mode="windowed"),
-        )
-        ```
+    Attributes:
+        owner: The thread that created a pull iterator (design 3.5), by a
+            weak reference (`_thread_ref`); None for the dispatcher.
+        push: Whether this is the dispatcher.
+        attached: False once it detached (`_Run._detach`).
+        owe_done: The record in hand was finished with; the next step settles
+            it (`Outbox.done`).
+        failed: Its callback raised: it takes nothing more (design A.21).
+        reached_end: It saw the end of the outbox (or failed), so a pull
+            iterator raises a FAILED outcome.
     """
 
+    owner: weakref.ref[threading.Thread] | None
+    push: bool
+    attached: bool = True
+    owe_done: bool = False
+    failed: bool = False
+    reached_end: bool = False
+
+
+class _Run:
+    """One run's mailbox, outbox, workers and consumer side (see the module docs)."""
+
     def __init__(
         self,
-        adb_path: str | None = None,
-        device_id: str | None = None,
-        parser: LogParser | None = None,
-        filter_by: Condition | None = None,
-        group_by: GroupBy | None = None,
-        stdout_callback: LogCallback | None = None,
-        stderr_callback: LogCallback | None = None,
-        on_start: LifecycleCallback | None = None,
-        on_stop: LifecycleCallback | None = None,
-        on_state: StateCallback | None = None,
-        on_error: ErrorCallback | None = None,
-        logcat_args: Sequence[str] | None = None,
-        auto_reconnect: bool = False,  # noqa: FBT001, FBT002 (existing public signature)
-        reconnect_delay: float = 1.0,
-        max_queue_size: int = 10000,
-        read_timeout: float | None = None,
-        queue_full_warning_interval: float = 5.0,
-        queue_overflow_policy: Literal["drop_newest", "drop_oldest"] = "drop_newest",
-        pid_poll_interval: float = 2.0,
-        pid_max_poll_interval: float = 30.0,
-        pid_poll_backoff_factor: float = 2.0,
-        pid_max_resolves_per_cycle: int = 32,
+        core: StreamCore,
+        config: StreamConfig,
+        *,
+        on_item: Callable[[Any], object] | None,
+        on_event: Callable[[StreamEvent], object] | None,
     ) -> None:
-        """Initialize the LogStream.
+        self.core = core
+        self.on_item = on_item
+        self.on_event = on_event
+        self.cond = threading.Condition()
+        self.control = ControlInbox()
+        self.data: deque[Data | Eof] = deque()
+        self.data_closed = False
+        self.outbox = Outbox()
+        self.procs: dict[int, subprocess.Popen[bytes]] = {}
+        self.buffer_entries = config.buffer_entries
+        self.buffer_bytes = config.buffer_bytes
+        # What the engine publishes after every handle() (design 3.6).
+        self.state = StreamState.IDLE
+        self.stats = core.stats()
+        self.intake_open = True
+        self.concluded = False
+        self.reached_running = False
+        self.finished = False  # Finished was carried out
+        self.outcome: StreamError | None = None
+        self.ended = False  # the engine is gone: what join() waits for
+        self.crash: BaseException | None = None
+        # The consumer side.
+        self.started = False
+        self.kill_flag = False
+        self.consumer: _Consumer | None = None
+        self.consumed = False  # a consumer was attached once
+        self.pending: OutboxCounts | None = None  # a report the engine has not taken
+        self.posted: OutboxCounts | None = None  # the counts reported last
+        self.seen = False  # join(), iteration or wait_running() raised the outcome
+        self.orphaned = False  # the LogStream was garbage-collected
+        # The worker threads (`_thread_ref`), for the F3-7 check.
+        self.engine_thread: weakref.ref[threading.Thread] | None = None
+        self.dispatcher_thread: weakref.ref[threading.Thread] | None = None
 
-        Args:
-            adb_path: Path to ADB executable. If None, resolved automatically.
-            device_id: Target device serial ID.
-            parser: Parser to convert lines to LogEntry objects.
-            filter_by: The condition an entry must meet to be delivered. The
-                packages of its `Package` conditions (anywhere in the tree,
-                under `Or` and `Not` too) are resolved to pids.
-            group_by: How to group the stdout entries; the stdout callback
-                then receives `LogGroup` objects. The groups still open when
-                stdout ends are delivered with reason "end".
-            stdout_callback: Callback for processed stdout entries.
-                Signature: `Callable[[LogEntry, StreamHandle], None]`.
-                The second argument is the `StreamHandle`, which allows controlling
-                the stream (e.g., `handle.stop()`) from within the callback.
-            stderr_callback: Callback for processed stderr entries.
-                Signature: `Callable[[LogEntry, StreamHandle], None]`.
-                The second argument is the `StreamHandle`, which allows controlling
-                the stream (e.g., `handle.stop()`) from within the callback.
-            on_start: Hook called when stream starts.
-            on_stop: Hook called when stream stops.
-            on_state: Hook called when state changes.
-            on_error: Hook called when an error occurs.
-            logcat_args: Additional arguments for `adb logcat`.
-            auto_reconnect: Whether to automatically reconnect when the process exits.
-            reconnect_delay: Delay in seconds before reconnecting.
-            max_queue_size: Maximum size of the callback queue. Defaults to 10000.
-            read_timeout: Timeout in seconds for reading from the stream.
-            queue_full_warning_interval: Minimum interval in seconds between
-                repeated queue-full warnings. Defaults to 5.0.
-            queue_overflow_policy: Policy for callback queue overflow.
-                "drop_newest" drops incoming data, "drop_oldest" evicts the
-                oldest queued item.
-            pid_poll_interval: Base interval in seconds for PID monitoring.
-            pid_max_poll_interval: Maximum PID poll interval when idle.
-            pid_poll_backoff_factor: Backoff factor for unchanged PID snapshots.
-            pid_max_resolves_per_cycle: Maximum packages to resolve per PID poll cycle.
-        """
-        self.adb_path = adb_path or adb.resolve_adb()
-        self.device_id = device_id
-        self.parser = parser or ThreadTimeLogParser()
-        # One parse session per adb connection (F6-1); replaced at each spawn.
-        self._parse_context = ParseContext()
-        self.filter_by = (
-            None if filter_by is None else _require_condition(filter_by, "filter_by")
-        )
-        self.auto_reconnect = auto_reconnect
-        self.reconnect_delay = reconnect_delay
-        self.max_queue_size = max_queue_size
-        self.read_timeout = read_timeout
-        self._queue_full_warning_interval = max(0.0, queue_full_warning_interval)
-        self.queue_overflow_policy = queue_overflow_policy
-        self.pid_poll_interval = pid_poll_interval
-        self.pid_max_poll_interval = pid_max_poll_interval
-        self.pid_poll_backoff_factor = pid_poll_backoff_factor
-        self.pid_max_resolves_per_cycle = pid_max_resolves_per_cycle
+    # -- control, from any thread ------------------------------------------------------
 
-        if group_by is not None and not isinstance(group_by, GroupBy):
-            msg = f"group_by must be a GroupBy, not {type(group_by).__name__}"
-            raise TypeError(msg)
-        self.group_by = group_by
-        # One grouping state per stream; the stdout reader flushes it at EOF.
-        self._grouper = None if group_by is None else Grouper(group_by)
+    def start(self, *, push: bool) -> bool:
+        """Start the engine (and the dispatcher); False if already started."""
+        with self.cond:
+            if self.started:
+                return False
+            self.started = True
+            if push:
+                self.consumer = _Consumer(owner=None, push=True)
+                self.consumed = True
+            self.control.post(Start())
+        threading.Thread(target=self._engine, name="logpyt-engine", daemon=True).start()
+        if push:
+            threading.Thread(
+                target=self._dispatch, name="logpyt-dispatcher", daemon=True
+            ).start()
+        return True
 
-        self.stdout_callback = stdout_callback
-        self.stderr_callback = stderr_callback
-        self.on_start = on_start
-        self.on_stop = on_stop
-        self.on_state = on_state
-        self.on_error = on_error
-        self.logcat_args = list(logcat_args) if logcat_args else []
+    def stop(self, flush: float | None, *, detach_own: bool = False) -> None:
+        """Post a stop; detach the outbox when no consumer is attached (3.5)."""
+        with self.cond:
+            if detach_own:
+                consumer = self.consumer
+                if consumer is not None and _owned_here(consumer):
+                    self._detach(consumer)
+            if not self.started or self.finished:
+                return  # D-6, G2
+            self._post(StopRequest(flush))
+            if self.consumer is None and not self.outbox.detached:
+                # Nobody takes the rest: discard and count it (design 3.5).
+                self.outbox.detach()
+                self._post(ConsumerDetached(self._counts()))
 
-        self._exceptions: queue.Queue[Exception] = queue.Queue()
-        # Serializes grouper access: stdout and stderr reader threads share one grouper.
-        self._grouper_lock = threading.Lock()
-        self._callback_queue: queue.Queue[
-            tuple[Sequence[LogEntry | LogGroup], str] | None
-        ] = queue.Queue(maxsize=self.max_queue_size)
-        self._pid_monitor: PidMonitor | None = None
-        # F5-1: every Package in the condition tree, not only Filter's. F5-3:
-        # each name reaches the device shell, and an override of packages()
-        # bypasses Package's own check, so a bad name fails here.
-        packages = frozenset() if self.filter_by is None else self.filter_by.packages()
-        if packages:
-            self._pid_monitor = PidMonitor(
-                self.adb_path,
-                self.device_id,
-                sorted(_check_package_name(name) for name in packages),
-                poll_interval=self.pid_poll_interval,
-                max_poll_interval=self.pid_max_poll_interval,
-                poll_backoff_factor=self.pid_poll_backoff_factor,
-                max_resolves_per_cycle=self.pid_max_resolves_per_cycle,
+    def kill(self, *, detach_own: bool = False) -> None:
+        """Set the kill flag and post the kill where the core acts (F2-7, D-6)."""
+        with self.cond:
+            if detach_own:
+                consumer = self.consumer
+                if consumer is not None and _owned_here(consumer):
+                    self._detach(consumer)
+            if not self.started or self.finished:
+                return
+            self.kill_flag = True
+            self._post(KillRequest())
+
+    def abandon(self) -> None:
+        """The LogStream was garbage-collected: kill a running run (design 3.4)."""
+        late: str | None = None
+        with self.cond:
+            self.orphaned = True
+            if self.finished:
+                late = self._unseen_outcome_message()
+            elif self.started:
+                self.kill_flag = True
+                self._post(KillRequest())
+        if late is not None:
+            _log.error("%s", late)
+
+    def kill_children(self) -> None:
+        """Kill every live adb child at once (interpreter shutdown: no threads)."""
+        for proc in list(self.procs.values()):
+            with contextlib.suppress(OSError):
+                proc.kill()
+
+    def attach(self) -> _Consumer:
+        """Attach a pull iterator, or raise UsageError (design 2.3, 4.2)."""
+        with self.cond:
+            if not self.started:
+                msg = (
+                    "LogStream iterated before start(): use `with LogStream(...) as "
+                    "stream: for entry in stream: ...`, or call stream.start() first"
+                )
+                raise UsageError(msg)
+            if self.consumed:
+                msg = (
+                    "LogStream has one iterator per run, and it was already created; "
+                    "keep that iterator, or use stream.clone() for a new run"
+                )
+                raise UsageError(msg)
+            if self.outbox.detached:
+                msg = (
+                    "LogStream iterated after stop() without an attached iterator: "
+                    "stop() discarded the rest (design 3.5); iterate first, then stop()"
+                )
+                raise UsageError(msg)
+            consumer = _Consumer(owner=_thread_ref(), push=False)
+            self.consumer = consumer
+            self.consumed = True
+            return consumer
+
+    def detach(self, consumer: _Consumer) -> None:
+        """A pull iterator was closed or dropped."""
+        with self.cond:
+            self._detach(consumer)
+
+    # -- waits, from user code ------------------------------------------------------
+
+    def check_wait(self, what: str, *, iterator: bool) -> None:
+        """UsageError for a wait from the stream's own user code (F3-7, design 3.5)."""
+        if (
+            _IN_CALLBACK.get() is self
+            or _is_current(self.engine_thread)
+            or _is_current(self.dispatcher_thread)
+        ):
+            msg = (
+                f"{what} called from a stream callback; call stream.stop() and "
+                "return instead"
             )
+            raise UsageError(msg)
+        consumer = self.consumer
+        if iterator and consumer is not None and _owned_here(consumer):
+            msg = (
+                f"{what} would wait for this thread's own iterator; iterate to the "
+                "end, break, or call it.close() first"
+            )
+            raise UsageError(msg)
 
-        self._process: subprocess.Popen[str] | None = None
-        self._stdout_thread: threading.Thread | None = None
-        self._stderr_thread: threading.Thread | None = None
-        self._callback_thread: threading.Thread | None = None
-        self._connection_thread: threading.Thread | None = None
-        self._state = StreamState.IDLE
-        self._state_lock = threading.RLock()
-        self._handle = StreamHandle(self)
-        self._stop_event = threading.Event()
+    def wait_ended(self, timeout: float | None, what: str) -> None:
+        """Wait in slices until the engine has ended; TimeoutError on expiry."""
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        with self.cond:
+            while not self.ended:
+                if deadline is None:
+                    self.cond.wait(_SLICE)
+                    continue
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    msg = (
+                        f"{what} timed out after {timeout:g} s; the stream keeps "
+                        "running"
+                    )
+                    raise TimeoutError(msg)
+                self.cond.wait(min(_SLICE, left))
 
-        self._last_activity: float = 0.0
-        self._activity_lock = threading.Lock()
-        self._watchdog_thread: threading.Thread | None = None
-        self._last_queue_full_warning: dict[str, float] = {}
-        self._queue_warning_lock = threading.Lock()
+    def wait_running(self, timeout: float | None) -> None:
+        """Wait until the first RUNNING or the run's conclusion (design A.21)."""
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        with self.cond:
+            while not (self.reached_running or self.concluded or self.crash):
+                left = _SLICE if deadline is None else deadline - time.monotonic()
+                if left <= 0:
+                    msg = (
+                        f"wait_running() timed out after {timeout:g} s; the stream "
+                        f"is {self.state} and keeps running"
+                    )
+                    raise TimeoutError(msg)
+                self.cond.wait(min(_SLICE, left))
+            if self.reached_running and self.crash is None:
+                return
+            error = self._take_error(unseen_only=False)
+        if error is not None:
+            raise error
+
+    def wait_while_progressing(self, close_timeout: float) -> bool:
+        """Wait until the end while the consumer takes items; False once it took
+        nothing for ``close_timeout`` (design 3.4).
+        """
+        with self.cond:
+            last = self.outbox.counts()
+            since = time.monotonic()
+            while not self.ended:
+                now = time.monotonic()
+                counts = self.outbox.counts()
+                if (counts.taken_entries, counts.handled) != (
+                    last.taken_entries,
+                    last.handled,
+                ):
+                    last, since = counts, now
+                elif now - since >= close_timeout:
+                    return False
+                self.cond.wait(min(_SLICE, close_timeout - (now - since)))
+            return True
+
+    def take_error(self, *, unseen_only: bool) -> BaseException | None:
+        """The error a finished run raises (its FAILED outcome), marked seen."""
+        with self.cond:
+            return self._take_error(unseen_only=unseen_only)
+
+    def _take_error(self, *, unseen_only: bool) -> BaseException | None:
+        if self.crash is not None:
+            return self.crash
+        if self.outcome is None or (unseen_only and self.seen):
+            return None
+        self.seen = True
+        return self.outcome
+
+    # -- the consumer side: one delivery iterator for pull and push -----------------
+
+    def _dispatch(self) -> None:
+        """Push mode: ``for item in <the delivery iterator>: on_item(item)`` (A-4)."""
+        self.dispatcher_thread = _thread_ref()
+        consumer = self.consumer
+        on_item = self.on_item
+        assert consumer is not None  # noqa: S101  (set by start)
+        assert on_item is not None  # noqa: S101  (push mode has one)
+        try:
+            while (item := self.deliver_next(consumer, sliced=False)) is not None:
+                if not self._call(consumer, "on_item", on_item, item):
+                    return
+        finally:
+            self.detach(consumer)
+
+    def deliver_next(self, consumer: _Consumer, *, sliced: bool) -> Item | None:
+        """The next item for ``consumer``, ``on_event`` run for the events before it.
+
+        None at the consumer's end: the outbox ended, it was detached, or a
+        callback raised (``on_event`` here, ``on_item`` before).
+        """
+        while True:
+            record = self._step(consumer, sliced=sliced)
+            if record is None:
+                return None
+            if isinstance(record, LogEntry | LogGroup):
+                return record
+            on_event = self.on_event
+            if on_event is None:
+                consumer.owe_done = True
+            elif not self._call(consumer, "on_event", on_event, record):
+                return None
+
+    def _step(self, consumer: _Consumer, *, sliced: bool) -> Record | None:
+        """Settle, pop and report in one critical section (protocol module docs)."""
+        with self.cond:
+            while True:
+                if consumer.failed:
+                    self._await_close(consumer, sliced=sliced)
+                    return None
+                if consumer.owe_done:
+                    consumer.owe_done = False
+                    self.outbox.done()
+                if not consumer.attached:
+                    return None
+                if self.kill_flag and self.outbox.entries and not self.outbox.closed:
+                    # F2-7: no item is taken after kill(). The core discards
+                    # them (DiscardUndelivered, counted in undelivered: 3.4),
+                    # and the events behind them still come.
+                    self._report(empty=True)
+                    self.cond.wait(_SLICE if sliced else None)
+                    continue
+                record = self.outbox.pop()
+                self._report(empty=record is None)
+                if record is None:
+                    if self.outbox.ended:
+                        consumer.reached_end = True
+                        self._detach(consumer)
+                        return None
+                    self.cond.wait(_SLICE if sliced else None)
+                    continue
+                return record
+
+    def _call(
+        self,
+        consumer: _Consumer,
+        stage: Literal["on_item", "on_event"],
+        callback: Callable[[Any], object],
+        record: Record,
+    ) -> bool:
+        """Run one callback in the consumer context; False if it failed (2.4)."""
+        token = _IN_CALLBACK.set(self)
+        try:
+            result = callback(record)
+            if result is not None and inspect.isawaitable(result):
+                if inspect.iscoroutine(result):
+                    result.close()
+                msg = (
+                    f"{stage} returned an awaitable, which LogStream never awaits; "
+                    "use AsyncLogStream for async callbacks"
+                )
+                raise TypeError(msg)
+        except Exception as exc:  # noqa: BLE001  (fail fast: CallbackError)
+            self._fail(consumer, stage, exc)
+            return False
+        except BaseException as exc:
+            if consumer.push:  # SystemExit in the dispatcher thread (F3-6)
+                self._fail(consumer, stage, exc)
+                return False
+            # Interrupted, not failed: the next step settles the record.
+            consumer.owe_done = True
+            raise
+        finally:
+            _IN_CALLBACK.reset(token)
+        consumer.owe_done = True
+        return True
+
+    def _fail(
+        self,
+        consumer: _Consumer,
+        stage: Literal["on_item", "on_event"],
+        error: BaseException,
+    ) -> None:
+        """Post the failure; take nothing more; detach once the outbox is closed."""
+        with self.cond:
+            consumer.failed = True
+            late = self._post(CallbackFailed(stage, error))
+        if late is not None:
+            _log.error("%s", late, exc_info=error)
+        with self.cond:
+            self._await_close(consumer, sliced=not consumer.push)
+
+    def _await_close(self, consumer: _Consumer, *, sliced: bool) -> None:
+        """After a failure: wait (lock held) until the outbox is closed, then detach."""
+        while consumer.attached and not self.outbox.closed:
+            self.cond.wait(_SLICE if sliced else None)
+        consumer.reached_end = True
+        self._detach(consumer)
+
+    def _report(self, *, empty: bool) -> None:
+        """The consumer side's report of the outbox counts (lock held).
+
+        The engine takes it before any later request (`_take`); it is woken
+        only when the report can change its course.
+        """
+        counts = self.outbox.counts()
+        if counts is self.posted:
+            return
+        self.posted = counts
+        if self.ended:
+            self._handle_late(ConsumerProgress(counts))
+            return
+        self.pending = counts
+        low = (
+            2 * self.outbox.entries <= self.buffer_entries
+            and 2 * self.outbox.nbytes <= self.buffer_bytes
+        )
+        if empty or (low and not self.intake_open):
+            self.cond.notify_all()
+
+    def _detach(self, consumer: _Consumer) -> None:
+        """`Outbox.detach` and `ConsumerDetached` in one critical section (locked)."""
+        if not consumer.attached:
+            return
+        consumer.attached = False
+        if self.consumer is consumer:
+            self.consumer = None
+        self.outbox.detach()
+        self._post(ConsumerDetached(self._counts()))
+
+    def _counts(self) -> OutboxCounts:
+        counts = self.outbox.counts()
+        self.posted = counts
+        return counts
+
+    # -- the mailbox ------------------------------------------------------------------
+
+    def _post(self, event: Event) -> str | None:
+        """Hand ``event`` to the engine (lock held); after its end, to the core.
+
+        Returns the ERROR message of a callback failure that came after the
+        engine ended (`StreamCore.late_failure`), for the caller to log.
+        """
+        if self.ended:
+            return self._handle_late(event)
+        self.control.post(event)
+        self.cond.notify_all()
+        return None
+
+    def _handle_late(self, event: Event) -> str | None:
+        """The engine has ended: the core is ours under the lock (G2: accounting)."""
+        if self.crash is not None or not isinstance(
+            event, ConsumerProgress | ConsumerDetached | CallbackFailed
+        ):
+            return None
+        late = (
+            self.core.late_failure(event) if isinstance(event, CallbackFailed) else None
+        )
+        self.core.handle(event, time.monotonic())
+        self.stats = self.core.stats()
+        return late
+
+    def _take(self, *, intake_open: bool, deadline: float | None) -> Event | None:
+        """The engine's next event (design 5.3); None once the run is over.
+
+        The control inbox comes first, then data while intake is open, then a
+        `Tick` at the deadline. The run is over once `Finished` was carried
+        out and no consumer is attached any more.
+        """
+        with self.cond:
+            while True:
+                pending = self.pending
+                if pending is not None:
+                    self.pending = None
+                    self.control.post(ConsumerProgress(pending))
+                event = self.control.take()
+                if event is not None:
+                    return event
+                data = self.data
+                if data and intake_open:
+                    if len(data) >= _DATA_SLOTS:
+                        self.cond.notify_all()  # a reader waits for room
+                    return data.popleft()
+                if self.finished and self.consumer is None:
+                    self._end()
+                    return None
+                if deadline is None:
+                    self.cond.wait()
+                    continue
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return _TICK
+                self.cond.wait(left)
+
+    def _end(self) -> None:
+        """The engine is done (lock held): join() returns; readers drop their data."""
+        self.ended = True
+        self.data_closed = True
+        self.data.clear()
+        self.cond.notify_all()
+
+    # -- the engine ---------------------------------------------------------------
+
+    def _engine(self) -> None:
+        self.engine_thread = _thread_ref()
+        core = self.core
+        try:
+            while (
+                event := self._take(
+                    intake_open=core.intake_open, deadline=core.next_deadline()
+                )
+            ) is not None:
+                if isinstance(event, CallbackFailed):
+                    late = core.late_failure(event)
+                    if late is not None:
+                        _log.error("%s", late, exc_info=event.error)
+                self._carry_out(core.handle(event, time.monotonic()))
+        except BaseException as exc:  # noqa: BLE001  (a bug: end the run visibly)
+            self._crashed(exc)
+
+    def _carry_out(self, commands: Iterable[Command]) -> None:
+        """Carry out one ``handle()`` batch in order, then report and publish."""
+        changed = False  # the batch changed the outbox counts
+        for command in commands:
+            match command:
+                case Deliver(records=records):
+                    changed |= self._deliver(records)
+                case DiscardUndelivered():
+                    with self.cond:
+                        before = self.outbox.counts()
+                        self.outbox.discard()
+                        changed |= self.outbox.counts() is not before
+                        self.cond.notify_all()  # a consumer waits under the kill flag
+                case Diagnostic(level=level, message=message, logger=name):
+                    logging.getLogger(name).log(level, "%s", message)
+                case Spawn(connection=connection, argv=argv):
+                    self._spawn(connection, argv)
+                case Terminate(connection=connection):
+                    self._signal(connection, kill=False)
+                case Kill(connection=connection):
+                    self._signal(connection, kill=True)
+                case RunCommand():
+                    threading.Thread(
+                        target=self._run_command,
+                        args=(command,),
+                        name=f"logpyt-{command.kind}",
+                        daemon=True,
+                    ).start()
+                case Finished(outcome=outcome):
+                    self._finished(outcome)
+                    changed = False
+                case _:
+                    assert_never(command)
+        with self.cond:
+            if changed:
+                self.control.post(ConsumerProgress(self._counts()))
+            self._publish()
+
+    def _deliver(self, records: tuple[Record, ...]) -> bool:
+        """`Deliver`: append to the outbox; whether that changed its counts."""
+        with self.cond:
+            before = self.outbox.counts()
+            self.outbox.put(records)
+            if not self.reached_running and any(
+                isinstance(record, StateChange) and record.new is StreamState.RUNNING
+                for record in records
+            ):
+                self.reached_running = True
+            self.cond.notify_all()
+            return self.outbox.counts() is not before
+
+    def _finished(self, outcome: StreamError | None) -> None:
+        """`Finished`: the engine side's last report first, then the end (protocol)."""
+        with self.cond:
+            counts = self._counts()
+        # The core is terminal now: this updates only its accounting (G2).
+        self.core.handle(ConsumerProgress(counts), time.monotonic())
+        with self.cond:
+            self.outbox.close()
+            self.finished = True
+            self.outcome = outcome
+            self._publish()
+            late = self._unseen_outcome_message() if self.orphaned else None
+            self.cond.notify_all()
+        if late is not None:
+            _log.error("%s", late)
+
+    def _publish(self) -> None:
+        """Publish the core's state, stats and intake (lock held; design 3.6)."""
+        core = self.core
+        self.stats = core.stats()
+        self.intake_open = core.intake_open
+        state = core.state
+        concluded = core.concluded
+        if state is not self.state or concluded is not self.concluded:
+            self.state = state
+            self.concluded = concluded
+            if state is StreamState.RUNNING:
+                self.reached_running = True
+            self.cond.notify_all()
+
+    def _unseen_outcome_message(self) -> str | None:
+        """The ERROR for a FAILED outcome nobody saw (lock held; design 3.4)."""
+        if self.outcome is None or self.seen:
+            return None
+        self.seen = True
+        return (
+            "a LogStream was garbage-collected and its run ended FAILED without "
+            f"anyone seeing it: {type(self.outcome).__name__}: {self.outcome}"
+        )
+
+    def _crashed(self, error: BaseException) -> None:
+        """The engine failed (a logpyt bug): end the run so no wait hangs."""
+        _log.error("the LogStream engine failed; the run is abandoned", exc_info=error)
+        with self.cond:
+            self.crash = error
+            self.finished = True
+            self.outbox.close()
+            self._end()
+        self.kill_children()
+
+    # -- workers ---------------------------------------------------------------------
+
+    def _spawn(self, connection: int, argv: tuple[str, ...]) -> None:
+        """`Spawn`: start adb, report it, start its readers and its exit waiter."""
+        try:
+            # Through the module, like resolve_adb: one patch point for tests.
+            proc = adb._spawn_adb(argv)  # noqa: SLF001
+        except OSError as exc:
+            with self.cond:
+                self._post(SpawnFailed(connection, exc))
+            return
+        with self.cond:
+            self.procs[connection] = proc
+            # Posted before any reader runs, so the core sees it before the data.
+            self._post(Spawned(connection, proc.pid))
+        pipes: tuple[tuple[Pipe, IO[bytes] | None], ...] = (
+            ("stdout", proc.stdout),
+            ("stderr", proc.stderr),
+        )
+        for name, pipe in pipes:
+            assert pipe is not None  # noqa: S101  (spawned with PIPE)
+            threading.Thread(
+                target=self._read,
+                args=(connection, name, pipe),
+                name=f"logpyt-{name}-{connection}",
+                daemon=True,
+            ).start()
+        threading.Thread(
+            target=self._wait_exit,
+            args=(connection, proc),
+            name=f"logpyt-exit-{connection}",
+            daemon=True,
+        ).start()
+
+    def _signal(self, connection: int, *, kill: bool) -> None:
+        """`Terminate` or `Kill`: the child's pid only, never its group (5.11)."""
+        with self.cond:
+            proc = self.procs.get(connection)
+        if proc is None:
+            return  # it has exited
+        with contextlib.suppress(OSError):
+            if kill:
+                proc.kill()
+            else:
+                proc.terminate()
+
+    def _read(self, connection: int, pipe_name: Pipe, pipe: IO[bytes]) -> None:
+        """Read one pipe to EOF into the data inbox; close it at the end (X-5)."""
+        try:
+            while True:
+                try:
+                    chunk = pipe.read(_READ_SIZE)
+                except (OSError, ValueError):
+                    chunk = b""  # the pipe broke: that is its end
+                if not chunk:
+                    break
+                if not self._put(Data(connection, pipe_name, chunk)):
+                    return
+            self._put(Eof(connection, pipe_name))
+        finally:
+            with contextlib.suppress(OSError):
+                pipe.close()
+
+    def _put(self, event: Data | Eof) -> bool:
+        """Append to the data inbox, waiting while it is full; False once closed."""
+        with self.cond:
+            while len(self.data) >= _DATA_SLOTS and not self.data_closed:
+                self.cond.wait()
+            if self.data_closed:
+                return False
+            self.data.append(event)
+            self.cond.notify_all()
+            return True
+
+    def _wait_exit(self, connection: int, proc: subprocess.Popen[bytes]) -> None:
+        returncode = proc.wait()
+        with self.cond:
+            self.procs.pop(connection, None)
+            self._post(Exited(connection, returncode))
+
+    def _run_command(self, command: RunCommand) -> None:
+        """`RunCommand`: the one-shot runner; its result or error goes back."""
+        result: Any
+        try:
+            result = adb._run_adb(command.argv, timeout=command.timeout)  # noqa: SLF001
+        except Exception as exc:  # noqa: BLE001  (the core reads the error)
+            result = exc
+        with self.cond:
+            self._post(CommandDone(command.request, result))
+
+
+def _thread_ref() -> weakref.ref[threading.Thread]:
+    """The current thread, by a weak reference to its `threading.Thread`.
+
+    Not by its ident: the OS hands an ident out again once its thread ended,
+    so a new thread could pass for an ended engine, dispatcher or iterator
+    owner. A weak reference does not keep the ended thread's object (and so,
+    on CPython 3.13+, its unjoined OS thread) alive.
+    """
+    return weakref.ref(threading.current_thread())
+
+
+def _is_current(thread: weakref.ref[threading.Thread] | None) -> bool:
+    """Whether ``thread`` (a `_thread_ref`) is the current thread."""
+    return thread is not None and thread() is threading.current_thread()
+
+
+def _owned_here(consumer: _Consumer) -> bool:
+    """Whether ``consumer`` is a pull iterator this thread created (design 3.5)."""
+    return not consumer.push and _is_current(consumer.owner)
+
+
+def _abandon(run: _Run) -> None:
+    """`weakref.finalize` of a started `LogStream`: kill its run (design 3.4).
+
+    It may run inside any critical section (a cyclic collection), so the kill
+    is posted from a new thread. At interpreter shutdown (the main thread has
+    ended: weakref.finalize runs at exit) the engine may never run again, so
+    the adb children are killed at once as well. A run that ended and whose
+    outcome was seen (or is None) needs nothing.
+    """
+    if run.finished and (run.outcome is None or run.seen):
+        return
+    if not threading.main_thread().is_alive():
+        run.kill_children()
+    try:
+        threading.Thread(
+            target=run.abandon, name="logpyt-finalizer", daemon=True
+        ).start()
+    except RuntimeError:
+        run.kill_children()
+
+
+def _kill_and_wait(run: _Run, *, detach_own: bool = False) -> None:
+    """with-exit's kill: ``kill()``, then wait at most 1 s for the end (3.4).
+
+    The kill is posted before the wait, so a second Ctrl+C there only cuts
+    the wait short.
+    """
+    run.kill(detach_own=detach_own)
+    with contextlib.suppress(TimeoutError):
+        run.wait_ended(_KILL_WAIT, "the with-block exit")
+
+
+def _check_callback(name: str, callback: object) -> None:
+    """TypeError for a callback that is not callable or is async (design 2.3)."""
+    if callback is None:
+        return
+    if not callable(callback):
+        msg = f"{name} must be callable or None, not {type(callback).__name__}"
+        raise TypeError(msg)
+    call = type(callback).__call__  # an object with an async __call__
+    if inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(call):
+        msg = (
+            f"{name} is an async function, which LogStream never awaits; use "
+            "AsyncLogStream, or pass a plain function"
+        )
+        raise TypeError(msg)
+
+
+class _PullIterator[T]:
+    """The pull iterator of a stream (design 3.5, A-21): a class, not a generator.
+
+    It keeps its stream alive. ``close()``, and ``__del__`` when a ``break``
+    drops the last reference, detach it at once; the rest is discarded and
+    counted.
+    """
+
+    __slots__ = ("_consumer", "_done", "_handed", "_run", "_stream")
+
+    def __init__(self, stream: LogStream[T], run: _Run, consumer: _Consumer) -> None:
+        self._stream = stream
+        self._run = run
+        self._consumer = consumer
+        self._done = False
+        self._handed = False  # an item was returned; asking for the next settles it
+
+    def __iter__(self) -> Self:
+        return self
+
+    def __next__(self) -> T:
+        if self._done:
+            raise StopIteration
+        consumer = self._consumer
+        if self._handed:
+            self._handed = False
+            consumer.owe_done = True
+        item = self._run.deliver_next(consumer, sliced=True)
+        if item is not None:
+            self._handed = True
+            return cast("T", item)
+        self._done = True
+        if self._consumer.reached_end:
+            # A FAILED run raises its outcome once, after the last item (4.2).
+            error = self._run.take_error(unseen_only=False)
+            if error is not None:
+                raise error
+        raise StopIteration
+
+    def close(self) -> None:
+        """Detach from the stream; what it did not take is discarded and counted."""
+        self._done = True
+        self._run.detach(self._consumer)
+
+    def __del__(self) -> None:
+        with contextlib.suppress(AttributeError):
+            self.close()
+
+
+class LogStream[T]:
+    """A live ``adb logcat`` stream run by threads (design 2.3).
+
+    ``T`` is `LogEntry`, or `LogGroup` when ``group_by`` is given. A stream runs
+    once: iterate it (pull), or pass ``on_item`` (push, one dispatcher thread);
+    ``on_event`` receives the `StateChange` and `Gap` events in order with the
+    items, in the consumer context. ``where`` and ``group_by`` run in the
+    engine thread. Any of them raising ends the run with `CallbackError`.
+
+    Args:
+        config: The configuration; None uses ``StreamConfig()``.
+        where: The condition each entry must match; None delivers every entry.
+        group_by: Deliver `LogGroup` items instead of entries.
+        on_item: Push mode: called with each item on the dispatcher thread.
+        on_event: Called with each event in the consumer context.
+
+    Raises:
+        TypeError: An argument has the wrong type, or a callback is async
+            (use `AsyncLogStream`).
+        ValueError: ``group_by`` cannot fit the outbox, or ``where.packages()``
+            names something that is not a package name.
+        FileNotFoundError: ``config.adb_path`` is None and no adb is found.
+
+    """
+
+    @overload
+    def __init__(
+        self: LogStream[LogEntry],
+        config: StreamConfig | None = None,
+        /,
+        *,
+        where: Condition | None = None,
+        group_by: None = None,
+        on_item: Callable[[LogEntry], object] | None = None,
+        on_event: Callable[[StreamEvent], object] | None = None,
+    ) -> None: ...
+    @overload
+    def __init__(
+        self: LogStream[LogGroup],
+        config: StreamConfig | None = None,
+        /,
+        *,
+        where: Condition | None = None,
+        group_by: GroupBy,
+        on_item: Callable[[LogGroup], object] | None = None,
+        on_event: Callable[[StreamEvent], object] | None = None,
+    ) -> None: ...
+    def __init__(
+        self,
+        config: StreamConfig | None = None,
+        /,
+        *,
+        where: Condition | None = None,
+        group_by: GroupBy | None = None,
+        on_item: Callable[[LogEntry], object]
+        | Callable[[LogGroup], object]
+        | None = None,
+        on_event: Callable[[StreamEvent], object] | None = None,
+    ) -> None:
+        if config is None:
+            config = StreamConfig()
+        elif not isinstance(config, StreamConfig):
+            msg = f"config must be a StreamConfig or None, not {type(config).__name__}"
+            raise TypeError(msg)
+        if where is not None:
+            where = _require_condition(where, "where")
+        if group_by is not None and not isinstance(group_by, GroupBy):
+            msg = f"group_by must be a GroupBy or None, not {type(group_by).__name__}"
+            raise TypeError(msg)
+        _check_callback("on_item", on_item)
+        _check_callback("on_event", on_event)
+        adb_path = config.adb_path if config.adb_path is not None else adb.resolve_adb()
+        self._setup(config, adb_path, where, group_by, on_item, on_event)
+
+    def _setup(
+        self,
+        config: StreamConfig,
+        adb_path: str,
+        where: Condition | None,
+        group_by: GroupBy | None,
+        on_item: Callable[[Any], object] | None,
+        on_event: Callable[[StreamEvent], object] | None,
+    ) -> None:
+        core = StreamCore(config, adb_path=adb_path, where=where, group_by=group_by)
+        self._config = config
+        self._adb_path = adb_path
+        self._where = where
+        self._group_by = group_by
+        self._on_item = on_item
+        self._on_event = on_event
+        self._flush_hidden_by = _parse_logcat_args(
+            config.logcat_args
+        ).marker_hidden_by()
+        self._run = _Run(core, config, on_item=on_item, on_event=on_event)
+
+    # -- properties --------------------------------------------------------------------
+
+    @property
+    def config(self) -> StreamConfig:
+        """The configuration of this stream."""
+        return self._config
 
     @property
     def state(self) -> StreamState:
-        """Current state of the stream."""
-        with self._state_lock:
-            return self._state
+        """The state, as the engine published it after its last step (design 3.6)."""
+        return self._run.state
 
-    def _set_state(self, new_state: StreamState) -> None:
-        """Update state and trigger callback."""
-        with self._state_lock:
-            if self._state == new_state:
-                return
-            self._state = new_state
+    @property
+    def stats(self) -> StreamStats:
+        """An immutable snapshot of the run's counters (design 2.5, 4.4)."""
+        return self._run.stats
 
-        if self.on_state:
-            try:
-                self.on_state(new_state)
-            except Exception:
-                # Don't let a user on_state callback error crash the stream.
-                logging.getLogger("logpyt").exception("on_state callback failed")
+    @property
+    def outcome(self) -> StreamError | None:
+        """The latched error of a run that ended FAILED; None otherwise."""
+        return self._run.outcome
+
+    # -- control -----------------------------------------------------------------------
 
     def start(self) -> None:
-        """Start the log stream."""
-        with self._state_lock:
-            if self._state not in {StreamState.IDLE, StreamState.STOPPED}:
-                raise LogStreamInternalError(
-                    f"Cannot start stream from state {self._state}"
-                )
-            self._set_state(StreamState.STARTING)
-
-        self._stop_event.clear()
-        self._connection_thread = threading.Thread(
-            target=self._connection_manager,
-            name="LogStream-ConnectionManager",
-            daemon=True,
-        )
-        self._connection_thread.start()
-
-    def _connection_manager(self) -> None:  # noqa: PLR0912, PLR0915 (lifecycle state machine; refactor deferred)
-        """Manage the ADB process lifecycle and reconnection."""
-        while not self._stop_event.is_set():
-            self._parse_context = ParseContext()
-            cmd = [self.adb_path]
-            if self.device_id:
-                cmd.extend(["-s", self.device_id])
-            cmd.append("logcat")
-            cmd.extend(self.logcat_args)
-
-            try:
-                self._process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    bufsize=1,  # Line buffered
-                    encoding="utf-8",
-                    errors="replace",
-                    creationflags=_CREATE_NO_WINDOW,
-                )
-            except Exception as e:  # noqa: BLE001 (process spawn may fail arbitrarily; must not crash manager)
-                logging.getLogger("logpyt").debug("Failed to start adb process: %s", e)
-                self._set_state(StreamState.STOPPED)
-                self._exceptions.put(e)
-                self._invoke_callback(self.on_error, e)
-                # If we can't even start the process, we probably shouldn't loop
-                # infinitely fast unless it's a transient error.
-                # For now, let's treat start failure as fatal or subject to the
-                # reconnect delay when auto_reconnect is True.
-                if self.auto_reconnect and not self._stop_event.is_set():
-                    self._set_state(StreamState.RECONNECTING)
-                    if self._stop_event.wait(self.reconnect_delay):
-                        break
-                    continue
-                else:
-                    break
-
-            # stop() may have set the event during Popen() above; it terminated
-            # the previous handle, not this fresh one, so terminate now to avoid
-            # orphaning it on the wait() below.
-            if self._stop_event.is_set():
-                with contextlib.suppress(ProcessLookupError):
-                    self._process.terminate()
-
-            self._stdout_thread = threading.Thread(
-                target=self._read_loop,
-                args=(self._process.stdout, "stdout"),
-                name="LogStream-Stdout",
-                daemon=True,
-            )
-            self._stderr_thread = threading.Thread(
-                target=self._read_loop,
-                args=(self._process.stderr, "stderr"),
-                name="LogStream-Stderr",
-                daemon=True,
-            )
-
-            self._stdout_thread.start()
-            self._stderr_thread.start()
-
-            self._callback_thread = threading.Thread(
-                target=self._callback_loop,
-                name="LogStream-Callback",
-                daemon=True,
-            )
-            self._callback_thread.start()
-
-            if self._pid_monitor:
-                self._pid_monitor.start()
-
-            if self.read_timeout:
-                with self._activity_lock:
-                    self._last_activity = time.time()
-                self._watchdog_thread = threading.Thread(
-                    target=self._watchdog_loop,
-                    args=(self._process,),
-                    name="LogStream-Watchdog",
-                    daemon=True,
-                )
-                self._watchdog_thread.start()
-
-            self._set_state(StreamState.RUNNING)
-            self._invoke_callback(self.on_start)
-
-            # Wait for process to exit
-            return_code = self._process.wait()
-
-            # Wait for threads to finish reading
-            if self._stdout_thread:
-                self._stdout_thread.join()
-            if self._stderr_thread:
-                self._stderr_thread.join()
-
-            # Watchdog thread will exit when process exits or stop event is set
-            if self._watchdog_thread:
-                self._watchdog_thread.join(timeout=1.0)
-
-            # Signal callback thread to stop
-            self._enqueue_callback_item(None, source=None, force=True)
-            if self._callback_thread:
-                self._callback_thread.join(timeout=0.5)
-
-            if self._pid_monitor:
-                self._pid_monitor.stop()
-
-            if self._stop_event.is_set():
-                break
-
-            if isinstance(return_code, int) and return_code != 0:
-                err = LogStreamInternalError(
-                    f"adb logcat exited with code {return_code}"
-                )
-                self._exceptions.put(err)
-                self._invoke_callback(self.on_error, err)
-                break
-
-            if not self.auto_reconnect:
-                break
-
-            self._set_state(StreamState.RECONNECTING)
-            if self._stop_event.wait(self.reconnect_delay):
-                break
-
-        # Final cleanup: decide under the lock, but invoke on_state/on_stop
-        # OUTSIDE it (matching the rest of this class and AsyncLogStream) so a
-        # callback that re-enters the stream cannot deadlock on _state_lock.
-        with self._state_lock:
-            should_stop = self._state != StreamState.KILLED
-        if should_stop:
-            self._set_state(StreamState.STOPPED)
-            self._invoke_callback(self.on_stop)
-
-    def stop(self) -> None:
-        """Stop the log stream gracefully."""
-        with self._state_lock:
-            if self._state in {
-                StreamState.STOPPED,
-                StreamState.KILLED,
-                StreamState.IDLE,
-            }:
-                return
-            self._set_state(StreamState.STOPPING)
-
-        self._stop_event.set()
-        if self._pid_monitor:
-            self._pid_monitor.stop()
-        if self._process:
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait()
-
-    def kill(self) -> None:
-        """Kill the log stream immediately."""
-        with self._state_lock:
-            self._set_state(StreamState.KILLED)
-
-        self._stop_event.set()
-        if self._pid_monitor:
-            self._pid_monitor.stop()
-        if self._process:
-            self._process.kill()
-
-    def pause(self) -> None:
-        """Pause dispatching of log entries.
-
-        Entries read from the device while paused are dropped, not buffered: a
-        live stream cannot buffer unboundedly. Call resume() to continue.
-        """
-        with self._state_lock:
-            if self._state == StreamState.RUNNING:
-                self._set_state(StreamState.PAUSED)
-
-    def resume(self) -> None:
-        """Resume dispatching of log entries."""
-        with self._state_lock:
-            if self._state == StreamState.PAUSED:
-                self._set_state(StreamState.RUNNING)
-
-    @staticmethod
-    def _invoke_callback(callback: Callable[..., None] | None, *args: object) -> None:
-        """Invoke a user lifecycle/error callback without letting it break teardown."""
-        if callback is None:
-            return
-        try:
-            callback(*args)
-        except Exception:
-            logging.getLogger("logpyt").exception("LogStream lifecycle callback raised")
-
-    def join(self, timeout: float | None = None) -> None:
-        """Wait for the stream to finish.
-
-        Args:
-            timeout: Maximum time to wait in seconds.
+        """Start the run and return at once; it never runs user code (design 3.3).
 
         Raises:
-            LogStreamTimeoutError: If timeout expires.
-            LogStreamKilledError: If stream was killed.
-            LogStreamInternalError: If an internal error occurred.
+            UsageError: The stream was started before (use `clone`).
+
         """
-        if not self._connection_thread:
-            return
+        run = self._run
+        if not run.start(push=self._on_item is not None):
+            state = run.state
+            what = "a started" if state is StreamState.IDLE else f"a {state}"
+            msg = (
+                f"LogStream.start() called on {what} stream; a stream runs once "
+                "- use stream.clone()"
+            )
+            raise UsageError(msg)
+        weakref.finalize(self, _abandon, run)
 
-        deadline = None if timeout is None else time.monotonic() + timeout
+    def stop(self, *, flush: float | None = None) -> None:
+        """Ask the run to stop; from any thread or callback; idempotent.
 
-        self._connection_thread.join(timeout=timeout)
-        if self._connection_thread.is_alive():
-            raise LogStreamTimeoutError("Timeout waiting for connection thread")
+        With ``flush``, a marker is written to the device log and the stream
+        reads until it, for at most ``flush`` seconds of open intake (design
+        2.3). Before ``start()`` and after the end it does nothing.
 
-        if self._callback_thread and self._callback_thread.is_alive():
-            if deadline is None:
-                self._callback_thread.join()
-            else:
-                # Honor the remaining timeout budget for the callback phase too, so
-                # a blocked user callback cannot make join(timeout=...) hang.
-                remaining = max(deadline - time.monotonic(), 0.0)
-                self._callback_thread.join(timeout=remaining)
-                if self._callback_thread.is_alive():
-                    raise LogStreamTimeoutError("Timeout waiting for callback thread")
+        Raises:
+            UsageError: ``flush`` is given and ``logcat_args`` hides the marker.
+            TypeError: ``flush`` is not a number.
 
-        if self.state == StreamState.KILLED:
-            raise LogStreamKilledError("Stream was killed")
-
-        # Check for exceptions. Peek (non-destructive) under the queue's own mutex
-        # so re-invoking join() surfaces the same terminal error (matching
-        # AsyncLogStream.join()) without racing the deque internals.
-        with self._exceptions.mutex:
-            exc = self._exceptions.queue[0] if self._exceptions.queue else None
-        if exc is not None:
-            # Wrap in LogStreamInternalError unless it is already a LogStreamError.
-            if isinstance(exc, LogStreamError):
-                raise exc
-            raise LogStreamInternalError(
-                f"Internal error in stream thread: {exc}"
-            ) from exc
-
-    def _watchdog_loop(self, process: subprocess.Popen[str]) -> None:
-        """Monitor one process's activity and kill it if it hangs.
-
-        Bound to the process it was started for (not ``self._process``) so a
-        reconnect that spawns a replacement leaves this watchdog to exit when
-        its own process ends, rather than acting on the new process or lingering.
         """
-        if not self.read_timeout:
-            return
-
-        while not self._stop_event.is_set():
-            # Stop watching once this specific process has exited.
-            if process.poll() is not None:
-                break
-
-            with self._activity_lock:
-                last = self._last_activity
-
-            if time.time() - last > self.read_timeout:
-                logging.getLogger("logpyt").warning(
-                    "LogStream read timeout (%ss). Killing ADB process.",
-                    self.read_timeout,
+        if flush is not None:
+            if isinstance(flush, bool) or not isinstance(flush, int | float):
+                msg = f"flush takes seconds as a number or None, not {flush!r}"
+                raise TypeError(msg)
+            if self._flush_hidden_by:
+                msg = (
+                    "stop(flush=...) needs the flush marker, which "
+                    f"{' and '.join(self._flush_hidden_by)} in logcat_args hides; "
+                    "call stop() without flush"
                 )
-                with contextlib.suppress(ProcessLookupError, OSError):
-                    process.kill()
-                break
+                raise UsageError(msg)
+        self._run.stop(None if flush is None else float(flush))
 
-            time.sleep(1.0)
+    def kill(self) -> None:
+        """Kill adb at once and discard undelivered items; idempotent (design 3.4)."""
+        self._run.kill()
 
-    def _warn_queue_full_once(self, message: str, key: str | None = None) -> None:
-        """Emit queue-full warning with optional rate limiting.
+    def join(self, timeout: float | None = None) -> None:
+        """Wait for the end of delivery; raise the outcome of a FAILED run.
 
-        Rate limiting is keyed on ``key`` (falling back to ``message``) so a
-        message carrying a variable count still de-duplicates on a stable key.
+        Returns once the run ended and its consumer finished (or detached).
+
+        Raises:
+            StreamError: The run ended FAILED (the same object every time).
+            TimeoutError: ``timeout`` seconds passed; the stream keeps running.
+            UsageError: Called from the stream's own callbacks, from the thread
+                that owns an attached iterator, or before ``start()``.
+
         """
-        interval = self._queue_full_warning_interval
-        if interval <= 0.0:
-            logging.getLogger("logpyt").warning(message)
-            return
-
-        dedup_key = key if key is not None else message
-        now = time.monotonic()
-        should_log = False
-        with self._queue_warning_lock:
-            last = self._last_queue_full_warning.get(dedup_key)
-            if last is None or (now - last) >= interval:
-                self._last_queue_full_warning[dedup_key] = now
-                should_log = True
-
-        if should_log:
-            logging.getLogger("logpyt").warning(message)
-
-    def _read_loop(self, pipe: TextIO | None, source: str) -> None:
-        """Internal loop to read from a pipe."""
-        if pipe is None:
-            return
-
-        try:
-            while not self._stop_event.is_set():
-                if self._process and self._process.poll() is not None:
-                    break
-
-                line = pipe.readline(_READ_LIMIT)
-                if not line:
-                    # EOF
-                    break
-
-                if self.read_timeout:
-                    with self._activity_lock:
-                        self._last_activity = time.time()
-
-                if self.state == StreamState.PAUSED:
-                    continue
-
-                self._process_line(line, source)
-        except Exception as e:  # noqa: BLE001 (read/parse errors must not crash the reader thread)
-            logging.getLogger("logpyt").debug("Read loop error on %s: %s", source, e)
-            self._exceptions.put(e)
-            self._invoke_callback(self.on_error, e)
-            # Ensure process is terminated so connection manager doesn't hang
-            if self._process:
-                self._process.terminate()
-        finally:
-            if source == "stdout" and self._grouper is not None:
-                with self._grouper_lock:
-                    flushed = self._grouper.flush()
-                if flushed:
-                    # force so the terminal group is delivered even if the queue
-                    # is saturated (matches the shutdown sentinel).
-                    self._enqueue_callback_item(
-                        (flushed, source), source=source, force=True
-                    )
-
-    def _callback_loop(self) -> None:
-        """Internal loop to process callbacks."""
-        while True:
-            try:
-                item = self._callback_queue.get()
-                if item is None:
-                    break
-
-                items, source = item
-                callback = (
-                    self.stdout_callback if source == "stdout" else self.stderr_callback
-                )
-                if callback:
-                    for entry in items:
-                        try:
-                            callback(entry, self._handle)
-                        except Exception as e:  # noqa: BLE001 (user callback must not crash the dispatch loop)
-                            logging.getLogger("logpyt").debug(
-                                "User callback raised: %s", e
-                            )
-                            self._invoke_callback(self.on_error, e)
-            except Exception as e:  # noqa: BLE001 (dispatch loop must not crash on unexpected errors)
-                # Should not happen, but if it does, log it
-                logging.getLogger("logpyt").debug("Callback loop error: %s", e)
-                self._invoke_callback(self.on_error, e)
-
-    def _enqueue_callback_item(
-        self,
-        item: tuple[Sequence[LogEntry | LogGroup], str] | None,
-        source: str | None,
-        force: bool = False,  # noqa: FBT001, FBT002 (existing public signature)
-    ) -> None:
-        """Enqueue callback work honoring overflow policy."""
-        try:
-            self._callback_queue.put_nowait(item)
-            return
-        except queue.Full:
-            pass
-
-        if force:
-            # Guarantee delivery of a forced item (shutdown sentinel / terminal
-            # flush): evict one to make room, but if a consumer already drained
-            # the queue (get_nowait -> Empty) there is room, so enqueue either way
-            # instead of returning without delivering.
-            with contextlib.suppress(queue.Empty):
-                self._callback_queue.get_nowait()
-            with contextlib.suppress(queue.Full):
-                self._callback_queue.put_nowait(item)
-            return
-
-        if self.queue_overflow_policy == "drop_oldest":
-            try:
-                self._callback_queue.get_nowait()
-            except queue.Empty:
-                return
-            try:
-                self._callback_queue.put_nowait(item)
-                return
-            except queue.Full:
-                pass
-
-        if source == "stdout" and self._grouper is not None:
-            dropped = (
-                sum(len(x) if isinstance(x, LogGroup) else 1 for x in item[0])
-                if item is not None
-                else 0
+        run = self._run
+        run.check_wait("join()", iterator=True)
+        if not run.started:
+            msg = (
+                "join() called before start(); start the stream, or use `with stream:`"
             )
-            self._warn_queue_full_once(
-                f"LogStream callback queue full; dropping {dropped} grouped entries.",
-                key="queue-full-grouped",
+            raise UsageError(msg)
+        run.wait_ended(timeout, "join()")
+        error = run.take_error(unseen_only=False)
+        if error is not None:
+            raise error
+
+    def wait_running(self, timeout: float | None = None) -> None:
+        """Wait until a connection is RUNNING (adb printed), or the run concluded.
+
+        Raises:
+            StreamError: The run concluded FAILED before it was RUNNING.
+            TimeoutError: ``timeout`` seconds passed; the stream keeps running.
+            UsageError: Called from the stream's own callbacks or before
+                ``start()``.
+
+        """
+        run = self._run
+        run.check_wait("wait_running()", iterator=False)
+        if not run.started:
+            msg = "wait_running() called before start(); start the stream first"
+            raise UsageError(msg)
+        run.wait_running(timeout)
+
+    def assert_complete(self) -> None:
+        """Fail a CI test whose capture may miss device lines (design 4.4).
+
+        Raises:
+            UsageError: The run has not ended; call ``join()`` first.
+            StreamError: The run ended FAILED.
+            IncompleteCaptureError: ``stats.incomplete`` names a reason.
+
+        """
+        run = self._run
+        state = run.state
+        if run.crash is None and state not in _TERMINAL:
+            msg = f"assert_complete() on a {state} stream; call join() first"
+            raise UsageError(msg)
+        error = run.take_error(unseen_only=False)
+        if error is not None:
+            raise error
+        reasons = run.stats.incomplete
+        if reasons:
+            msg = f"the capture is incomplete: {', '.join(reasons)}"
+            raise IncompleteCaptureError(msg, reasons=reasons)
+
+    def clone(self) -> Self:
+        """A fresh IDLE stream: same config, adb path, where, group_by and callbacks."""
+        twin = object.__new__(type(self))
+        twin._setup(  # noqa: SLF001  (a LogStream sets up its own twin)
+            self._config,
+            self._adb_path,
+            self._where,
+            self._group_by,
+            self._on_item,
+            self._on_event,
+        )
+        return twin
+
+    # -- iteration and with ------------------------------------------------------------
+
+    def __iter__(self) -> Iterator[T]:
+        """Pull mode: the one iterator of this run (design 2.4, 3.5).
+
+        Raises:
+            UsageError: The stream has ``on_item``, was not started, or was
+                iterated before (or stop() discarded what no iterator took).
+
+        """
+        if self._on_item is not None:
+            msg = (
+                "LogStream with on_item cannot be iterated: its dispatcher takes "
+                "the items; leave out on_item to iterate"
             )
-        else:
-            self._warn_queue_full_once(
-                "LogStream callback queue is full. Dropping log entry."
-            )
+            raise UsageError(msg)
+        return _PullIterator(self, self._run, self._run.attach())
 
-    def _process_line(self, line: str, source: str) -> None:
-        """Process a single raw line."""
-        # 1. Parse
-        ctx = self._parse_context
-        try:
-            if source == "stdout":
-                parsed = self.parser.parse(line, ctx)
-                entry = unparsed_entry(line, ctx) if parsed is None else parsed
-            else:
-                entry = unparsed_entry(line, ctx, level="E")
-        except Exception as e:  # noqa: BLE001 (parser errors must not crash the reader thread)
-            logging.getLogger("logpyt").debug("Parser error on %s line: %s", source, e)
-            self._exceptions.put(e)
-            self._invoke_callback(self.on_error, e)
-            if self._process:
-                self._process.terminate()
-            return
-
-        if self._pid_monitor:
-            pkg = self._pid_monitor.get_package(entry.pid)
-            if pkg:
-                entry = entry.model_copy(update={"package": pkg})
-
-        # 2. Filter
-        if self.filter_by is not None and not self.filter_by(entry):
-            return
-
-        # 3. Group
-        # Grouping applies to stdout only (the shared grouper is flushed on stdout
-        # EOF); feeding stderr through it would flush/misroute stdout groups.
-        items_to_emit: Sequence[LogEntry | LogGroup]
-        if self._grouper is not None and source == "stdout":
-            with self._grouper_lock:
-                items_to_emit = self._grouper.add(entry, time.monotonic())
-        else:
-            items_to_emit = [entry]
-
-        # 4. Dispatch
-        if items_to_emit:
-            self._enqueue_callback_item((items_to_emit, source), source=source)
-
-    def __enter__(self) -> StreamHandle:
-        """Start the stream and return the handle."""
+    def __enter__(self) -> Self:
+        """Start the stream and return it."""
         self.start()
-        return self._handle
+        return self
 
     def __exit__(
         self,
         exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: TracebackType | None,
-    ) -> bool | None:
-        """Stop the stream on exit."""
-        self.stop()
-        # We don't necessarily join here, as stop() is async, but usually
-        # context managers clean up resources. stop() terminates the process.
-        # We might want to wait for it to actually close?
-        # Let's do a quick join with timeout to ensure cleanup.
-        with contextlib.suppress(LogStreamTimeoutError, LogStreamKilledError):
-            self.join(timeout=1.0)
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        """Stop and join; how depends on how the body ended (design 3.4).
+
+        An iterator this thread owns is detached first. A clean body waits
+        without a cap and raises an outcome nobody saw. A body that raised an
+        `Exception` waits while the consumer takes items, kills once it took
+        nothing for ``close_timeout``, and keeps the body's exception, with the
+        outcome added as a note. A `GeneratorExit` (a generator around the
+        block was closed early) takes the `Exception` path: it is how a
+        caller's ``break`` reaches the block, not an interrupt. Any other
+        exception kills. An exception that interrupts the exit's own wait
+        (Ctrl+C) kills too before it propagates, so neither adb nor the
+        consumer outlives the block (design 9.2).
+        """
+        run = self._run
+        if exc is None:
+            run.check_wait("the with-block exit", iterator=False)
+            try:
+                run.stop(None, detach_own=True)
+                run.wait_ended(None, "the with-block exit")
+            except BaseException:
+                _kill_and_wait(run, detach_own=True)
+                raise
+            error = run.take_error(unseen_only=True)
+            if error is not None:
+                raise error
+            return
+        if not isinstance(exc, Exception | GeneratorExit):
+            _kill_and_wait(run, detach_own=True)  # KeyboardInterrupt, SystemExit, ...
+            return
+        try:
+            run.stop(None, detach_own=True)
+            progressing = run.wait_while_progressing(self._config.close_timeout)
+        except BaseException:
+            _kill_and_wait(run, detach_own=True)
+            raise
+        if not progressing:
+            _kill_and_wait(run)
+        error = run.take_error(unseen_only=True)
+        if error is not None and error is not exc:
+            exc.add_note(
+                f"logpyt: the stream ended {run.state} too: "
+                f"{type(error).__name__}: {error}"
+            )
+            _log.error(
+                "the LogStream failed while its with-block raised %s",
+                type(exc).__name__,
+                exc_info=error,
+            )

@@ -60,13 +60,13 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 import pytest
 
 import logpyt
-from logpyt import AsyncLogStream, LogStream
+from logpyt import AsyncLogStream, LogStream, StreamConfig
 from tests.conftest import install_fake_adb, lines, run, threadtime, touch
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
 
-    from logpyt import AsyncStreamHandle, LogEntry, StreamHandle
+    from logpyt import AsyncStreamHandle, LogEntry
     from tests.conftest import FakeAdb
 
 DEFAULT_LINES = 200_000
@@ -206,7 +206,7 @@ class Driver(Protocol):
 
 
 class SyncDriver:
-    """logpyt 2.x ``LogStream``: reader threads and one callback thread."""
+    """logpyt 3.0 ``LogStream``: the thread driver over the stream core."""
 
     name: ClassVar[str] = "sync"
 
@@ -229,19 +229,20 @@ class SyncDriver:
             stream.join(timeout=timeout)
 
     @staticmethod
-    def _open(adb_path: str, probe: DeliveryProbe, *, lossless: bool) -> LogStream:
-        def on_entry(_entry: LogEntry, _handle: StreamHandle) -> None:
+    def _open(
+        adb_path: str, probe: DeliveryProbe, *, lossless: bool
+    ) -> LogStream[LogEntry]:
+        def on_entry(_entry: LogEntry) -> None:
             probe.hit()
 
         if lossless:
-            # 2.x drops once its callback queue is full, so the queue is sized
-            # to hold the whole run.
-            return LogStream(
-                adb_path=adb_path,
-                stdout_callback=on_entry,
-                max_queue_size=probe.expected,
-            )
-        return LogStream(adb_path=adb_path, stdout_callback=on_entry)
+            # 3.0 never drops an entry (backpressure), but until PR-14 a stall
+            # resume replays from the first position (design A.20) and would
+            # count lines twice, so the lossless case turns it off.
+            config = StreamConfig(adb_path=adb_path, stall_timeout=None)
+        else:
+            config = StreamConfig(adb_path=adb_path)
+        return LogStream(config, on_item=on_entry)
 
 
 class AsyncDriver:

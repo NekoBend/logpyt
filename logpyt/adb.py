@@ -73,7 +73,7 @@ logger = logging.getLogger(__name__)
 # On Windows a child of a GUI, pythonw or frozen app opens a console window unless
 # CREATE_NO_WINDOW is set, and CREATE_NEW_PROCESS_GROUP keeps a terminal Ctrl+C
 # away from adb. Neither flag exists on POSIX, where the child gets a new session.
-# _CREATE_NO_WINDOW alone is what the 2.x streams pass until PR-12/PR-13.
+# _CREATE_NO_WINDOW alone is what the 2.x AsyncLogStream passes until PR-13.
 _CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 _CREATION_FLAGS = (
     subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP

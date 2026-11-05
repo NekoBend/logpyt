@@ -10,7 +10,8 @@ actors, each step atomic (one critical section of the driver contract):
   ``fail_at``, it raises (``fail-wait``: post `CallbackFailed`, take nothing
   more, detach once the outbox is closed) or the loop breaks at the first
   item from there on (``break``: detach). Once ``kill()`` set the kill flag
-  (F2-7), an item is skipped instead: no callback, and never settled;
+  (F2-7), "next" takes no item while items wait and the outbox is not
+  closed: it settles the record in hand and reports, and nothing more;
 - the engine: take one control event (`ControlInbox` order), hand it to the
   core and carry out the commands like a driver: the engine-side report after
   a batch that changed the counts, and the report handed to the core right
@@ -129,7 +130,7 @@ class World:
         self.failed: str | None = None
         self.failed_on_terminal = False
         self.broke = False
-        self.skipped = 0  # items skipped under the kill flag (F2-7)
+        self.withheld = False  # a step under the kill flag took no item (F2-7)
         self.saw_terminal = False
         self.items_total = harness.outbox.entries
         self.base_taken = harness.outbox.counts().taken_entries
@@ -255,6 +256,11 @@ class World:
         if self.owe_done:
             outbox.done()
             self.owe_done = False
+        if "kill" in self.trace and outbox.entries and not outbox.closed:
+            # kill() set the flag: no item is taken; the core discards them.
+            self.inbox.post(ConsumerProgress(outbox.counts()))
+            self.withheld = True
+            return
         record = outbox.pop()
         self.inbox.post(ConsumerProgress(outbox.counts()))
         if record is None:
@@ -273,11 +279,6 @@ class World:
         self.pending = None
         if _terminal_change(record):
             self.saw_terminal = True
-        if "kill" in self.trace and _item(record):
-            # kill() set the flag: the item is skipped, its callback never
-            # runs, and it is never settled (F2-7).
-            self.skipped += 1
-            return
         at = self.fail_at
         if self.mode == "break" and _item(record) and at is not None and index >= at:
             self.broke = True
@@ -326,9 +327,17 @@ class World:
             assert self.late == 1, "a failure on the terminal change was not late"
         real = self.failed is not None and not self.failed_on_terminal
         if "kill" in self.trace:
-            # Only the KillRequest ends a run whose consumer skipped an item.
+            # Only the KillRequest ends a run whose consumer withheld items.
             if core.state is S.STOPPED:
-                assert not self.skipped, "STOPPED after a skip under the kill flag"
+                assert not self.withheld, "STOPPED after items were withheld"
+            if core.state is S.KILLED and self.mode == "ok":
+                # What no callback took is undelivered (design 3.4).
+                stats = core.stats()
+                handed = stats.delivered - self.base_taken
+                assert (handed, stats.undelivered) == (
+                    self.popped_items,
+                    self.items_total - self.popped_items,
+                ), f"stats {stats.delivered}/{stats.undelivered} after a kill"
             # A failure taken after the kill is late: KILLED, logged (A.21).
             if real:
                 assert core.state is not S.STOPPED, "a failure and a kill: STOPPED"
@@ -422,7 +431,7 @@ def _signature(world: World) -> tuple[object, ...]:
         world.failed,
         world.failed_on_terminal,
         world.broke,
-        world.skipped,
+        world.withheld,
         world.saw_terminal,
         world.finished,
         world.at_finished,
@@ -478,8 +487,9 @@ def test_drain_model(scenario: str) -> None:
     more is taken; a break at each position), with and without a kill: the
     run ends once, the consumer ends detached, every CallbackFailed the core
     gets is the outcome or late, a failure on a record before the end ends
-    FAILED (or KILLED after a kill, late), a run whose consumer skipped an
-    item under the kill flag never ends STOPPED, the stats of a STOPPED run
+    FAILED (or KILLED after a kill, late), a run whose consumer withheld
+    items under the kill flag never ends STOPPED, a killed run counts what
+    no callback took in ``undelivered``, the stats of a STOPPED run
     are final at Finished with only the terminal change queued, and the drain
     arms no timer and emits nothing.
     """
