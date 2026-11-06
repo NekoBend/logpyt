@@ -1,903 +1,1896 @@
-"""Async log stream implementation for capturing and processing ADB logcat output."""
+"""`AsyncLogStream`: the asyncio driver of a live stream (design 2.3-2.4, 3.3-3.6, 5.4).
+
+`logpyt._core.machine.StreamCore` decides everything about a run (design 5.2):
+its states, every timer, the reconnect budget, flow control, framing, parsing,
+``where``, grouping, attribution and the outcome. This module only runs adb
+and the consumer on an event loop, and carries out the commands the core
+returns, as `logpyt._core.protocol` documents them. It is the asyncio
+translation of `logpyt.streams.sync`, which runs the same contract with
+threads.
+
+Tasks of one run (design 5.4), all on the loop that called ``start()``:
+
+- the engine (`_Run._engine`): takes one event at a time (`_Run._take`),
+  hands it to `StreamCore.handle` with the loop's monotonic time and carries
+  out the commands (`_Run._carry_out`) in that task step, without an
+  ``await``; it yields once after each chunk of data (X-1);
+- per connection, a spawn task (`_Run._spawn`), then a stdout and a stderr
+  reader (`_Run._read`: ``await reader.read(65536)`` into the data inbox, an
+  ``asyncio.Queue(16)``, then ``await asyncio.sleep(0)``, because
+  ``StreamReader.read`` does not suspend while data is buffered, X-1; each
+  closes its pipe when it ends, X-5) and an exit watcher (`_Run._wait_exit`,
+  which reads ``returncode`` every 50 ms: a ``Process.wait()`` begun before
+  the exit returns only once the pipes close, design 5.1);
+- one task per one-shot command (`_Run._run_command`), whose adb child is
+  tracked from its spawn until it was reaped; when ``Finished`` is carried
+  out the task is cancelled, which kills and reaps that child before
+  ``join()`` can return;
+- in push mode, one dispatcher for the run's whole lifetime
+  (`_Run._dispatch`: ``for item in <the delivery iterator>: on_item(item)``),
+  which awaits what a callback returns.
+
+The engine's end cancels and awaits the tasks still running. Cancelled
+itself (the loop shuts down), it kills adb at once, starts nothing more and
+ends the run like a crash, so no wait hangs (F3-2); a run whose ``Finished``
+was carried out keeps its outcome then (G4, `_Run._abandoned`). A task that
+raises (a logpyt bug) ends the run as an engine crash does
+(`_Run._worker_failed`, `_Run._crashed`): adb is killed and reaped, then
+every wait ends and raises that exception. ``KeyboardInterrupt`` (Ctrl+C on
+the loop's thread) in the engine or an I/O task is no bug: adb is killed at
+once and the run ends as for a cancelled engine, nothing is logged, and the
+interrupt leaves the loop without waiting (`_Run._interrupted`).
+
+Everything a run shares lives on its loop, so a task step is the critical
+section of the protocol (no lock): the mailbox (the core's `ControlInbox`
+plus the data inbox), the `Outbox` and what the engine publishes after every
+``handle()``: ``state``, ``stats``, whether intake is open. Waiters are
+futures resolved by whoever changes what they wait for: the engine's
+(`_Run._notify_engine`), the consumer's (`_Run._wake_consumer`) and those of
+``join()``, ``wait_running()`` and with-exit (`_Run._notify_waiters`).
+``stop()`` and ``kill()`` are plain functions: on the loop they act at once,
+from any other thread they go through ``loop.call_soon_threadsafe`` (``kill()``
+sets the consumer's kill flag before it returns, F2-7), and once the loop is
+closed they do nothing. ``state``, ``stats`` and ``outcome`` may be read from
+any thread.
+
+The consumer side follows the contract in `logpyt._core.protocol`: one
+delivery iterator (`_Run.deliver_next`) for pull and push, each step one task
+step that settles the record in hand, pops the next and reports the outbox
+counts, with no ``await`` between the pop and handing the record to
+``on_event`` or to the caller. The consumer yields once per batch of
+``_BATCH`` records, before the step settles (X-1), so a cancelled
+``__anext__`` cancels only its wait and never loses a record.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
+import functools
+import inspect
 import logging
+import os
+import signal
+import sys
+import threading
 import time
-from collections.abc import Awaitable, Callable, Sequence
-from typing import TYPE_CHECKING, Any, Literal
+import weakref
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any, Final, Self, assert_never, cast, overload
 
 from logpyt import adb
-from logpyt._core.grouping import Grouper
-from logpyt.adb import _CREATE_NO_WINDOW, _check_package_name
-from logpyt.exceptions import (
-    LogStreamError,
-    LogStreamInternalError,
-    LogStreamKilledError,
-    LogStreamTimeoutError,
+from logpyt._core.machine import StreamCore
+from logpyt._core.mailbox import ControlInbox, Outbox
+from logpyt._core.protocol import (
+    STREAM_LOGGER,
+    CallbackFailed,
+    CommandDone,
+    ConsumerDetached,
+    ConsumerProgress,
+    Data,
+    Deliver,
+    Diagnostic,
+    DiscardUndelivered,
+    Eof,
+    Exited,
+    Finished,
+    Kill,
+    KillRequest,
+    RunCommand,
+    Spawn,
+    Spawned,
+    SpawnFailed,
+    Start,
+    StopRequest,
+    Terminate,
+    Tick,
 )
-from logpyt.filters import Condition, _require_condition
-from logpyt.groupers import GroupBy
-from logpyt.parsers import LogParser, ParseContext, ThreadTimeLogParser
-from logpyt.parsers._fallback import unparsed_entry
-
-from .common import StreamState, build_pidof_command
+from logpyt.config import StreamConfig, _parse_logcat_args
+from logpyt.exceptions import IncompleteCaptureError, UsageError
+from logpyt.models import LogEntry, LogGroup
+from logpyt.streams._events import StateChange, StreamState
+from logpyt.streams.sync import (
+    _check_callable,
+    _checked_arguments,
+    _checked_flush,
+    _ends_run,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import (
+        AsyncIterator,
+        Callable,
+        Coroutine,
+        Iterable,
+        Sequence,
+    )
     from types import TracebackType
+    from typing import Literal
 
-    from logpyt.models import LogEntry, LogGroup
+    from logpyt._core.protocol import Command, Event, Item, OutboxCounts, Pipe, Record
+    from logpyt.exceptions import StreamError
+    from logpyt.filters import Condition
+    from logpyt.groupers import GroupBy
+    from logpyt.streams._events import StreamEvent, StreamStats
 
-__all__ = ["AsyncLogStream", "AsyncPidMonitor", "AsyncStreamHandle"]
+    type _Process = asyncio.subprocess.Process
 
-# Configure module logger
-logger = logging.getLogger(__name__)
+__all__ = ["AsyncLogStream"]
 
-_DISPATCH_STOP = object()
+_log = logging.getLogger(STREAM_LOGGER)
 
-# Max bytes buffered while reading a single logcat line. The asyncio default is
-# 64 KiB, which a single crafted/huge line can exceed and permanently stall the
-# reader; a generous limit plus drain-and-continue avoids that DoS.
-_READ_LIMIT = 8 * 1024 * 1024
-# Upper bound on the graceful callback drain during dispatcher shutdown, so a stuck
-# user callback cannot hang teardown.
-_DISPATCH_DRAIN_TIMEOUT = 2.0
+# Design 5.4: one pipe read, and the data inbox's capacity in chunks.
+_READ_SIZE: Final = 65536
+_DATA_SLOTS: Final = 16
+# Design 5.4: how often the exit watcher reads returncode.
+_EXIT_POLL: Final = 0.05
+# X-1: records a consumer takes between two yields to the loop. One chunk of
+# 64 KiB holds about 500 lines, so a batch is a fraction of one read.
+_BATCH: Final = 64
+# How often with-exit looks at the consumer's progress (design 3.4).
+_SLICE: Final = 0.25
+# Design 3.4: with-exit waits this long after it killed the stream.
+_KILL_WAIT: Final = 1.0
+# How long the end of a run (and a crash) waits for the adb children it
+# killed to be reaped, so that none is left once join() returns.
+_REAP_WAIT: Final = 1.0
+# How often a crash looks whether the children it killed were reaped.
+_REAP_POLL: Final = 0.01
+_TERMINAL: Final = frozenset(
+    {StreamState.STOPPED, StreamState.KILLED, StreamState.FAILED}
+)
+_TICK: Final = Tick()
 
+# The run whose user code (on_item, on_event; the engine for where and
+# group_by) runs in this context (F3-7). Tasks created there inherit it.
+_IN_CALLBACK: contextvars.ContextVar[_Run | None] = contextvars.ContextVar(
+    "logpyt_async_stream_callback", default=None
+)
 
-class AsyncPidMonitor:
-    """Monitors PIDs for specific packages using ADB asynchronously."""
-
-    def __init__(
-        self,
-        adb_path: str,
-        device_id: str | None,
-        packages: list[str],
-        poll_interval: float = 5.0,
-        max_poll_interval: float = 30.0,
-        poll_backoff_factor: float = 2.0,
-        max_resolves_per_cycle: int = 32,
-    ) -> None:
-        """Initialize the PID monitor.
-
-        Args:
-            adb_path: Path to ADB executable.
-            device_id: Target device serial ID.
-            packages: List of package names to monitor.
-            poll_interval: Interval in seconds between PID polls.
-            max_poll_interval: Maximum poll interval in seconds when idle.
-            poll_backoff_factor: Multiplier applied after unchanged polls.
-            max_resolves_per_cycle: Maximum packages to resolve per poll cycle.
-        """
-        self.adb_path = adb_path
-        self.device_id = device_id
-        self.packages = list(set(packages))
-        self.poll_interval = max(0.1, poll_interval)
-        self.max_poll_interval = max(self.poll_interval, max_poll_interval)
-        self.poll_backoff_factor = max(1.0, poll_backoff_factor)
-        self.max_resolves_per_cycle = max(1, max_resolves_per_cycle)
-        self._pid_map: dict[int, str] = {}
-        self._lock = asyncio.Lock()
-        self._stop_event = asyncio.Event()
-        self._task: asyncio.Task[None] | None = None
-        self._resolve_cursor = 0
-
-    async def start(self) -> None:
-        """Start the monitoring task."""
-        if not self.packages:
-            return
-
-        self._stop_event.clear()
-        self._task = asyncio.create_task(self._run(), name="AsyncPidMonitor")
-
-    async def stop(self) -> None:
-        """Stop the monitoring task."""
-        self._stop_event.set()
-        if self._task:
-            try:
-                await asyncio.wait_for(self._task, timeout=1.0)
-            except (TimeoutError, asyncio.CancelledError):
-                if self._task and not self._task.done():
-                    self._task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await self._task
-
-    async def get_package(self, pid: int) -> str | None:
-        """Get the package name for a given PID.
-
-        Args:
-            pid: The process ID.
-
-        Returns:
-            The package name if found, None otherwise.
-        """
-        async with self._lock:
-            return self._pid_map.get(pid)
-
-    async def _run(self) -> None:
-        """Internal loop to poll PIDs."""
-        current_interval = self.poll_interval
-        while not self._stop_event.is_set():
-            packages = self.packages
-            total = len(packages)
-            cycle_limit = min(total, self.max_resolves_per_cycle)
-            polled_packages: list[str] = []
-            resolved_map: dict[int, str] = {}
-            for offset in range(cycle_limit):
-                package = packages[(self._resolve_cursor + offset) % total]
-                polled_packages.append(package)
-                pids = await self._resolve_pids(package)
-                for pid in pids:
-                    resolved_map[pid] = package
-
-            if cycle_limit == total:
-                new_map = resolved_map
-            else:
-                # Only reconcile PIDs for packages polled this cycle; keep mappings
-                # for unpolled packages so throttled polling stays correct.
-                polled_package_set = set(polled_packages)
-                async with self._lock:
-                    new_map = {
-                        pid: package
-                        for pid, package in self._pid_map.items()
-                        if package not in polled_package_set
-                    }
-                new_map.update(resolved_map)
-
-            if total:
-                self._resolve_cursor = (self._resolve_cursor + cycle_limit) % total
-
-            changed = await self._update_pid_map(new_map)
-
-            if changed:
-                current_interval = self.poll_interval
-            else:
-                current_interval = min(
-                    self.max_poll_interval,
-                    current_interval * self.poll_backoff_factor,
-                )
-
-            try:
-                await asyncio.wait_for(
-                    self._stop_event.wait(), timeout=current_interval
-                )
-            except TimeoutError:
-                continue
-
-    async def _update_pid_map(self, new_map: dict[int, str]) -> bool:
-        """Apply PID map changes in place.
-
-        This avoids replacing the full mapping object when there are no changes,
-        while preserving the same add/update/remove semantics.
-
-        Args:
-            new_map: Latest PID to package mapping snapshot.
-
-        Returns:
-            True if at least one mapping changed, False otherwise.
-        """
-        async with self._lock:
-            if self._pid_map == new_map:
-                return False
-
-            current_pids = set(self._pid_map)
-            new_pids = set(new_map)
-
-            for stale_pid in current_pids - new_pids:
-                del self._pid_map[stale_pid]
-
-            for pid, package in new_map.items():
-                if self._pid_map.get(pid) != package:
-                    self._pid_map[pid] = package
-
-            return True
-
-    async def _resolve_pids(self, package: str) -> list[int]:
-        """Resolve PIDs for a package using ADB."""
-        try:
-            cmd = build_pidof_command(self.adb_path, self.device_id, package)
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                creationflags=_CREATE_NO_WINDOW,
-            )
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5.0)
-
-            if process.returncode == 0 and stdout:
-                output = stdout.decode("utf-8", errors="replace").strip()
-                if output:
-                    return [
-                        int(p) for p in output.split() if p.isdigit() and len(p) <= 7
-                    ]
-        except Exception as exc:  # noqa: BLE001
-            # A polling monitor must never crash: any failure (device disconnected,
-            # command failed, malformed output, a name the builder refuses)
-            # degrades to returning no PIDs.
-            logger.debug("pidof resolution failed for %s: %s", package, exc)
-        return []
+# The tasks of every live run. asyncio keeps only weak references to tasks; a
+# run whose stream was dropped must still end (and kill adb) on its own.
+_LIVE: set[asyncio.Task[Any]] = set()
 
 
-class AsyncStreamHandle:
-    """Handle to control an AsyncLogStream instance."""
+@dataclass(slots=True, eq=False)
+class _Consumer:
+    """The one consumer of a run: the push dispatcher or a pull iterator.
 
-    def __init__(self, stream: AsyncLogStream) -> None:
-        """Initialize the handle.
-
-        Args:
-            stream: The AsyncLogStream instance to control.
-        """
-        self._stream = stream
-
-    async def stop(self) -> None:
-        """Stop the log stream gracefully."""
-        await self._stream.stop()
-
-    async def kill(self) -> None:
-        """Kill the log stream immediately."""
-        await self._stream.kill()
-
-    async def pause(self) -> None:
-        """Pause dispatching of log entries."""
-        await self._stream.pause()
-
-    async def resume(self) -> None:
-        """Resume dispatching of log entries."""
-        await self._stream.resume()
-
-    async def join(self, timeout: float | None = None) -> None:
-        """Wait for the stream to finish."""
-        await self._stream.join(timeout)
-
-    @property
-    def state(self) -> StreamState:
-        """Get the current state of the stream."""
-        return self._stream.state
-
-
-# Type aliases for callbacks
-AsyncLogCallback = Callable[[Any, AsyncStreamHandle], Awaitable[None]]
-AsyncStateCallback = Callable[[StreamState], Awaitable[None]]
-AsyncErrorCallback = Callable[[Exception], Awaitable[None]]
-AsyncLifecycleCallback = Callable[[], Awaitable[None]]
-
-
-class AsyncLogStream:
-    """Manages an ADB logcat subprocess and processes its output asynchronously.
-
-    This class handles the lifecycle of the `adb logcat` process using asyncio,
-    parses its output into `LogEntry` objects, applies filters and groupers,
-    and dispatches the results to user-provided async callbacks.
-
-    Usage:
-        ```python
-        from logpyt.streams.async_stream import AsyncLogStream, AsyncStreamHandle
-        from logpyt.models import LogEntry
-
-        async def my_callback(entry: LogEntry, handle: AsyncStreamHandle) -> None:
-            if entry.tag == "MyApp":
-                print(f"MyApp Log: {entry.message}")
-
-        async def main():
-            async with AsyncLogStream(stdout_callback=my_callback) as stream:
-                await asyncio.sleep(10)
-        ```
+    Attributes:
+        owner: The task that created a pull iterator (design 3.5), by a weak
+            reference; None for the dispatcher.
+        push: Whether this is the dispatcher.
+        attached: False once it detached (`_Run._detach`).
+        owe_done: The record in hand was finished with; the next step settles
+            it (`Outbox.done`).
+        failed: Its callback raised: it takes nothing more (design A.21).
+        reached_end: It saw the end of the outbox (or failed), so a pull
+            iterator raises a FAILED outcome.
+        taken: Records taken since it last yielded to the loop (X-1).
+        busy: A step is in progress (one ``__anext__`` at a time).
     """
 
+    owner: weakref.ref[asyncio.Task[Any]] | None
+    push: bool
+    attached: bool = True
+    owe_done: bool = False
+    failed: bool = False
+    reached_end: bool = False
+    taken: int = 0
+    busy: bool = False
+
+
+class _Run:
+    """One run's mailbox, outbox, tasks and consumer side (see the module docs)."""
+
     def __init__(
         self,
-        adb_path: str | None = None,
-        device_id: str | None = None,
-        parser: LogParser | None = None,
-        filter_by: Condition | None = None,
-        group_by: GroupBy | None = None,
-        stdout_callback: AsyncLogCallback | None = None,
-        stderr_callback: AsyncLogCallback | None = None,
-        on_start: AsyncLifecycleCallback | None = None,
-        on_stop: AsyncLifecycleCallback | None = None,
-        on_state: AsyncStateCallback | None = None,
-        on_error: AsyncErrorCallback | None = None,
-        logcat_args: Sequence[str] | None = None,
-        auto_reconnect: bool = False,  # noqa: FBT001, FBT002  existing public signature
-        reconnect_delay: float = 1.0,
-        pid_poll_interval: float = 5.0,
-        pid_max_poll_interval: float = 30.0,
-        pid_poll_backoff_factor: float = 2.0,
-        read_timeout: float | None = None,
-        callback_queue_size: int = 1024,
-        callback_queue_policy: Literal["drop_newest", "drop_oldest"] = "drop_newest",
-        pid_max_resolves_per_cycle: int = 32,
+        core: StreamCore,
+        config: StreamConfig,
+        *,
+        on_item: Callable[[Any], object] | None,
+        on_event: Callable[[StreamEvent], object] | None,
     ) -> None:
-        """Initialize the AsyncLogStream.
+        self.core = core
+        self.on_item = on_item
+        self.on_event = on_event
+        # Loop-bound state is made in start(), on the running loop (F2-9).
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.data: asyncio.Queue[Data | Eof] | None = None
+        self.control = ControlInbox()
+        self.data_closed = False
+        self.outbox = Outbox()
+        self.procs: dict[int, _Process] = {}  # logcat, until its exit was seen
+        self.oneshots: set[_Process] = set()  # one-shot, until reaped
+        self.workers: set[asyncio.Task[None]] = set()  # spawns, readers, watchers
+        self.commands: set[asyncio.Task[None]] = set()  # one-shot commands
+        self.reaping = False  # the run is over: a one-shot child is killed at once
+        self.closing = False  # interpreter exit: no adb child is started any more
+        # adb spawns in progress whose child is not tracked yet; interpreter
+        # exit lets them finish (`_abandon`).
+        self.spawning = 0
+        self.failure: BaseException | None = None  # a task raised (a logpyt bug)
+        self.buffer_entries = config.buffer_entries
+        self.buffer_bytes = config.buffer_bytes
+        # What the engine publishes after every handle() (design 3.6).
+        self.state = StreamState.IDLE
+        self.stats = core.stats()
+        self.intake_open = True
+        self.concluded = False
+        self.reached_running = False
+        self.finished = False  # Finished was carried out
+        self.outcome: StreamError | None = None
+        self.ended = False  # the engine is done: what join() waits for
+        self.crash: BaseException | None = None
+        # The consumer side.
+        self.started = False
+        self.kill_flag = False
+        # kill() from another thread sets the flag under it, and a consumer
+        # step reads the flag and pops under it, so no pop begins after such
+        # a kill() returned (F2-7). The protocol itself needs no lock.
+        self.kill_lock = threading.Lock()
+        self.consumer: _Consumer | None = None
+        self.consumed = False  # a consumer was attached once
+        self.pending: OutboxCounts | None = None  # a report the engine has not taken
+        self.posted: OutboxCounts | None = None  # the counts reported last
+        # join(), iteration, wait_running() or assert_complete() raised the
+        # outcome (design A.23).
+        self.seen = False
+        # How the AsyncLogStream was dropped, for the unseen-outcome ERROR.
+        self.orphaned: str | None = None
+        # The engine and dispatcher tasks, for the F3-7 check.
+        self.engine_task: weakref.ref[asyncio.Task[Any]] | None = None
+        self.dispatcher_task: weakref.ref[asyncio.Task[Any]] | None = None
+        # Wake-ups, on the loop only.
+        self._engine_waiter: asyncio.Future[None] | None = None
+        self._consumer_waiter: asyncio.Future[None] | None = None
+        self._waiters: list[asyncio.Future[None]] = []
+        self._reap_due = False  # Finished was carried out: reap the one-shots
 
-        Args:
-            adb_path: Path to ADB executable. If None, resolved automatically.
-            device_id: Target device serial ID.
-            parser: Parser to convert lines to LogEntry objects.
-            filter_by: The condition an entry must meet to be delivered. The
-                packages of its `Package` conditions (anywhere in the tree,
-                under `Or` and `Not` too) are resolved to pids.
-            group_by: How to group the stdout entries; the stdout callback
-                then receives `LogGroup` objects. The groups still open when
-                stdout ends are delivered with reason "end".
-            stdout_callback: Async callback for processed stdout entries.
-            stderr_callback: Async callback for processed stderr entries.
-            on_start: Async hook called when stream starts.
-            on_stop: Async hook called when stream stops.
-            on_state: Async hook called when state changes.
-            on_error: Async hook called when an error occurs.
-            logcat_args: Additional arguments for `adb logcat`.
-            auto_reconnect: Whether to automatically reconnect when the process exits.
-            reconnect_delay: Delay in seconds before reconnecting.
-            pid_poll_interval: Interval in seconds for PID monitoring.
-            pid_max_poll_interval: Maximum PID poll interval when idle.
-            pid_poll_backoff_factor: Backoff factor for unchanged PID snapshots.
-            read_timeout: Timeout in seconds for reading from the stream.
-            callback_queue_size: Max buffered callback items per stream source.
-                Uses backpressure when full.
-            callback_queue_policy: Policy for callback queue overflow.
-                "drop_newest" drops incoming data, "drop_oldest" evicts the
-                oldest queued item.
-            pid_max_resolves_per_cycle: Maximum packages to resolve per PID poll cycle.
+    # -- the loop ---------------------------------------------------------------------
+
+    def on_loop(self) -> bool:
+        """Whether the caller runs on this run's (running) loop."""
+        try:
+            return asyncio.get_running_loop() is self.loop
+        except RuntimeError:
+            return False
+
+    def _soon(self, callback: Callable[[], object]) -> bool:
+        """Run ``callback`` on the loop from another thread; False once it is closed."""
+        loop = self.loop
+        if loop is None:
+            return False
+        try:
+            loop.call_soon_threadsafe(callback)
+        except RuntimeError:  # the loop is closed: nothing runs any more
+            return False
+        return True
+
+    def _task(
+        self,
+        coro: Coroutine[Any, Any, None],
+        name: str,
+        *,
+        context: contextvars.Context | None = None,
+    ) -> asyncio.Task[None]:
+        loop = self.loop
+        assert loop is not None  # noqa: S101  (started)
+        task = loop.create_task(coro, name=name, context=context)
+        _LIVE.add(task)
+        task.add_done_callback(_LIVE.discard)
+        task.add_done_callback(_retrieve)
+        return task
+
+    def _worker(self, coro: Coroutine[Any, Any, None], name: str) -> None:
+        task = self._task(coro, name)
+        self.workers.add(task)
+        task.add_done_callback(self.workers.discard)
+
+    # -- control, from any thread -----------------------------------------------------
+
+    def start(self, loop: asyncio.AbstractEventLoop, *, push: bool) -> bool:
+        """Start the engine (and the dispatcher) on ``loop``; False if started."""
+        if self.started:
+            return False
+        self.started = True
+        self.loop = loop
+        self.data = asyncio.Queue(_DATA_SLOTS)
+        if push:
+            self.consumer = _Consumer(owner=None, push=True)
+            self.consumed = True
+        self.control.post(Start())
+        # The engine and the dispatcher run the stream's user code; the tasks
+        # they create inherit the mark (F3-7).
+        context = contextvars.copy_context()
+        context.run(_IN_CALLBACK.set, self)
+        engine = self._task(self._engine(), "logpyt-engine", context=context)
+        self.engine_task = weakref.ref(engine)
+        if push:
+            dispatcher = self._task(
+                self._dispatch(), "logpyt-dispatcher", context=context
+            )
+            self.dispatcher_task = weakref.ref(dispatcher)
+        return True
+
+    def stop(self, flush: float | None, *, detach_own: bool = False) -> None:
+        """Post a stop; detach the outbox when no consumer is attached (3.5)."""
+        if self.loop is None:
+            return  # D-6
+        if self.on_loop():
+            self._stop_now(flush, detach_own=detach_own)
+        else:
+            self._soon(functools.partial(self._stop_now, flush))
+
+    def _stop_now(self, flush: float | None, *, detach_own: bool = False) -> None:
+        if detach_own:
+            consumer = self.consumer
+            if consumer is not None and _owned_here(consumer):
+                self._detach(consumer)
+        if not self.started or self.finished:
+            return  # D-6, G2
+        self._post(StopRequest(flush))
+        if self.consumer is None and not self.outbox.detached:
+            # Nobody takes the rest: discard and count it (design 3.5).
+            self.outbox.detach()
+            self._post(ConsumerDetached(self._counts()))
+
+    def kill(self, *, detach_own: bool = False) -> None:
+        """Set the kill flag and post the kill where the core acts (F2-7, D-6).
+
+        From another thread the request reaches the loop later, but the flag
+        is set before kill() returns: the consumer may go on first (a worker
+        thread's result can wake it at once), and takes no item then. A step
+        that was popping when the flag was set (`kill_lock`) began before
+        kill() returned.
         """
-        self.adb_path = adb_path or adb.resolve_adb()
-        self.device_id = device_id
-        self.parser = parser or ThreadTimeLogParser()
-        # One parse session per adb connection (F6-1); replaced at each spawn.
-        self._parse_context = ParseContext()
-        self.filter_by = (
-            None if filter_by is None else _require_condition(filter_by, "filter_by")
+        if self.loop is None:
+            return
+        if self.on_loop():
+            self._kill_now(detach_own=detach_own)
+        elif self._soon(self._kill_now) and self.started and not self.finished:
+            with self.kill_lock:
+                self.kill_flag = True
+
+    def _kill_now(self, *, detach_own: bool = False) -> None:
+        if detach_own:
+            consumer = self.consumer
+            if consumer is not None and _owned_here(consumer):
+                self._detach(consumer)
+        if not self.started or self.finished:
+            return
+        self.kill_flag = True
+        self._post(KillRequest())
+
+    def abandon(self, *, at_exit: bool) -> None:
+        """The AsyncLogStream was dropped: kill a running run (design 3.4).
+
+        Runs on the loop, or in place where the loop cannot act on it any
+        more (`_abandon`), where only adb is killed and the outcome logged.
+        ``at_exit``: its finalizer ran at interpreter exit, while the stream
+        was still referenced; else it was garbage-collected. Either names the
+        cause in the ERROR for an outcome nobody saw.
+        """
+        self.orphaned = (
+            "was still referenced at interpreter exit"
+            if at_exit
+            else "was garbage-collected"
         )
-        self.auto_reconnect = auto_reconnect
-        self.reconnect_delay = reconnect_delay
-        self.pid_poll_interval = pid_poll_interval
-        self.pid_max_poll_interval = pid_max_poll_interval
-        self.pid_poll_backoff_factor = pid_poll_backoff_factor
-        self.read_timeout = read_timeout
-        self.callback_queue_size = callback_queue_size
-        self.callback_queue_policy = callback_queue_policy
-        self.pid_max_resolves_per_cycle = pid_max_resolves_per_cycle
+        late: str | None = None
+        if self.finished:
+            late = self._unseen_outcome_message()
+        elif self.started:
+            if self.on_loop():
+                self.kill_flag = True
+                self._post(KillRequest())
+            else:
+                self.kill_children()
+        if late is not None:
+            _log.error("%s", late)
 
-        if group_by is not None and not isinstance(group_by, GroupBy):
-            msg = f"group_by must be a GroupBy, not {type(group_by).__name__}"
-            raise TypeError(msg)
-        self.group_by = group_by
-        # One grouping state per stream; the stdout reader flushes it at EOF.
-        self._grouper = None if group_by is None else Grouper(group_by)
+    def kill_children(self) -> None:
+        """Kill every adb child not reaped yet at once: logcat and one-shot.
 
-        self.stdout_callback = stdout_callback
-        self.stderr_callback = stderr_callback
-        self.on_start = on_start
-        self.on_stop = on_stop
-        self.on_state = on_state
-        self.on_error = on_error
-        self.logcat_args = list(logcat_args) if logcat_args else []
+        It does not need the loop, so it also works at interpreter shutdown
+        and once the loop is closed; the copies are made in one step each.
+        """
+        for proc in [*self.procs.values(), *self.oneshots]:
+            _send(proc, kill=True)
 
-        self._pid_monitor: AsyncPidMonitor | None = None
-        # F5-1: every Package in the condition tree, not only Filter's. F5-3:
-        # each name reaches the device shell, and an override of packages()
-        # bypasses Package's own check, so a bad name fails here.
-        packages = frozenset() if self.filter_by is None else self.filter_by.packages()
-        if packages:
-            self._pid_monitor = AsyncPidMonitor(
-                self.adb_path,
-                self.device_id,
-                sorted(_check_package_name(name) for name in packages),
-                poll_interval=self.pid_poll_interval,
-                max_poll_interval=self.pid_max_poll_interval,
-                poll_backoff_factor=self.pid_poll_backoff_factor,
-                max_resolves_per_cycle=self.pid_max_resolves_per_cycle,
+    def wait_spawns(self) -> None:
+        """Interpreter exit, in the main thread, while the loop runs in another
+        one: let the adb spawns in progress there finish, for at most
+        ``_REAP_WAIT``, so their children are tracked (design A.23).
+
+        ``closing`` is set first, so no spawn begins any more, and one that
+        finishes kills its own child. Without this wait, finalization could
+        freeze the loop's thread after the child was created but before it
+        was tracked, and the child would outlive the interpreter.
+        """
+        deadline = time.monotonic() + _REAP_WAIT
+        while self.spawning and time.monotonic() < deadline:
+            time.sleep(_REAP_POLL)
+
+    def attach(self) -> _Consumer:
+        """Attach a pull iterator, or raise UsageError (design 2.3, 4.2)."""
+        if not self.started:
+            msg = (
+                "AsyncLogStream iterated before start(): use `async with "
+                "AsyncLogStream(...) as stream: async for entry in stream: ...`, "
+                "or call stream.start() first"
+            )
+            raise UsageError(msg)
+        if not self.on_loop():
+            msg = (
+                "AsyncLogStream iterated outside the event loop that started it; "
+                "iterate it in a coroutine on that loop"
+            )
+            raise UsageError(msg)
+        if self.consumed:
+            msg = (
+                "AsyncLogStream has one iterator per run, and it was already "
+                "created; keep that iterator, or use stream.clone() for a new run"
+            )
+            raise UsageError(msg)
+        if self.outbox.detached:
+            msg = (
+                "AsyncLogStream iterated after stop() without an attached "
+                "iterator: stop() discarded the rest (design 3.5); iterate "
+                "first, then stop()"
+            )
+            raise UsageError(msg)
+        task = _current_task()
+        consumer = _Consumer(
+            owner=None if task is None else weakref.ref(task), push=False
+        )
+        self.consumer = consumer
+        self.consumed = True
+        return consumer
+
+    def detach(self, consumer: _Consumer) -> None:
+        """A pull iterator was closed or dropped; from any thread."""
+        if self.on_loop():
+            self._detach(consumer)
+        else:
+            self._soon(functools.partial(self._detach, consumer))
+
+    # -- waits, from user code ---------------------------------------------------------
+
+    def check_wait(self, what: str, *, iterator: bool) -> None:
+        """UsageError for a wait from the stream's own user code (F3-7, design 3.5)."""
+        task = _current_task()
+        if _IN_CALLBACK.get() is self or (
+            task is not None
+            and (_is(task, self.engine_task) or _is(task, self.dispatcher_task))
+        ):
+            msg = (
+                f"{what} called from a stream callback; call stream.stop() and "
+                "return instead"
+            )
+            raise UsageError(msg)
+        consumer = self.consumer
+        if iterator and consumer is not None and _owned_here(consumer):
+            msg = (
+                f"{what} would wait for this task's own iterator; iterate to the "
+                "end, break, or call it.aclose() first"
+            )
+            raise UsageError(msg)
+
+    def check_loop(self, what: str) -> None:
+        """UsageError for a wait awaited on another loop than the run's."""
+        if not self.on_loop():
+            msg = (
+                f"{what} awaited outside the event loop that started the stream; "
+                "await it in a coroutine on that loop"
+            )
+            raise UsageError(msg)
+
+    async def _wait_until(
+        self, done: Callable[[], bool], timeout: float | None
+    ) -> bool:
+        """Wait until ``done()``; False once ``timeout`` seconds passed first.
+
+        Woken by `_notify_waiters`; cancelling the caller cancels only this
+        wait (design 5.4).
+        """
+        loop = self.loop
+        assert loop is not None  # noqa: S101  (started)
+        deadline = None if timeout is None else loop.time() + max(0.0, timeout)
+        while not done():
+            if deadline is not None and loop.time() >= deadline:
+                return False
+            waiter: asyncio.Future[None] = loop.create_future()
+            self._waiters.append(waiter)
+            timer = None if deadline is None else loop.call_at(deadline, _wake, waiter)
+            try:
+                await waiter
+            finally:
+                if timer is not None:
+                    timer.cancel()
+                with contextlib.suppress(ValueError):
+                    self._waiters.remove(waiter)
+        return True
+
+    async def wait_ended(self, timeout: float | None, what: str) -> None:
+        """Wait until the engine has ended; TimeoutError on expiry."""
+        if not await self._wait_until(lambda: self.ended, timeout):
+            msg = f"{what} timed out after {timeout:g} s; the stream keeps running"
+            raise TimeoutError(msg)
+
+    async def wait_running(self, timeout: float | None) -> None:
+        """Wait until the first RUNNING or the run's conclusion (design A.21)."""
+
+        def done() -> bool:
+            return self.reached_running or self.concluded or self.crash is not None
+
+        if not await self._wait_until(done, timeout):
+            msg = (
+                f"wait_running() timed out after {timeout:g} s; the stream is "
+                f"{self.state} and keeps running"
+            )
+            raise TimeoutError(msg)
+        if self.reached_running and self.crash is None:
+            return
+        error = self.take_error(unseen_only=False)
+        if error is not None:
+            raise error
+
+    async def wait_while_progressing(self, close_timeout: float) -> bool:
+        """Wait until the end while the consumer takes items; False once it took
+        nothing for ``close_timeout`` (design 3.4).
+        """
+        loop = self.loop
+        assert loop is not None  # noqa: S101  (started)
+        last = self.outbox.counts()
+        since = loop.time()
+        while not self.ended:
+            now = loop.time()
+            counts = self.outbox.counts()
+            if (counts.taken_entries, counts.handled) != (
+                last.taken_entries,
+                last.handled,
+            ):
+                last, since = counts, now
+            elif now - since >= close_timeout:
+                return False
+            await self._wait_until(
+                lambda: self.ended, min(_SLICE, close_timeout - (now - since))
+            )
+        return True
+
+    def take_error(self, *, unseen_only: bool) -> BaseException | None:
+        """The error a finished run raises (its FAILED outcome), marked seen."""
+        if self.crash is not None:
+            return self.crash
+        if self.outcome is None or (unseen_only and self.seen):
+            return None
+        self.seen = True
+        return self.outcome
+
+    # -- the consumer side: one delivery iterator for pull and push -----------------
+
+    async def _dispatch(self) -> None:
+        """Push mode: ``for item in <the delivery iterator>: on_item(item)`` (A-4)."""
+        # An eager task factory would run this step inside start(), which
+        # runs no user code (design 3.3): yield first.
+        await asyncio.sleep(0)
+        consumer = self.consumer
+        on_item = self.on_item
+        assert consumer is not None  # noqa: S101  (set by start)
+        assert on_item is not None  # noqa: S101  (push mode has one)
+        try:
+            while (item := await self.deliver_next(consumer)) is not None:
+                if not await self._call(consumer, "on_item", on_item, item):
+                    return
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise  # a real cancellation, or Ctrl+C on the loop's thread
+        except BaseException as exc:  # noqa: BLE001  (_call takes the callbacks')
+            self._worker_failed(exc)
+        finally:
+            self.detach(consumer)
+
+    async def deliver_next(self, consumer: _Consumer) -> Item | None:
+        """The next item for ``consumer``, ``on_event`` run for the events before it.
+
+        None at the consumer's end: the outbox ended, it was detached, or a
+        callback raised (``on_event`` here, ``on_item`` before).
+        """
+        if consumer.busy:
+            msg = (
+                "an AsyncLogStream iterator is awaited by two tasks at once; "
+                "await its __anext__() from one task at a time"
+            )
+            raise UsageError(msg)
+        consumer.busy = True
+        try:
+            while True:
+                record = await self._step(consumer)
+                if record is None:
+                    return None
+                if isinstance(record, LogEntry | LogGroup):
+                    return record
+                on_event = self.on_event
+                if on_event is None:
+                    consumer.owe_done = True
+                elif not await self._call(consumer, "on_event", on_event, record):
+                    return None
+        finally:
+            consumer.busy = False
+
+    async def _step(self, consumer: _Consumer) -> Record | None:
+        """Settle, pop and report in one task step (protocol module docs).
+
+        The once-per-batch yield (X-1) comes before the settle, so a
+        cancellation there loses nothing: the record in hand is settled by
+        the next step.
+        """
+        if consumer.taken >= _BATCH:
+            consumer.taken = 0
+            await asyncio.sleep(0)
+        outbox = self.outbox
+        while True:
+            if consumer.failed:
+                await self._await_close(consumer)
+                return None
+            if consumer.owe_done:
+                consumer.owe_done = False
+                outbox.done()
+            if not consumer.attached:
+                return None
+            with self.kill_lock:  # an off-loop kill() sets the flag under it
+                skip = self.kill_flag and outbox.entries > 0 and not outbox.closed
+                record = None if skip else outbox.pop()
+            if skip:
+                # F2-7: no item is taken after kill(). The core discards
+                # them (DiscardUndelivered, counted in undelivered: 3.4),
+                # and the events behind them still come.
+                self._report(empty=True)
+                await self._consumer_wait(consumer)
+                continue
+            self._report(empty=record is None)
+            if record is None:
+                if outbox.ended:
+                    consumer.reached_end = True
+                    self._detach(consumer)
+                    return None
+                await self._consumer_wait(consumer)
+                continue
+            consumer.taken += 1
+            return record
+
+    async def _call(
+        self,
+        consumer: _Consumer,
+        stage: Literal["on_item", "on_event"],
+        callback: Callable[[Any], object],
+        record: Record,
+    ) -> bool:
+        """Run one callback in the consumer context and await what it returns;
+        False if it failed (design 2.4, F3-6).
+
+        A ``CancelledError`` while the task is not being cancelled
+        (``Task.cancelling() == 0``) is the callback's own failure; a real
+        cancellation, and Ctrl+C (``KeyboardInterrupt``) propagate and leave
+        the record to the next step. On the dispatcher any other
+        ``BaseException`` (``SystemExit``) is a callback failure, as in the
+        thread driver (design A.23).
+        """
+        token = _IN_CALLBACK.set(self)
+        try:
+            result = callback(record)
+            if result is not None and inspect.isawaitable(result):
+                await result
+        except asyncio.CancelledError as exc:
+            task = _current_task()
+            if task is not None and task.cancelling():
+                consumer.owe_done = True  # interrupted: the next step settles it
+                raise
+            await self._fail(consumer, stage, exc)
+            return False
+        except Exception as exc:  # noqa: BLE001  (fail fast: CallbackError)
+            await self._fail(consumer, stage, exc)
+            return False
+        except BaseException as exc:
+            if consumer.push and not isinstance(exc, KeyboardInterrupt):
+                await self._fail(consumer, stage, exc)  # SystemExit (A.23)
+                return False
+            consumer.owe_done = True  # interrupted, not failed
+            raise
+        finally:
+            _IN_CALLBACK.reset(token)
+        consumer.owe_done = True
+        return True
+
+    async def _fail(
+        self,
+        consumer: _Consumer,
+        stage: Literal["on_item", "on_event"],
+        error: BaseException,
+    ) -> None:
+        """Post the failure; take nothing more; detach once the outbox is closed."""
+        consumer.failed = True
+        late = self._post(CallbackFailed(stage, error))
+        if late is not None:
+            _log.error("%s", late, exc_info=error)
+        await self._await_close(consumer)
+
+    async def _await_close(self, consumer: _Consumer) -> None:
+        """After a failure: wait until the outbox is closed, then detach."""
+        while consumer.attached and not self.outbox.closed:
+            await self._consumer_wait(consumer)
+        consumer.reached_end = True
+        self._detach(consumer)
+
+    async def _consumer_wait(self, consumer: _Consumer) -> None:
+        """Wait until the engine puts, discards or closes, or a detach."""
+        loop = self.loop
+        assert loop is not None  # noqa: S101  (started)
+        waiter: asyncio.Future[None] = loop.create_future()
+        self._consumer_waiter = waiter
+        consumer.taken = 0  # it suspends here
+        try:
+            await waiter
+        finally:
+            if self._consumer_waiter is waiter:
+                self._consumer_waiter = None
+
+    def _wake_consumer(self) -> None:
+        waiter = self._consumer_waiter
+        if waiter is not None:
+            _wake(waiter)
+
+    def _report(self, *, empty: bool) -> None:
+        """The consumer side's report of the outbox counts (design A.21).
+
+        The engine takes it before any later request (`_take`); it is woken
+        only when the report can change its course.
+        """
+        counts = self.outbox.counts()
+        if counts is self.posted:
+            return
+        self.posted = counts
+        if self.ended:
+            self._handle_late(ConsumerProgress(counts))
+            return
+        self.pending = counts
+        low = (
+            2 * self.outbox.entries <= self.buffer_entries
+            and 2 * self.outbox.nbytes <= self.buffer_bytes
+        )
+        if empty or (low and not self.intake_open):
+            self._notify_engine()
+
+    def _detach(self, consumer: _Consumer) -> None:
+        """`Outbox.detach` and `ConsumerDetached` in one task step."""
+        if not consumer.attached:
+            return
+        consumer.attached = False
+        if self.consumer is consumer:
+            self.consumer = None
+        self.outbox.detach()
+        self._post(ConsumerDetached(self._counts()))
+        self._wake_consumer()
+
+    def _counts(self) -> OutboxCounts:
+        counts = self.outbox.counts()
+        self.posted = counts
+        return counts
+
+    # -- the mailbox ------------------------------------------------------------------
+
+    def _post(self, event: Event) -> str | None:
+        """Hand ``event`` to the engine; after its end, to the core.
+
+        Returns the ERROR message of a callback failure that came after the
+        engine ended (`StreamCore.late_failure`), for the caller to log.
+        """
+        if self.ended:
+            return self._handle_late(event)
+        self.control.post(event)
+        self._notify_engine()
+        return None
+
+    def _handle_late(self, event: Event) -> str | None:
+        """The engine has ended: the core is the consumer's (G2: accounting)."""
+        if self.crash is not None or not isinstance(
+            event, ConsumerProgress | ConsumerDetached | CallbackFailed
+        ):
+            return None
+        late = (
+            self.core.late_failure(event) if isinstance(event, CallbackFailed) else None
+        )
+        self.core.handle(event, _now(self.loop))
+        self.stats = self.core.stats()
+        return late
+
+    def _notify_engine(self) -> None:
+        waiter = self._engine_waiter
+        if waiter is not None:
+            _wake(waiter)
+
+    def _notify_waiters(self) -> None:
+        waiters, self._waiters = self._waiters, []
+        for waiter in waiters:
+            _wake(waiter)
+
+    async def _take(self) -> Event | None:
+        """The engine's next event (design 5.4); None once the run is over.
+
+        The control inbox comes first, then data while intake is open, then a
+        `Tick` at the deadline. The run is over once `Finished` was carried
+        out and no consumer is attached any more, or once a task failed (the
+        engine then ends it: `_crashed`).
+        """
+        loop = self.loop
+        data = self.data
+        assert loop is not None  # noqa: S101  (started)
+        assert data is not None  # noqa: S101
+        core = self.core
+        while True:
+            if self.failure is not None:
+                return None
+            pending = self.pending
+            if pending is not None:
+                self.pending = None
+                self.control.post(ConsumerProgress(pending))
+            event = self.control.take()
+            if event is not None:
+                return event
+            if not data.empty() and core.intake_open:
+                return data.get_nowait()  # a reader waiting for room is woken
+            if self.finished and self.consumer is None:
+                self._end()
+                return None
+            deadline = core.next_deadline()
+            if deadline is not None and deadline <= loop.time():
+                return _TICK
+            waiter: asyncio.Future[None] = loop.create_future()
+            self._engine_waiter = waiter
+            timer = None if deadline is None else loop.call_at(deadline, _wake, waiter)
+            try:
+                await waiter
+            finally:
+                self._engine_waiter = None
+                if timer is not None:
+                    timer.cancel()
+
+    def _end(self) -> None:
+        """The engine is done: join() returns; readers drop their data."""
+        self.ended = True
+        self.data_closed = True
+        data = self.data
+        while data is not None and not data.empty():
+            data.get_nowait()
+        self._notify_waiters()
+        self._wake_consumer()
+
+    # -- the engine ---------------------------------------------------------------
+
+    async def _engine(self) -> None:
+        # An eager task factory would run this step inside start(), which
+        # never waits for adb (design 2.3): yield first.
+        await asyncio.sleep(0)
+        loop = self.loop
+        assert loop is not None  # noqa: S101  (started)
+        core = self.core
+        interrupted = False
+        try:
+            while (event := await self._take()) is not None:
+                if isinstance(event, CallbackFailed):
+                    late = core.late_failure(event)
+                    if late is not None:
+                        _log.error("%s", late, exc_info=event.error)
+                self._carry_out(core.handle(event, loop.time()))
+                if self._reap_due:
+                    self._reap_due = False
+                    await self._reap_commands()
+                if isinstance(event, Data):
+                    await asyncio.sleep(0)  # X-1: one chunk per task step
+            # A failed task logged its error (`_worker_failed`); an
+            # interrupted one ended the run itself (`_interrupted`).
+            if self.failure is not None and not self.ended:
+                await self._crashed(self.failure)
+        except asyncio.CancelledError as exc:
+            # The loop shuts down (or someone cancelled the engine): kill adb
+            # now, start nothing more (F3-2), and end every wait.
+            self._abandoned(exc)
+            raise
+        except KeyboardInterrupt as exc:
+            # Ctrl+C on the loop's thread: not a bug, and not swallowed.
+            interrupted = True
+            self._interrupted(exc)
+            raise
+        except BaseException as exc:  # noqa: BLE001  (a bug: end the run visibly)
+            _log.error(
+                "the AsyncLogStream engine failed; the run is abandoned", exc_info=exc
+            )
+            await self._crashed(exc)
+        finally:
+            if not interrupted:  # the interrupt leaves the loop without an await
+                await self._close_tasks()
+
+    def _carry_out(self, commands: Iterable[Command]) -> None:
+        """Carry out one ``handle()`` batch in order, then report and publish.
+
+        The `Deliver` that ends the run (its last record is the terminal
+        `StateChange`; `Finished` comes right after it) is put into the
+        outbox together with the outcome (`_finished`), so whoever sees the
+        terminal change also sees the terminal state and the outcome.
+        """
+        changed = False  # the batch changed the outbox counts
+        final: tuple[Record, ...] = ()  # the Deliver that ends the run
+        for command in commands:
+            match command:
+                case Deliver(records=records) if _ends_run(records):
+                    final = records
+                case Deliver(records=records):
+                    changed |= self._deliver(records)
+                case DiscardUndelivered():
+                    before = self.outbox.counts()
+                    self.outbox.discard()
+                    changed |= self.outbox.counts() is not before
+                    self._wake_consumer()  # a consumer waits under the kill flag
+                case Diagnostic(level=level, message=message, logger=name):
+                    logging.getLogger(name).log(level, "%s", message)
+                case Spawn(connection=connection, argv=argv):
+                    self._worker(
+                        self._spawn(connection, argv), f"logpyt-spawn-{connection}"
+                    )
+                case Terminate(connection=connection):
+                    self._signal(connection, kill=False)
+                case Kill(connection=connection):
+                    self._signal(connection, kill=True)
+                case RunCommand():
+                    task = self._task(
+                        self._run_command(command), f"logpyt-{command.kind}"
+                    )
+                    self.commands.add(task)
+                    task.add_done_callback(self.commands.discard)
+                case Finished(outcome=outcome):
+                    self._finished(outcome, final)
+                    final = ()
+                    changed = False
+                case _:
+                    assert_never(command)
+        assert not final  # noqa: S101  (the core emits Finished right after it)
+        if changed:
+            self.control.post(ConsumerProgress(self._counts()))
+        self._publish()
+
+    def _deliver(self, records: tuple[Record, ...]) -> bool:
+        """`Deliver`: append to the outbox; whether that changed its counts.
+
+        The state is published first (design 3.6 item 5: it may run ahead
+        of the events, never behind them), so a consumer that takes one of
+        these records, and a `wait_running` it wakes, read the state that
+        record led to or a later one.
+        """
+        self._publish(records)
+        before = self.outbox.counts()
+        self._put_records(records)
+        return self.outbox.counts() is not before
+
+    def _put_records(self, records: tuple[Record, ...]) -> None:
+        """Append to the outbox and wake the consumer."""
+        self.outbox.put(records)
+        if not self.reached_running and any(
+            isinstance(record, StateChange) and record.new is StreamState.RUNNING
+            for record in records
+        ):
+            self.reached_running = True
+            self._notify_waiters()
+        self._wake_consumer()
+
+    def _finished(self, outcome: StreamError | None, final: tuple[Record, ...]) -> None:
+        """`Finished`: the run's last records, the engine side's last report,
+        then the end (protocol), in one task step; the engine then kills and
+        reaps the one-shot adb children still running (`_reap_commands`).
+
+        The core is terminal, so ``handle()`` here only updates its
+        accounting (G2) and runs no user code. A consumer therefore takes the
+        terminal `StateChange` only once ``state``, ``stats`` and ``outcome``
+        are final, and ``assert_complete()`` never sees a terminal state
+        without its outcome.
+        """
+        if final:
+            self._put_records(final)
+        self.core.handle(ConsumerProgress(self._counts()), _now(self.loop))
+        self.outbox.close()
+        self.finished = True
+        self.outcome = outcome
+        self._publish()
+        late = self._unseen_outcome_message() if self.orphaned else None
+        self.reaping = True
+        self._reap_due = bool(self.commands)
+        self._wake_consumer()
+        self._notify_waiters()
+        if late is not None:
+            _log.error("%s", late)
+
+    async def _reap_commands(self) -> None:
+        """Kill and reap the one-shot commands still running at the end (A.23).
+
+        Their results would be ignored (G2, G5). Cancelling the runner kills
+        and reaps its child; this waits at most ``_REAP_WAIT`` for that.
+        """
+        tasks = list(self.commands)
+        for task in tasks:
+            task.cancel()
+        await asyncio.wait(tasks, timeout=_REAP_WAIT)
+
+    def _publish(self, records: tuple[Record, ...] = ()) -> None:
+        """Publish the core's state, stats and intake (design 3.6).
+
+        A terminal state is published only once ``outcome`` is set
+        (`_finished`). Before that, in a batch that ends the run, ``state``
+        is the state the last change in ``records`` led to, and
+        ``concluded`` keeps its value, so ``wait_running()`` never returns
+        for a run whose outcome is not published yet.
+        """
+        core = self.core
+        self.stats = core.stats()
+        self.intake_open = core.intake_open
+        state = core.state
+        concluded = core.concluded
+        if state in _TERMINAL and not self.finished:
+            changes = [
+                r.new
+                for r in records
+                if isinstance(r, StateChange) and r.new not in _TERMINAL
+            ]
+            state = changes[-1] if changes else self.state
+            concluded = self.concluded
+        if state is not self.state or concluded is not self.concluded:
+            self.state = state
+            self.concluded = concluded
+            if state is StreamState.RUNNING:
+                self.reached_running = True
+            self._notify_waiters()
+
+    def _unseen_outcome_message(self) -> str | None:
+        """The ERROR for a FAILED outcome nobody saw (design 3.4)."""
+        if self.outcome is None or self.seen:
+            return None
+        self.seen = True
+        return (
+            f"an AsyncLogStream {self.orphaned} and its run ended FAILED without "
+            f"anyone seeing it: {type(self.outcome).__name__}: {self.outcome}"
+        )
+
+    async def _crashed(self, error: BaseException) -> None:
+        """The engine or a task failed (a logpyt bug): end the run so no wait
+        hangs (design A.23).
+
+        adb is killed first and reaped (bounded by ``_REAP_WAIT``), so no adb
+        child is left when join() returns; only then does every wait end.
+        ``stats`` stays the snapshot the core published last, with ``failed``
+        set: a crashed capture is never ``complete`` (design 4.4), while
+        ``state`` is not changed (no driver invents a state, 5.2).
+        """
+        loop = self.loop
+        assert loop is not None  # noqa: S101  (started)
+        self.reaping = True
+        self.kill_children()
+        tasks = [*self.workers, *self.commands]
+        for task in tasks:
+            task.cancel()  # a one-shot runner kills and reaps its child
+        deadline = loop.time() + _REAP_WAIT
+        try:
+            if tasks:
+                await asyncio.wait(tasks, timeout=_REAP_WAIT)
+            while loop.time() < deadline and (
+                any(proc.returncode is None for proc in self.procs.values())
+                or self.oneshots
+            ):
+                await asyncio.sleep(_REAP_POLL)
+        finally:
+            self._fail_run(error)
+
+    def _abandoned(self, error: BaseException) -> None:
+        """The engine was cancelled: kill adb at once and end the run (F3-2).
+
+        A run whose `Finished` was carried out keeps its outcome, state and
+        stats, which are final (G4, design A.21): the engine was only waiting
+        for its one-shot children to be reaped or for its consumer to detach.
+        The consumer's reports it had not taken yet go to the core for the
+        accounting, as after the end (`_handle_late`). Any other run ends
+        like a crash, with ``error``.
+        """
+        self.reaping = True
+        self.closing = True  # a spawn in flight kills its own child
+        self.kill_children()
+        if self.ended:
+            return
+        if not self.finished:
+            self._fail_run(error)
+            return
+        pending, self.pending = self.pending, None
+        if pending is not None:
+            self.control.post(ConsumerProgress(pending))
+        while (event := self.control.take()) is not None:
+            late = self._handle_late(event)
+            if late is not None and isinstance(event, CallbackFailed):
+                _log.error("%s", late, exc_info=event.error)
+        self._end()
+
+    def _interrupted(self, error: BaseException) -> None:
+        """Ctrl+C (``KeyboardInterrupt``) in a task of the run, on the loop's
+        thread: it leaves the loop at once, and it is not a logpyt bug, so
+        nothing is logged.
+
+        adb is killed now, nothing is started any more, the run's other I/O
+        tasks are cancelled, and every wait ends: as for a cancelled engine
+        (`_abandoned`), with ``error``. Nothing here awaits. The engine, once
+        the loop runs it again, takes no event and only cleans up.
+        """
+        current = _current_task()
+        for task in [*self.workers, *self.commands]:
+            if task is not current:
+                task.cancel()
+        self._abandoned(error)
+        if self.failure is None:
+            self.failure = error
+        self._notify_engine()
+
+    def _fail_run(self, error: BaseException) -> None:
+        """End a crashed run: every wait ends and raises ``error``."""
+        self.crash = error
+        self.stats = replace(self.stats, failed=True)
+        self.finished = True
+        self.outbox.close()
+        self._end()
+
+    async def _close_tasks(self) -> None:
+        """The engine's end: cancel and await the tasks still running (5.4).
+
+        A reader of a retired connection whose pipe a grandchild holds ends
+        here (design 5.10), and closes that pipe. A cancelled one-shot runner
+        reaps its child first. A logcat child the end killed (the engine was
+        cancelled) is waited for, at most ``_REAP_WAIT``, until asyncio has
+        reaped it, so its transport closes before the loop does.
+        """
+        loop = self.loop
+        assert loop is not None  # noqa: S101  (started)
+        tasks = [*self.workers, *self.commands]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.wait(tasks)
+        deadline = loop.time() + _REAP_WAIT
+        while loop.time() < deadline and any(
+            proc.returncode is None for proc in self.procs.values()
+        ):
+            await asyncio.sleep(_REAP_POLL)
+
+    def _worker_failed(self, error: BaseException) -> None:
+        """A task raised (a logpyt bug): the engine ends the run.
+
+        The engine takes no event after this (`_take`) and crashes the run
+        with ``error`` (`_crashed`), so join(), iteration and
+        assert_complete() raise it, as for an engine crash (design A.23).
+        It is logged first, so the ERROR is out before any wait ends.
+        """
+        task = _current_task()
+        name = "?" if task is None else task.get_name()
+        if self.failure is None and not self.ended:
+            _log.error(
+                "the AsyncLogStream task %s failed; the run is abandoned",
+                name,
+                exc_info=error,
+            )
+            self.failure = error
+            self._notify_engine()
+        else:
+            _log.error(
+                "the AsyncLogStream task %s failed after the run ended or was "
+                "abandoned",
+                name,
+                exc_info=error,
             )
 
-        self._process: asyncio.subprocess.Process | None = None
-        self._stdout_task: asyncio.Task[None] | None = None
-        self._stderr_task: asyncio.Task[None] | None = None
-        self._connection_task: asyncio.Task[None] | None = None
-        self._stdout_dispatch_task: asyncio.Task[None] | None = None
-        self._stderr_dispatch_task: asyncio.Task[None] | None = None
-        self._stdout_dispatch_queue: asyncio.Queue[object] | None = None
-        self._stderr_dispatch_queue: asyncio.Queue[object] | None = None
-        self._state = StreamState.IDLE
-        self._state_lock = asyncio.Lock()
-        self._handle = AsyncStreamHandle(self)
-        self._stop_event = asyncio.Event()
-        self._exceptions: list[Exception] = []
+    # -- tasks ------------------------------------------------------------------------
 
-    def _build_dispatch_queue(self) -> asyncio.Queue[object]:
-        """Create a callback dispatch queue with optional backpressure."""
-        if self.callback_queue_size <= 0:
-            return asyncio.Queue()
-        return asyncio.Queue(maxsize=self.callback_queue_size)
-
-    async def _dispatch_item(
-        self,
-        item: LogEntry | LogGroup,
-        source: str,
-        callback: AsyncLogCallback,
-        force: bool = False,  # noqa: FBT001, FBT002  (internal delivery-guarantee flag)
-    ) -> None:
-        """Dispatch an item to callback queue or directly when queue is unavailable."""
-        queue = (
-            self._stdout_dispatch_queue
-            if source == "stdout"
-            else self._stderr_dispatch_queue
-        )
-        if queue is None:
-            await callback(item, self._handle)
-            return
-        # Never block ingestion on a full queue: apply the overflow policy instead.
-        if queue.full():
-            if force or self.callback_queue_policy == "drop_oldest":
-                # force (terminal flush) / drop_oldest: evict one to make room so
-                # the item is still delivered rather than dropped.
-                with contextlib.suppress(asyncio.QueueEmpty):
-                    queue.get_nowait()
-                    queue.task_done()
-            else:
-                # drop_newest: drop the incoming item rather than blocking the reader.
-                logger.debug("Dispatch queue full; dropping newest %s item", source)
-                return
-        with contextlib.suppress(asyncio.QueueFull):
-            queue.put_nowait(item)
-
-    async def _callback_dispatch_loop(
-        self,
-        queue: asyncio.Queue[object],
-        callback: AsyncLogCallback,
-    ) -> None:
-        """Consume queued callback items sequentially."""
-        while True:
-            item = await queue.get()
+    async def _spawn(self, connection: int, argv: tuple[str, ...]) -> None:
+        """`Spawn`: start adb, report it, start its readers and its exit watcher."""
+        try:
+            # Counted before ``closing`` is read: interpreter exit sets it,
+            # then waits for the spawns counted (`_abandon`).
+            self.spawning += 1
             try:
-                if item is _DISPATCH_STOP:
-                    return
-                await callback(item, self._handle)
-            except Exception as e:  # noqa: BLE001  user callback must not crash dispatcher
-                logger.debug("Error in dispatch callback: %s", e)
-                await self._invoke_callback(self.on_error, e)
+                if self.closing:
+                    msg = "the interpreter is exiting: adb is not started"
+                    raise OSError(msg)
+                # Through the module, like resolve_adb: one patch point for tests.
+                proc = await adb._async_spawn_adb(argv)  # noqa: SLF001
+                self.procs[connection] = proc
+            except OSError as exc:
+                self._post(SpawnFailed(connection, exc))
+                return
             finally:
-                queue.task_done()
+                self.spawning -= 1
+            # Posted before any reader runs, so the core sees it before the data.
+            self._post(Spawned(connection, proc.pid))
+            if self.closing:
+                _send(proc, kill=True)
+            pipes: tuple[tuple[Pipe, asyncio.StreamReader | None], ...] = (
+                ("stdout", proc.stdout),
+                ("stderr", proc.stderr),
+            )
+            for name, reader in pipes:
+                assert reader is not None  # noqa: S101  (spawned with PIPE)
+                self._worker(
+                    self._read(connection, name, reader, proc),
+                    f"logpyt-{name}-{connection}",
+                )
+            self._worker(self._wait_exit(connection, proc), f"logpyt-exit-{connection}")
+        except asyncio.CancelledError:
+            raise
+        except KeyboardInterrupt as exc:
+            self._interrupted(exc)
+            raise
+        except BaseException as exc:  # noqa: BLE001  (a bug: end the run visibly)
+            self._worker_failed(exc)
 
-    async def _stop_dispatcher(self, source: str) -> None:
-        """Gracefully stop callback dispatcher for a source."""
-        queue = (
-            self._stdout_dispatch_queue
-            if source == "stdout"
-            else self._stderr_dispatch_queue
-        )
-        task = (
-            self._stdout_dispatch_task
-            if source == "stdout"
-            else self._stderr_dispatch_task
-        )
-        if queue is None or task is None:
-            return
-        # Enqueue the stop sentinel without blocking: if the queue is full (slow or
-        # stuck callback under backpressure), evict one item to make room so shutdown
-        # cannot deadlock on put().
+    def _signal(self, connection: int, *, kill: bool) -> None:
+        """`Terminate` or `Kill`: the child's pid only, never its group (5.11)."""
+        proc = self.procs.get(connection)
+        if proc is not None:
+            _send(proc, kill=kill)
+
+    async def _read(
+        self,
+        connection: int,
+        pipe_name: Pipe,
+        reader: asyncio.StreamReader,
+        proc: _Process,
+    ) -> None:
+        """Read one pipe to EOF into the data inbox; close it at the end (X-5)."""
         try:
-            queue.put_nowait(_DISPATCH_STOP)
-        except asyncio.QueueFull:
-            with contextlib.suppress(asyncio.QueueEmpty):
-                queue.get_nowait()
-                queue.task_done()
-            with contextlib.suppress(asyncio.QueueFull):
-                queue.put_nowait(_DISPATCH_STOP)
-        # Bound the graceful drain so a stuck user callback cannot hang shutdown.
+            while True:
+                try:
+                    chunk = await reader.read(_READ_SIZE)
+                except (OSError, ValueError):
+                    chunk = b""  # the pipe broke: that is its end
+                if not chunk:
+                    break
+                if not await self._put(Data(connection, pipe_name, chunk)):
+                    return
+                # X-1: read() returns at once while data is buffered.
+                await asyncio.sleep(0)
+            await self._put(Eof(connection, pipe_name))
+        except asyncio.CancelledError:
+            raise
+        except KeyboardInterrupt as exc:
+            self._interrupted(exc)
+            raise
+        except BaseException as exc:  # noqa: BLE001  (a bug: end the run visibly)
+            self._worker_failed(exc)
+        finally:
+            _close_pipe(proc, 1 if pipe_name == "stdout" else 2)
+
+    async def _put(self, event: Data | Eof) -> bool:
+        """Append to the data inbox, waiting while it is full; False once closed."""
+        data = self.data
+        assert data is not None  # noqa: S101  (started)
+        if self.data_closed:
+            return False
+        await data.put(event)
+        self._notify_engine()
+        return True
+
+    async def _wait_exit(self, connection: int, proc: _Process) -> None:
+        """Report adb's exit, told by ``returncode`` (design 5.1, 5.4)."""
         try:
-            await asyncio.wait_for(queue.join(), timeout=_DISPATCH_DRAIN_TIMEOUT)
-        except TimeoutError:
-            logger.debug("Dispatcher drain timed out for %s; cancelling", source)
-            task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        if source == "stdout":
-            self._stdout_dispatch_queue = None
-            self._stdout_dispatch_task = None
+            while (returncode := proc.returncode) is None:
+                await asyncio.sleep(_EXIT_POLL)
+            self.procs.pop(connection, None)
+            self._post(Exited(connection, returncode))
+        except asyncio.CancelledError:
+            raise
+        except KeyboardInterrupt as exc:
+            self._interrupted(exc)
+            raise
+        except BaseException as exc:  # noqa: BLE001  (a bug: end the run visibly)
+            self._worker_failed(exc)
+
+    async def _run_command(self, command: RunCommand) -> None:
+        """`RunCommand`: the one-shot runner; its result or error goes back.
+
+        Its adb child is in ``oneshots`` from its spawn until the runner has
+        reaped it, so interpreter exit can kill it; one spawned after the
+        run's end is killed at once. Cancelled, the runner kills and reaps it.
+        """
+        spawned: list[_Process] = []
+
+        async def spawn(argv: Sequence[str]) -> _Process:
+            self.spawning += 1  # before ``closing`` is read, as in `_spawn`
+            try:
+                if self.closing:
+                    msg = "the interpreter is exiting: adb is not started"
+                    raise OSError(msg)
+                proc = await adb._async_spawn_adb(argv)  # noqa: SLF001
+                spawned.append(proc)
+                self.oneshots.add(proc)
+            finally:
+                self.spawning -= 1
+            if self.reaping or self.closing:
+                _send(proc, kill=True)
+            return proc
+
+        result: Any
+        try:
+            try:
+                result = await adb._async_run_adb(  # noqa: SLF001
+                    command.argv, timeout=command.timeout, spawn=spawn
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001  (the core reads the error)
+                result = exc
+            finally:
+                self.oneshots.difference_update(spawned)
+            self._post(CommandDone(command.request, result))
+        except asyncio.CancelledError:
+            raise
+        except KeyboardInterrupt as exc:  # its child was killed and reaped
+            self._interrupted(exc)
+            raise
+        except BaseException as exc:  # noqa: BLE001  (a bug: end the run visibly)
+            self._worker_failed(exc)
+
+
+def _wake(waiter: asyncio.Future[None]) -> None:
+    if not waiter.done():
+        waiter.set_result(None)
+
+
+def _retrieve(task: asyncio.Task[Any]) -> None:
+    """Done-callback of a run's task: mark its exception retrieved.
+
+    A task of a run ends with an exception only for ``KeyboardInterrupt``
+    (`_Run._interrupted`, or one raised by a push callback), which asyncio
+    raises out of the loop as it ends the task; asyncio would otherwise
+    report it once more, as 'Task exception was never retrieved', when the
+    task is collected. Everything else is caught and ends the run visibly.
+    """
+    if not task.cancelled():
+        task.exception()
+
+
+def _now(loop: asyncio.AbstractEventLoop | None) -> float:
+    assert loop is not None  # noqa: S101  (started)
+    return loop.time()
+
+
+def _current_task() -> asyncio.Task[Any] | None:
+    """The running task, or None outside one (and without a running loop)."""
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
+
+
+def _is(task: asyncio.Task[Any], ref: weakref.ref[asyncio.Task[Any]] | None) -> bool:
+    return ref is not None and ref() is task
+
+
+def _owned_here(consumer: _Consumer) -> bool:
+    """Whether ``consumer`` is a pull iterator this task created (design 3.5)."""
+    if consumer.push or consumer.owner is None:
+        return False
+    task = _current_task()
+    return task is not None and consumer.owner() is task
+
+
+def _send(proc: _Process, *, kill: bool) -> None:
+    """Terminate or kill ``proc`` (its pid only, design 5.11) unless it has exited.
+
+    On POSIX the signal goes to the pid with ``os.kill``: asyncio's
+    ``Process.kill`` polls the child first (``Popen.send_signal``), which can
+    reap it before asyncio's child watcher and make that report exit status
+    255. Until the watcher has set ``returncode`` the child is not reaped by
+    asyncio, so its pid is still ours. On Windows terminate is a kill (5.11).
+    """
+    if proc.returncode is not None:
+        return
+    with contextlib.suppress(OSError):
+        if sys.platform == "win32":
+            if kill:
+                proc.kill()
+            else:
+                proc.terminate()
         else:
-            self._stderr_dispatch_queue = None
-            self._stderr_dispatch_task = None
+            os.kill(proc.pid, signal.SIGKILL if kill else signal.SIGTERM)
+
+
+def _close_pipe(proc: _Process, fd: int) -> None:
+    """Close one pipe of an adb child (X-5); its EOF has usually closed it already.
+
+    asyncio has no public way to reach a child's pipes: `asyncio.subprocess
+    .Process` keeps its transport as ``_transport`` (CPython 3.12 to 3.14),
+    whose ``get_pipe_transport`` is public. Closing the read pipe of a
+    retired connection also lets asyncio close the process transport once
+    the child has exited.
+    """
+    transport = getattr(proc, "_transport", None)
+    if not isinstance(transport, asyncio.SubprocessTransport):
+        return
+    pipe = transport.get_pipe_transport(fd)
+    if pipe is not None:
+        pipe.close()
+
+
+def _abandon(run: _Run) -> None:
+    """`weakref.finalize` of a started `AsyncLogStream`: kill its run (design 3.4).
+
+    It may run in any thread, inside any step of the loop (a cyclic
+    collection), so ``abandon`` is posted with ``loop.call_soon_threadsafe``
+    while the loop is not closed. There the kill goes through the core: on a
+    running loop at once, and on a stopped one (between two
+    ``run_until_complete`` calls) as the first thing the loop runs when it
+    runs again, before it reads the end of the adb killed here, so a run
+    that reconnects starts nothing more and ends KILLED. Where the loop may
+    not run it soon (it is stopped, or the interpreter is exiting) adb is
+    killed here at once too. Once the loop is closed, and for a finished run
+    whose loop does not run, ``abandon`` runs in place: it kills adb and
+    logs an outcome nobody saw. A run that ended and whose outcome was seen
+    (or is None) needs nothing.
+
+    At interpreter exit (the main thread has ended: weakref.finalize runs at
+    exit, for a stream still referenced) no adb child is started any more,
+    and every adb child of the run is killed, one-shot commands' included,
+    also for a run that ended. When the loop runs in another thread, which
+    still runs while atexit handlers do, a spawn in progress there is let
+    finish first (`_Run.wait_spawns`), so its child is tracked, as the
+    thread driver does (design A.23).
+    """
+    at_exit = not threading.main_thread().is_alive()
+    needed = not (run.finished and (run.outcome is None or run.seen))
+    if not (needed or at_exit):
+        return
+    loop = run.loop
+    running = loop is not None and loop.is_running()
+    if at_exit:
+        run.closing = True
+    # At exit only a running loop can still act on the post. For a finished
+    # run ``abandon`` only logs, which needs no loop: it is posted only to a
+    # loop that runs, and not at exit.
+    post = needed and (
+        (running and not run.finished) if at_exit else (running or not run.finished)
+    )
+    abandon = functools.partial(run.abandon, at_exit=at_exit)
+    posted = post and run._soon(abandon)  # noqa: SLF001  (the run's own helper)
+    if at_exit and running and threading.current_thread() is threading.main_thread():
+        run.wait_spawns()
+    if at_exit or not running or not posted:
+        run.kill_children()  # at exit, of an ended run too (a one-shot child)
+    if needed and not posted:
+        abandon()
+
+
+async def _kill_and_wait(run: _Run, *, detach_own: bool = False) -> None:
+    """with-exit's kill: ``kill()``, then wait at most 1 s for the end (3.4).
+
+    The kill is posted before the wait, so a second cancellation there only
+    cuts the wait short.
+    """
+    run.kill(detach_own=detach_own)
+    with contextlib.suppress(TimeoutError):
+        await run.wait_ended(_KILL_WAIT, "the with-block exit")
+
+
+class _PullIterator[T]:
+    """The pull iterator of a stream (design 3.5, A-21): a class, not an async
+    generator.
+
+    It keeps its stream alive. ``aclose()``, and ``__del__`` when a ``break``
+    drops the last reference, detach it at once; the rest is discarded and
+    counted.
+    """
+
+    __slots__ = ("_consumer", "_done", "_handed", "_run", "_stream")
+
+    def __init__(
+        self, stream: AsyncLogStream[T], run: _Run, consumer: _Consumer
+    ) -> None:
+        self._stream = stream
+        self._run = run
+        self._consumer = consumer
+        self._done = False
+        self._handed = False  # an item was returned; asking for the next settles it
+
+    def __aiter__(self) -> Self:
+        return self
+
+    async def __anext__(self) -> T:
+        if self._done:
+            raise StopAsyncIteration
+        consumer = self._consumer
+        if self._handed:
+            self._handed = False
+            consumer.owe_done = True
+        item = await self._run.deliver_next(consumer)
+        if item is not None:
+            self._handed = True
+            return cast("T", item)
+        self._done = True
+        if consumer.reached_end:
+            # A FAILED run raises its outcome once, after the last item (4.2).
+            error = self._run.take_error(unseen_only=False)
+            if error is not None:
+                raise error
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        """Detach from the stream; what it did not take is discarded and counted."""
+        self._done = True
+        self._run.detach(self._consumer)
+
+    def __del__(self) -> None:
+        with contextlib.suppress(AttributeError):
+            self._done = True
+            self._run.detach(self._consumer)
+
+
+class AsyncLogStream[T]:
+    """A live ``adb logcat`` stream run by asyncio tasks (design 2.3).
+
+    ``T`` is `LogEntry`, or `LogGroup` when ``group_by`` is given. A stream runs
+    once: iterate it with ``async for`` (pull), or pass ``on_item`` (push, one
+    dispatcher task); ``on_event`` receives the `StateChange` and `Gap`
+    events in order with the items, in the consumer context. The callbacks
+    may be plain or async functions: what they return is awaited when it is
+    awaitable. ``where`` and ``group_by`` run in the engine task, on the
+    loop. Any of them raising ends the run with `CallbackError`.
+
+    The stream lives on the event loop that runs ``start()`` (``async with``
+    starts it). ``stop()`` and ``kill()`` may be called from any thread;
+    ``state``, ``stats`` and ``outcome`` may be read from any thread.
+
+    Args:
+        config: The configuration; None uses ``StreamConfig()``.
+        where: The condition each entry must match; None delivers every entry.
+        group_by: Deliver `LogGroup` items instead of entries.
+        on_item: Push mode: called with each item on the dispatcher task.
+        on_event: Called with each event in the consumer context.
+
+    Raises:
+        TypeError: An argument has the wrong type.
+        ValueError: ``group_by`` cannot fit the outbox, or ``where.packages()``
+            names something that is not a package name.
+        FileNotFoundError: ``config.adb_path`` is None and no adb is found.
+
+    """
+
+    @overload
+    def __init__(
+        self: AsyncLogStream[LogEntry],
+        config: StreamConfig | None = None,
+        /,
+        *,
+        where: Condition | None = None,
+        group_by: None = None,
+        on_item: Callable[[LogEntry], object] | None = None,
+        on_event: Callable[[StreamEvent], object] | None = None,
+    ) -> None: ...
+    @overload
+    def __init__(
+        self: AsyncLogStream[LogGroup],
+        config: StreamConfig | None = None,
+        /,
+        *,
+        where: Condition | None = None,
+        group_by: GroupBy,
+        on_item: Callable[[LogGroup], object] | None = None,
+        on_event: Callable[[StreamEvent], object] | None = None,
+    ) -> None: ...
+    def __init__(
+        self,
+        config: StreamConfig | None = None,
+        /,
+        *,
+        where: Condition | None = None,
+        group_by: GroupBy | None = None,
+        on_item: Callable[[LogEntry], object]
+        | Callable[[LogGroup], object]
+        | None = None,
+        on_event: Callable[[StreamEvent], object] | None = None,
+    ) -> None:
+        config, where = _checked_arguments(config, where, group_by)
+        _check_callable("on_item", on_item)
+        _check_callable("on_event", on_event)
+        adb_path = config.adb_path if config.adb_path is not None else adb.resolve_adb()
+        self._setup(config, adb_path, where, group_by, on_item, on_event)
+
+    def _setup(
+        self,
+        config: StreamConfig,
+        adb_path: str,
+        where: Condition | None,
+        group_by: GroupBy | None,
+        on_item: Callable[[Any], object] | None,
+        on_event: Callable[[StreamEvent], object] | None,
+    ) -> None:
+        core = StreamCore(config, adb_path=adb_path, where=where, group_by=group_by)
+        self._config = config
+        self._adb_path = adb_path
+        self._where = where
+        self._group_by = group_by
+        self._on_item = on_item
+        self._on_event = on_event
+        self._flush_hidden_by = _parse_logcat_args(
+            config.logcat_args
+        ).marker_hidden_by()
+        self._run = _Run(core, config, on_item=on_item, on_event=on_event)
+
+    # -- properties --------------------------------------------------------------------
+
+    @property
+    def config(self) -> StreamConfig:
+        """The configuration of this stream."""
+        return self._config
 
     @property
     def state(self) -> StreamState:
-        """Current state of the stream."""
-        # Note: Accessing state without lock for property read is generally safe
-        # for simple enums, but strictly speaking should be locked.
-        # However, we can't make property async.
-        return self._state
+        """The state, as the engine published it after its last step (design 3.6)."""
+        return self._run.state
 
-    async def _set_state(self, new_state: StreamState) -> None:
-        """Update state and trigger callback."""
-        async with self._state_lock:
-            if self._state == new_state:
-                return
-            self._state = new_state
+    @property
+    def stats(self) -> StreamStats:
+        """An immutable snapshot of the run's counters (design 2.5, 4.4).
 
-        if self.on_state:
-            try:
-                await self.on_state(new_state)
-            except Exception as e:  # noqa: BLE001  user callback must not crash stream
-                logger.error("Error in on_state callback: %s", e)
-
-    async def start(self) -> None:
-        """Start the log stream."""
-        async with self._state_lock:
-            if self._state not in {StreamState.IDLE, StreamState.STOPPED}:
-                raise LogStreamInternalError(
-                    f"Cannot start stream from state {self._state}"
-                )
-            self._state = StreamState.STARTING
-            # We manually trigger the callback outside the lock to avoid
-            # deadlocks if the callback calls back into the stream.
-
-        if self.on_state:
-            await self.on_state(StreamState.STARTING)
-
-        self._stop_event.clear()
-        self._connection_task = asyncio.create_task(
-            self._connection_manager(), name="AsyncLogStream-ConnectionManager"
-        )
-
-    async def _connection_manager(self) -> None:
-        """Manage the ADB process lifecycle and reconnection."""
-        while not self._stop_event.is_set():
-            self._parse_context = ParseContext()
-            await self._run_process_lifecycle()
-
-            if self._stop_event.is_set():
-                break
-
-            if not self.auto_reconnect:
-                break
-
-            await self._set_state(StreamState.RECONNECTING)
-            try:
-                await asyncio.wait_for(
-                    self._stop_event.wait(), timeout=self.reconnect_delay
-                )
-            except TimeoutError:
-                pass  # Timeout, continue to reconnect
-            except asyncio.CancelledError:
-                break
-
-        # Final cleanup
-        async with self._state_lock:
-            if self._state != StreamState.KILLED:
-                # _set_state is fine here as long as we are not holding the
-                # lock when calling callbacks.
-                pass
-
-        if self.state != StreamState.KILLED:
-            await self._set_state(StreamState.STOPPED)
-            await self._invoke_callback(self.on_stop)
-
-    async def _run_process_lifecycle(self) -> None:  # noqa: PLR0912  sequential process lifecycle setup/teardown
-        """Run a single lifecycle of the ADB process."""
-        cmd = [self.adb_path]
-        if self.device_id:
-            cmd.extend(["-s", self.device_id])
-        cmd.append("logcat")
-        cmd.extend(self.logcat_args)
-
-        try:
-            self._process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                limit=_READ_LIMIT,
-                creationflags=_CREATE_NO_WINDOW,
-            )
-        except Exception as e:  # noqa: BLE001  subprocess spawn failure must not crash manager
-            logger.debug("Failed to start adb logcat subprocess: %s", e)
-            self._exceptions.append(e)
-            await self._set_state(StreamState.STOPPED)
-            await self._invoke_callback(self.on_error, e)
-            return
-
-        # stop() may have set the event while create_subprocess_exec was awaiting;
-        # it terminated the previous handle, not this fresh one, so terminate now
-        # to avoid orphaning it on the wait() below.
-        if self._stop_event.is_set():
-            with contextlib.suppress(ProcessLookupError):
-                self._process.terminate()
-
-        if self._process.stdout:
-            self._stdout_task = asyncio.create_task(
-                self._read_loop(self._process.stdout, "stdout"),
-                name="AsyncLogStream-Stdout",
-            )
-        if self._process.stderr:
-            self._stderr_task = asyncio.create_task(
-                self._read_loop(self._process.stderr, "stderr"),
-                name="AsyncLogStream-Stderr",
-            )
-
-        if self.stdout_callback:
-            self._stdout_dispatch_queue = self._build_dispatch_queue()
-            self._stdout_dispatch_task = asyncio.create_task(
-                self._callback_dispatch_loop(
-                    self._stdout_dispatch_queue,
-                    self.stdout_callback,
-                ),
-                name="AsyncLogStream-StdoutDispatcher",
-            )
-
-        if self.stderr_callback:
-            self._stderr_dispatch_queue = self._build_dispatch_queue()
-            self._stderr_dispatch_task = asyncio.create_task(
-                self._callback_dispatch_loop(
-                    self._stderr_dispatch_queue,
-                    self.stderr_callback,
-                ),
-                name="AsyncLogStream-StderrDispatcher",
-            )
-
-        if self._pid_monitor:
-            await self._pid_monitor.start()
-
-        await self._set_state(StreamState.RUNNING)
-        await self._invoke_callback(self.on_start)
-
-        # Wait for process to exit
-        try:
-            return_code = await self._process.wait()
-        except asyncio.CancelledError:
-            # If connection manager is cancelled, we should stop everything
-            return
-
-        # Wait for tasks to finish reading
-        tasks = []
-        if self._stdout_task:
-            tasks.append(self._stdout_task)
-        if self._stderr_task:
-            tasks.append(self._stderr_task)
-
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-        if self.stdout_callback:
-            await self._stop_dispatcher("stdout")
-
-        if self.stderr_callback:
-            await self._stop_dispatcher("stderr")
-
-        if self._pid_monitor:
-            await self._pid_monitor.stop()
-
-        if not self._stop_event.is_set() and return_code != 0:
-            error = LogStreamInternalError(f"adb logcat exited with code {return_code}")
-            self._exceptions.append(error)
-            await self._invoke_callback(self.on_error, error)
-
-    async def stop(self) -> None:
-        """Stop the log stream gracefully."""
-        async with self._state_lock:
-            if self._state in {
-                StreamState.STOPPED,
-                StreamState.KILLED,
-                StreamState.IDLE,
-            }:
-                return
-            # Don't set state here, let _set_state handle it to trigger callbacks
-
-        await self._set_state(StreamState.STOPPING)
-
-        self._stop_event.set()
-        if self._pid_monitor:
-            await self._pid_monitor.stop()
-
-        if self._process:
-            # We don't await wait() here immediately, join() does that.
-            with contextlib.suppress(ProcessLookupError):
-                self._process.terminate()
-
-    async def kill(self) -> None:
-        """Kill the log stream immediately."""
-        await self._set_state(StreamState.KILLED)
-
-        self._stop_event.set()
-        if self._pid_monitor:
-            await self._pid_monitor.stop()
-
-        if self._process:
-            with contextlib.suppress(ProcessLookupError):
-                self._process.kill()
-
-    async def pause(self) -> None:
-        """Pause dispatching of log entries.
-
-        Entries read from the device while paused are dropped, not buffered: a
-        live stream cannot buffer unboundedly. Call resume() to continue.
+        After a logpyt bug ended the run (join() raises it), ``failed`` is set,
+        so ``complete`` is False.
         """
-        async with self._state_lock:
-            should_pause = self._state == StreamState.RUNNING
+        return self._run.stats
 
-        if should_pause:
-            await self._set_state(StreamState.PAUSED)
+    @property
+    def outcome(self) -> StreamError | None:
+        """The latched error of a run that ended FAILED; None otherwise."""
+        return self._run.outcome
 
-    async def resume(self) -> None:
-        """Resume dispatching of log entries."""
-        if self.state == StreamState.PAUSED:
-            await self._set_state(StreamState.RUNNING)
+    # -- control -----------------------------------------------------------------------
 
-    @staticmethod
-    async def _invoke_callback(
-        callback: Callable[..., Awaitable[None]] | None, *args: object
-    ) -> None:
-        """Invoke a user lifecycle/error callback without letting it break teardown."""
-        if callback is None:
-            return
-        try:
-            await callback(*args)
-        except Exception:
-            logger.exception("AsyncLogStream lifecycle callback raised")
+    def start(self) -> None:
+        """Start the run on the running loop and return at once (design 3.3).
 
-    async def join(self, timeout: float | None = None) -> None:
-        """Wait for the stream to finish.
-
-        Args:
-            timeout: Maximum time to wait in seconds.
+        It never runs user code and never waits for adb.
 
         Raises:
-            LogStreamTimeoutError: If timeout expires.
-            LogStreamKilledError: If stream was killed.
-            LogStreamInternalError: If an internal error occurred.
+            UsageError: No event loop runs in this thread, the loop is a
+                selector loop on Windows, or the stream was started before
+                (use `clone`).
+
         """
-        if not self._connection_task:
-            return
-
         try:
-            # shield so a join() timeout only stops waiting; it must not cancel
-            # the connection task (which would skip lifecycle cleanup and orphan
-            # the reader/dispatcher tasks, PID monitor, and final flush).
-            await asyncio.wait_for(
-                asyncio.shield(self._connection_task), timeout=timeout
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            msg = (
+                "AsyncLogStream.start() needs a running event loop: call it in a "
+                "coroutine, or use `async with AsyncLogStream(...) as stream:`"
             )
-        except TimeoutError as err:
-            raise LogStreamTimeoutError("Timeout waiting for connection task") from err
+            raise UsageError(msg) from None
+        if sys.platform == "win32" and isinstance(loop, asyncio.SelectorEventLoop):
+            msg = (
+                "AsyncLogStream.start() needs the proactor event loop on Windows "
+                "(adb runs as a subprocess, which a selector loop cannot start); "
+                "use asyncio.run() with the default event loop policy"
+            )
+            raise UsageError(msg)
+        run = self._run
+        if not run.start(loop, push=self._on_item is not None):
+            state = run.state
+            what = "a started" if state is StreamState.IDLE else f"a {state}"
+            msg = (
+                f"AsyncLogStream.start() called on {what} stream; a stream runs "
+                "once - use stream.clone()"
+            )
+            raise UsageError(msg)
+        weakref.finalize(self, _abandon, run)
 
-        if self.state == StreamState.KILLED:
-            raise LogStreamKilledError("Stream was killed")
+    def stop(self, *, flush: float | None = None) -> None:
+        """Ask the run to stop; from any thread, task or callback; idempotent.
 
-        if self._exceptions:
-            exc = self._exceptions[0]
-            if isinstance(exc, LogStreamTimeoutError) and self._stop_event.is_set():
-                return
-            if isinstance(exc, LogStreamError):
-                raise exc
-            raise LogStreamInternalError(
-                f"Internal error in stream task: {exc}"
-            ) from exc
+        With ``flush``, a marker is written to the device log and the stream
+        reads until it, for at most ``flush`` seconds of open intake (design
+        2.3). Before ``start()``, after the end, and once the loop is closed
+        it does nothing.
 
-    async def _read_loop(self, stream: asyncio.StreamReader, source: str) -> None:  # noqa: PLR0912  read/timeout/flush handling kept inline
-        """Internal loop to read from a stream."""
-        try:  # noqa: PLR1702  nested read/timeout handling kept inline
-            while not self._stop_event.is_set():
-                try:
-                    if self.read_timeout:
-                        try:
-                            line_bytes = await asyncio.wait_for(
-                                stream.readline(), timeout=self.read_timeout
-                            )
-                        except TimeoutError:
-                            # Terminate process to unblock connection manager
-                            if self._process:
-                                with contextlib.suppress(ProcessLookupError):
-                                    self._process.terminate()
-                            raise
-                    else:
-                        line_bytes = await stream.readline()
-                except ValueError:
-                    # Oversized line (no newline within the read buffer limit): drop
-                    # the buffered chunk and keep reading rather than aborting the loop.
-                    logger.warning(
-                        "Dropping oversized %s data exceeding the read buffer limit",
-                        source,
-                    )
-                    with contextlib.suppress(Exception):
-                        await stream.read(_READ_LIMIT)
-                    continue
+        Raises:
+            UsageError: ``flush`` is given and ``logcat_args`` hides the marker.
+            TypeError: ``flush`` is not a number.
 
-                if not line_bytes:
-                    # EOF
-                    break
+        """
+        self._run.stop(_checked_flush(flush, self._flush_hidden_by))
 
-                line = line_bytes.decode("utf-8", errors="replace")
+    def kill(self) -> None:
+        """Kill adb at once and discard undelivered items; idempotent (design 3.4)."""
+        self._run.kill()
 
-                if self.state == StreamState.PAUSED:
-                    continue
+    async def join(self, timeout: float | None = None) -> None:
+        """Wait for the end of delivery; raise the outcome of a FAILED run.
 
-                await self._process_line(line, source)
-        except TimeoutError as e:
-            self._exceptions.append(LogStreamTimeoutError(str(e) or "Read timeout"))
-            await self._invoke_callback(self.on_error, e)
-        except Exception as e:  # noqa: BLE001  read/parse errors must not crash the loop
-            logger.debug("Error in read loop for %s: %s", source, e)
-            self._exceptions.append(e)
-            await self._invoke_callback(self.on_error, e)
-        finally:
-            if source == "stdout" and self._grouper is not None:
-                # Flush grouper
-                flushed = self._grouper.flush()
-                if flushed and self.stdout_callback:
-                    for item in flushed:
-                        try:
-                            await self._dispatch_item(
-                                item,
-                                source="stdout",
-                                callback=self.stdout_callback,
-                                force=True,
-                            )
-                        except Exception as e:  # noqa: BLE001  callback must not crash flush
-                            logger.debug("Error dispatching flushed item: %s", e)
-                            await self._invoke_callback(self.on_error, e)
+        Returns once the run ended and its consumer finished (or detached).
+        Cancelling the caller cancels only this wait.
 
-    async def _process_line(self, line: str, source: str) -> None:
-        """Process a single raw line."""
-        # 1. Parse
-        # Note: Parsing is CPU-bound. For extremely high throughput, this could be
-        # offloaded to an executor, but for typical logcat usage, the overhead of
-        # context switching per line outweighs the benefit.
-        ctx = self._parse_context
-        try:
-            if source == "stdout":
-                parsed = self.parser.parse(line, ctx)
-                entry = unparsed_entry(line, ctx) if parsed is None else parsed
-            else:
-                entry = unparsed_entry(line, ctx, level="E")
-        except Exception as e:  # noqa: BLE001  parser errors must not crash the stream
-            logger.debug("Error parsing %s line: %s", source, e)
-            self._exceptions.append(e)
-            await self._invoke_callback(self.on_error, e)
-            if self._process:
-                with contextlib.suppress(ProcessLookupError):
-                    self._process.terminate()
-            return
+        Raises:
+            StreamError: The run ended FAILED (the same object every time).
+            TimeoutError: ``timeout`` seconds passed; the stream keeps running.
+            UsageError: Awaited from the stream's own callbacks, from the task
+                that owns an attached iterator, before ``start()``, or on
+                another event loop while the run goes on.
 
-        if self._pid_monitor:
-            pkg = await self._pid_monitor.get_package(entry.pid)
-            if pkg:
-                entry = entry.model_copy(update={"package": pkg})
+        """
+        run = self._run
+        run.check_wait("join()", iterator=True)
+        if not run.started:
+            msg = (
+                "join() called before start(); start the stream, or use "
+                "`async with stream:`"
+            )
+            raise UsageError(msg)
+        if not run.ended:
+            run.check_loop("join()")
+            await run.wait_ended(timeout, "join()")
+        error = run.take_error(unseen_only=False)
+        if error is not None:
+            raise error
 
-        # 2. Filter
-        if self.filter_by is not None and not self.filter_by(entry):
-            return
+    async def wait_running(self, timeout: float | None = None) -> None:
+        """Wait until a connection is RUNNING (adb printed), or the run concluded.
 
-        # 3. Group
-        # Note: Grouping is also CPU-bound but stateful.
-        # The grouper is synchronous, which is fine as it's CPU bound and fast.
-        # Grouping applies to stdout only (the grouper is flushed on stdout EOF);
-        # feeding stderr through the shared grouper would flush/misroute stdout groups.
-        items_to_emit: Sequence[LogEntry | LogGroup]
-        if self._grouper is not None and source == "stdout":
-            items_to_emit = self._grouper.add(entry, time.monotonic())
-        else:
-            items_to_emit = [entry]
+        Raises:
+            StreamError: The run concluded FAILED before it was RUNNING.
+            TimeoutError: ``timeout`` seconds passed; the stream keeps running.
+            UsageError: Awaited from the stream's own callbacks, before
+                ``start()``, or on another event loop while the run goes on.
 
-        # 4. Dispatch
-        callback = self.stdout_callback if source == "stdout" else self.stderr_callback
-        if callback:
-            for item in items_to_emit:
-                try:
-                    await self._dispatch_item(item, source=source, callback=callback)
-                except Exception as e:  # noqa: BLE001  dispatch must not crash the stream
-                    logger.debug("Error dispatching %s item: %s", source, e)
-                    await self._invoke_callback(self.on_error, e)
+        """
+        run = self._run
+        run.check_wait("wait_running()", iterator=False)
+        if not run.started:
+            msg = "wait_running() called before start(); start the stream first"
+            raise UsageError(msg)
+        if not run.ended:
+            run.check_loop("wait_running()")
+        await run.wait_running(timeout)
 
-    async def __aenter__(self) -> AsyncStreamHandle:
-        """Start the stream and return the handle."""
-        await self.start()
-        return self._handle
+    def assert_complete(self) -> None:
+        """Fail a CI test whose capture may miss device lines (design 4.4).
+
+        Raises:
+            UsageError: The run has not ended; await ``join()`` first.
+            StreamError: The run ended FAILED.
+            IncompleteCaptureError: ``stats.incomplete`` names a reason.
+
+        """
+        run = self._run
+        state = run.state
+        if run.crash is None and state not in _TERMINAL:
+            msg = f"assert_complete() on a {state} stream; call join() first"
+            raise UsageError(msg)
+        error = run.take_error(unseen_only=False)
+        if error is not None:
+            raise error
+        reasons = run.stats.incomplete
+        if reasons:
+            msg = f"the capture is incomplete: {', '.join(reasons)}"
+            raise IncompleteCaptureError(msg, reasons=reasons)
+
+    def clone(self) -> Self:
+        """A fresh IDLE stream: same config, adb path, where, group_by and callbacks.
+
+        It may run on another event loop than this one.
+        """
+        twin = object.__new__(type(self))
+        twin._setup(  # noqa: SLF001  (an AsyncLogStream sets up its own twin)
+            self._config,
+            self._adb_path,
+            self._where,
+            self._group_by,
+            self._on_item,
+            self._on_event,
+        )
+        return twin
+
+    # -- iteration and async with ------------------------------------------------------
+
+    def __aiter__(self) -> AsyncIterator[T]:
+        """Pull mode: the one iterator of this run (design 2.4, 3.5).
+
+        Raises:
+            UsageError: The stream has ``on_item``, was not started, is not on
+                this event loop, or was iterated before (or stop() discarded
+                what no iterator took).
+
+        """
+        if self._on_item is not None:
+            msg = (
+                "AsyncLogStream with on_item cannot be iterated: its dispatcher "
+                "takes the items; leave out on_item to iterate"
+            )
+            raise UsageError(msg)
+        return _PullIterator(self, self._run, self._run.attach())
+
+    async def __aenter__(self) -> Self:
+        """Start the stream and return it."""
+        self.start()
+        return self
 
     async def __aexit__(
         self,
         exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: TracebackType | None,
-    ) -> bool | None:
-        """Stop the stream on exit."""
-        await self.stop()
-        # NOTE: unlike sync __exit__, this deliberately does NOT suppress a join
-        # timeout/kill: async cleanup surfaces a failed shutdown to the caller
-        # (see test_async_context_manager_does_not_swallow_join_timeout).
-        await self.join(timeout=1.0)
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        """Stop and join; how depends on how the body ended (design 3.4).
+
+        An iterator this task owns is detached first. A clean body waits
+        without a cap and raises an outcome nobody saw. A body that raised an
+        `Exception` waits while the consumer takes items, kills once it took
+        nothing for ``close_timeout``, and keeps the body's exception, with the
+        outcome added as a note. A `GeneratorExit` (an async generator around
+        the block was closed early) takes the `Exception` path. Any other
+        exception (a cancellation, ``KeyboardInterrupt``, ``SystemExit``)
+        kills, then waits at most 1 s. An exception that interrupts the exit's
+        own wait (a cancellation there) kills too before it propagates: adb
+        does not outlive the block (design 9.2). A run that ended FAILED
+        before the kill took effect is not killed (kill() after the end does
+        nothing, design A.23): the items it left are still delivered.
+        """
+        run = self._run
+        if exc is None:
+            run.check_wait("the with-block exit", iterator=False)
+            try:
+                run.stop(None, detach_own=True)
+                await run.wait_ended(None, "the with-block exit")
+            except BaseException:
+                await _kill_and_wait(run, detach_own=True)
+                raise
+            error = run.take_error(unseen_only=True)
+            if error is not None:
+                raise error
+            return
+        if not isinstance(exc, Exception | GeneratorExit):
+            await _kill_and_wait(run, detach_own=True)  # cancelled, Ctrl+C, ...
+            return
+        try:
+            run.stop(None, detach_own=True)
+            progressing = await run.wait_while_progressing(self._config.close_timeout)
+        except BaseException:
+            await _kill_and_wait(run, detach_own=True)
+            raise
+        if not progressing:
+            await _kill_and_wait(run)
+        error = run.take_error(unseen_only=True)
+        if error is not None and error is not exc:
+            exc.add_note(
+                f"logpyt: the stream ended {run.state} too: "
+                f"{type(error).__name__}: {error}"
+            )
+            _log.error(
+                "the AsyncLogStream failed while its with-block raised %s",
+                type(exc).__name__,
+                exc_info=error,
+            )

@@ -291,6 +291,26 @@ class SpawnedChild:
         repr=False, default=None
     )
 
+    @staticmethod
+    def pipe_closed(pipe: object) -> bool:
+        """Whether ``pipe``, one of ``popen``'s, is closed (or was never opened).
+
+        A sync child's pipe is a file object; an asyncio child's on Windows is
+        an overlapped ``PipeHandle``, whose handle is None once closed.
+        """
+        if pipe is None:
+            return True
+        closed = getattr(pipe, "closed", None)
+        if closed is not None:
+            return bool(closed)
+        return getattr(pipe, "handle", None) is None
+
+    def pipes_closed(self) -> bool:
+        """Whether both of the child's pipes were closed (by the library)."""
+        return all(
+            self.pipe_closed(pipe) for pipe in (self.popen.stdout, self.popen.stderr)
+        )
+
     def alive(self) -> bool:
         """True until the child has exited (exited-but-unreaped counts as gone).
 

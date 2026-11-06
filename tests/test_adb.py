@@ -271,7 +271,7 @@ def test_resolve_adb_is_not_cached(
 def test_only_the_fake_adb_is_spawned_with_path_emptied(
     fake_adb: FakeAdb, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With no adb to find, every helper and both 2.x streams still reach the fake.
+    """With no adb to find, every helper and both streams still reach the fake.
 
     PATH is empty and no SDK variable is set, so the real resolver finds
     nothing: a spawn that bypassed ``logpyt.adb.resolve_adb``, the single patch
@@ -293,7 +293,7 @@ def test_only_the_fake_adb_is_spawned_with_path_emptied(
     async def use_the_async_helpers() -> str:
         await adb.async_wait_for_device(timeout=TIMEOUT)
         await adb.async_adb_connect(ADDRESS, timeout=TIMEOUT)
-        return AsyncLogStream().adb_path
+        return AsyncLogStream()._adb_path
 
     assert asyncio.run(use_the_async_helpers()) == fake_adb.path
     assert LogStream()._adb_path == fake_adb.path

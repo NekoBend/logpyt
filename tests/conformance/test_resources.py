@@ -46,8 +46,7 @@ def _fds_at_most(limit: int) -> bool:
 
 def _pipes_closed(child: SpawnedChild) -> bool:
     """Whether the stream closed both pipes of ``child`` (its own Popen's)."""
-    popen = child.popen
-    return all(pipe is None or pipe.closed for pipe in (popen.stdout, popen.stderr))
+    return child.pipes_closed()
 
 
 def test_fds_return_to_baseline_after_reconnects(
@@ -73,8 +72,10 @@ def test_fds_return_to_baseline_after_reconnects(
     wait_until(lambda: all(_pipes_closed(c) for c in children[:-1]), timeout=TIMEOUT)
     assert not _pipes_closed(children[-1])
     if baseline is not None:
-        # The live connection's stdout and stderr; nothing of the retired ones.
-        wait_until(lambda: _fds_at_most(baseline + 2), timeout=TIMEOUT)
+        # The live connection's stdout and stderr (and the pidfd an asyncio
+        # child watcher holds); nothing of the retired ones.
+        limit = baseline + driver.connection_fds
+        wait_until(lambda: _fds_at_most(limit), timeout=TIMEOUT)
 
     driver.stop(stream)
     driver.join(stream)

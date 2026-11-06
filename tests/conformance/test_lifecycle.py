@@ -423,7 +423,7 @@ def test_dropped_failed_stream_logs_its_outcome(
     wait_until(logged, timeout=TIMEOUT)
     (message,) = logged()
     assert message.startswith(
-        "a LogStream was garbage-collected and its run ended FAILED without "
+        f"{driver.noun} was garbage-collected and its run ended FAILED without "
         "anyone seeing it: AdbExitError: "
     )
 
@@ -487,7 +487,7 @@ def test_body_exception_carries_the_failed_outcome(
     ]
     logged = [r for r in caplog.records if r.name == "logpyt.stream" and r.exc_info]
     assert [r.getMessage() for r in logged] == [
-        "the LogStream failed while its with-block raised ValueError"
+        f"the {driver.stream_class} failed while its with-block raised ValueError"
     ]
     assert logged[0].exc_info is not None
     assert logged[0].exc_info[1] is outcome
@@ -541,7 +541,7 @@ def test_engine_crash_raises_from_every_wait(
 
     logged = [r for r in caplog.records if r.name == "logpyt.stream" and r.exc_info]
     assert [r.getMessage() for r in logged] == [
-        "the LogStream engine failed; the run is abandoned"
+        f"the {driver.stream_class} engine failed; the run is abandoned"
     ]
     assert logged[0].exc_info is not None
     assert logged[0].exc_info[1] is error

@@ -31,7 +31,6 @@ from tests.conftest import (
     out,
     raw,
     run,
-    threadtime,
     touch,
     wait,
     wait_until,
@@ -457,23 +456,27 @@ def test_sync_stream_reads_from_the_fake_adb(fake_adb: FakeAdb) -> None:
 
 @pytest.mark.asyncio
 async def test_async_stream_reads_from_the_fake_adb(fake_adb: FakeAdb) -> None:
-    fake_adb.logcat(run(out(threadtime("hello")), wait("done")))
+    fake_adb.logcat(run(out(logcat_line("hello")), wait("done")))
     received: list[LogEntry] = []
     got_one = asyncio.Event()
 
-    async def on_entry(entry: LogEntry, _handle: object) -> None:
+    async def on_entry(entry: LogEntry) -> None:
         received.append(entry)
         got_one.set()
 
-    stream = AsyncLogStream(stdout_callback=on_entry)
-    await stream.start()
+    stream = AsyncLogStream(on_item=on_entry)
+    stream.start()
     try:
         await asyncio.wait_for(got_one.wait(), TIMEOUT)
+        stream.stop()
+        await stream.join(timeout=TIMEOUT)
     finally:
         fake_adb.release("done")
-        await stream.join(timeout=TIMEOUT)
+        stream.kill()
 
     assert [e.message for e in received] == ["hello"]
+    # The clock read, then the spawn: the library owns the rest of argv.
+    assert [call["command"] for call in fake_adb.calls()] == ["date", "logcat"]
 
 
 # -- child registry -----------------------------------------------------------

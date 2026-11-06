@@ -1109,13 +1109,65 @@ def _kill_and_wait(run: _Run, *, detach_own: bool = False) -> None:
         run.wait_ended(_KILL_WAIT, "the with-block exit")
 
 
-def _check_callback(name: str, callback: object) -> None:
-    """TypeError for a callback that is not callable or is async (design 2.3)."""
-    if callback is None:
-        return
-    if not callable(callback):
+def _checked_arguments(
+    config: StreamConfig | None, where: Condition | None, group_by: GroupBy | None
+) -> tuple[StreamConfig, Condition | None]:
+    """The constructor's type checks of both drivers (design 2.3, 4.2).
+
+    Returns the configuration (``StreamConfig()`` for None) and ``where``.
+
+    Raises:
+        TypeError: An argument has the wrong type.
+
+    """
+    if config is None:
+        config = StreamConfig()
+    elif not isinstance(config, StreamConfig):
+        msg = f"config must be a StreamConfig or None, not {type(config).__name__}"
+        raise TypeError(msg)
+    if where is not None:
+        where = _require_condition(where, "where")
+    if group_by is not None and not isinstance(group_by, GroupBy):
+        msg = f"group_by must be a GroupBy or None, not {type(group_by).__name__}"
+        raise TypeError(msg)
+    return config, where
+
+
+def _check_callable(name: str, callback: object) -> None:
+    """TypeError for a callback that is neither callable nor None (both drivers)."""
+    if callback is not None and not callable(callback):
         msg = f"{name} must be callable or None, not {type(callback).__name__}"
         raise TypeError(msg)
+
+
+def _checked_flush(flush: float | None, hidden_by: Sequence[str]) -> float | None:
+    """``stop(flush=)``'s checks of both drivers, before any state change (2.3).
+
+    Raises:
+        TypeError: ``flush`` is not a number.
+        UsageError: ``flush`` is given and ``logcat_args`` hides the marker.
+
+    """
+    if flush is None:
+        return None
+    if isinstance(flush, bool) or not isinstance(flush, int | float):
+        msg = f"flush takes seconds as a number or None, not {flush!r}"
+        raise TypeError(msg)
+    if hidden_by:
+        msg = (
+            "stop(flush=...) needs the flush marker, which "
+            f"{' and '.join(hidden_by)} in logcat_args hides; "
+            "call stop() without flush"
+        )
+        raise UsageError(msg)
+    return float(flush)
+
+
+def _check_callback(name: str, callback: object) -> None:
+    """TypeError for a callback that is not callable or is async (design 2.3)."""
+    _check_callable(name, callback)
+    if callback is None:
+        return
     call = type(callback).__call__  # an object with an async __call__
     if inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(call):
         msg = (
@@ -1233,16 +1285,7 @@ class LogStream[T]:
         | None = None,
         on_event: Callable[[StreamEvent], object] | None = None,
     ) -> None:
-        if config is None:
-            config = StreamConfig()
-        elif not isinstance(config, StreamConfig):
-            msg = f"config must be a StreamConfig or None, not {type(config).__name__}"
-            raise TypeError(msg)
-        if where is not None:
-            where = _require_condition(where, "where")
-        if group_by is not None and not isinstance(group_by, GroupBy):
-            msg = f"group_by must be a GroupBy or None, not {type(group_by).__name__}"
-            raise TypeError(msg)
+        config, where = _checked_arguments(config, where, group_by)
         _check_callback("on_item", on_item)
         _check_callback("on_event", on_event)
         adb_path = config.adb_path if config.adb_path is not None else adb.resolve_adb()
@@ -1327,18 +1370,7 @@ class LogStream[T]:
             TypeError: ``flush`` is not a number.
 
         """
-        if flush is not None:
-            if isinstance(flush, bool) or not isinstance(flush, int | float):
-                msg = f"flush takes seconds as a number or None, not {flush!r}"
-                raise TypeError(msg)
-            if self._flush_hidden_by:
-                msg = (
-                    "stop(flush=...) needs the flush marker, which "
-                    f"{' and '.join(self._flush_hidden_by)} in logcat_args hides; "
-                    "call stop() without flush"
-                )
-                raise UsageError(msg)
-        self._run.stop(None if flush is None else float(flush))
+        self._run.stop(_checked_flush(flush, self._flush_hidden_by))
 
     def kill(self) -> None:
         """Kill adb at once and discard undelivered items; idempotent (design 3.4)."""
