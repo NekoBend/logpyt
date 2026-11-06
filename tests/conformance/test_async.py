@@ -8,11 +8,14 @@ what another task of the same loop sees:
 
 - F2-9: a clone runs under a second ``asyncio.run``; nothing loop-bound is
   made before ``start()``.
-- F3-2: the engine cancelled, as a loop shutdown does, kills adb at once and
-  starts nothing more; ``tests/test_async_shutdown.py`` ends ``asyncio.run``
-  with a stream running, and the interpreter with a loop in a thread, in a
-  child interpreter. Cancelled once the run finished, it keeps the outcome
-  (G4). A stream dropped while its loop is stopped is killed (design 3.4).
+- F3-2: the engine cancelled, as a loop shutdown does, kills adb at once,
+  reaps it and starts nothing more; ``tests/test_async_shutdown.py`` ends
+  ``asyncio.run`` with a stream running, and the interpreter with a loop in
+  a thread, in a child interpreter. Cancelled once the run finished, it
+  keeps the outcome (G4). The engine or the dispatcher cancelled before its
+  first step still ends the run. A stream dropped, or killed, while its
+  loop is stopped is killed at once (design 3.4), and a pid that asyncio
+  already reaped gets no signal (5.11).
 - Ctrl+C and ``sys.exit()``: a KeyboardInterrupt or SystemExit raised in a
   task of the run, the push callbacks and ``where`` included, leaves the loop
   at once, kills adb and ends the run with it; one raised by on_event in pull
@@ -23,13 +26,14 @@ what another task of the same loop sees:
 - F3-3: a task cancelled while it waits for a stopped run gets its
   CancelledError, and the run's one-shot adb commands are still reaped. A
   cancellation of the with-block exit's own wait kills, and keeps the body's
-  exception as its ``__context__``.
+  exception as its ``__context__``, also under an ``except`` clause of a
+  caller.
 - F3-7: a task created inside a callback inherits its mark, so its waits
   raise UsageError while the run lives, and return once it has ended; the
   callback's own waits raise after the end too.
 - F2-7: kill() from an async on_item, on the loop or from a thread, stops
   delivery before it returns; a kill() from a thread racing a pop. stop()
-  from on_item on the loop.
+  from on_item on the loop. A plain callback runs on the loop (A.24).
 - F3-6: a callback's own CancelledError, raised while its task is not being
   cancelled, is a callback failure.
 - A.21: a cancelled ``__anext__()`` cancels only its wait; the record in hand
@@ -38,8 +42,9 @@ what another task of the same loop sees:
 - X-1: another task keeps getting turns while the stream takes a burst.
 - X-5: the end closes a pipe a grandchild holds, and leaves no task.
 - design 4.2: ``start()`` needs a running loop, and on Windows the proactor
-  loop; waits and iteration on another loop or thread, and two tasks in one
-  iterator, raise UsageError.
+  loop, and runs nothing under an eager task factory; waits and iteration
+  (``__aiter__`` and ``__anext__``) on another loop or thread, and two tasks
+  in one iterator, raise UsageError.
 
 Until PR-14 a reconnect replays from the first position (design A.20), so
 `config` turns the stall resume off.
@@ -53,6 +58,8 @@ import contextvars
 import gc
 import itertools
 import logging
+import os
+import signal
 import sys
 import threading
 from dataclasses import dataclass
@@ -87,12 +94,20 @@ from tests.conftest import (
     logcat_line,
     out,
     run,
+    sleep,
     touch,
     wait,
+    wait_until,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+    from collections.abc import (
+        AsyncIterator,
+        Awaitable,
+        Callable,
+        Iterator,
+        Sequence,
+    )
 
     from logpyt import StreamEvent
 
@@ -300,6 +315,11 @@ async def test_cancel_engine_reaps_adb_and_does_not_respawn(
     left, so nothing can respawn, and every wait ends: join() raises the
     CancelledError that ended the engine, and the capture is not complete
     (the crash rule of design A.23, 4.4).
+
+    The engine's end waits until asyncio has reaped the logcat child it
+    killed (design 5.4, A.24), so its ``returncode`` is set once the engine
+    task is done. `SpawnedChild.alive` counts an exited child that nobody
+    reaped as gone, so the survivors check alone cannot see a missing reap.
     """
     if phase == "running":
         first, delay = run(out(logcat_line("a")), wait("never")), 0.05
@@ -323,6 +343,10 @@ async def test_cancel_engine_reaps_adb_and_does_not_respawn(
         ]
         engine.cancel()
         await asyncio.wait({engine}, timeout=TIMEOUT)
+        codes = [
+            None if child.process is None else child.process.returncode
+            for child in fake_adb.children("logcat")
+        ]
         await async_wait_until(lambda: not _run_tasks(), timeout=TIMEOUT)
         survivors = await fake_adb.async_survivors(PROMPT)
         with pytest.raises(asyncio.CancelledError):
@@ -331,10 +355,65 @@ async def test_cancel_engine_reaps_adb_and_does_not_respawn(
         await _end(stream)
 
     assert engine.cancelled()
+    assert len(codes) == 1
+    assert None not in codes, "the engine's end did not reap the killed logcat"
     assert survivors == []
     assert len(fake_adb.calls("logcat")) == 1
     assert _messages(entries) == ["a"]
     assert not stream.stats.complete
+
+
+@pytest.mark.parametrize("task", ["engine", "dispatcher"])
+@pytest.mark.parametrize("yields", [0, 1])
+@pytest.mark.asyncio
+async def test_cancel_before_first_step_ends_the_run(
+    fake_adb: FakeAdb, yields: int, task: str
+) -> None:
+    """The engine or the dispatcher cancelled right after ``start()`` ends the
+    run as a later cancellation does (F3-2): before its first step (0), or
+    at the yield that step begins with (1). A cancelled engine ends the run
+    like a crash: join() and wait_running() raise that CancelledError, and
+    nothing was spawned. A cancelled dispatcher detaches, which stops the
+    run (design 3.5): join() returns.
+
+    The yield came before the task's ``try``, and a task cancelled before
+    its first step runs none of its code: the run went on, and join() and
+    wait_running() hung, also after kill() (the dispatcher stayed attached).
+    """
+    fake_adb.logcat(run(out(logcat_line("a")), wait("never")))
+    entries: list[LogEntry] = []
+    stream = AsyncLogStream(config(), on_item=entries.append)
+    stream.start()
+    try:
+        for _ in range(yields):
+            await asyncio.sleep(0)
+        victim = _task(f"logpyt-{task}")
+        victim.cancel()
+        await asyncio.wait({victim}, timeout=TIMEOUT)
+        with contextlib.suppress(TimeoutError):
+            await async_wait_until(lambda: stream._run.ended, timeout=TIMEOUT)
+        assert stream._run.ended, "the run went on: every wait for it hangs"
+        error = await _join_error(stream)
+        running: BaseException | None = None
+        try:
+            await _bounded(stream.wait_running(), "wait_running()")
+        except BaseException as exc:  # noqa: BLE001  (the test looks at it)
+            running = exc
+        survivors = await fake_adb.async_survivors(PROMPT)
+    finally:
+        await _end(stream)
+
+    assert victim.cancelled()
+    assert survivors == []
+    assert entries == []
+    if task == "engine":
+        assert isinstance(error, asyncio.CancelledError)
+        assert running is error
+        assert fake_adb.calls() == []
+        assert not stream.stats.complete
+    else:
+        assert (error, running) == (None, None)
+        assert stream.state is S.STOPPED
 
 
 @pytest.mark.parametrize("first", ["engine", "consumer"])
@@ -458,7 +537,7 @@ async def test_cancel_in_reap_keeps_outcome(
     assert survivors == []
 
 
-# -- design 3.4: a stream dropped while its loop is stopped ----------------------
+# -- design 3.4: a stream dropped, or killed, while its loop is stopped ----------
 
 
 @pytest.mark.parametrize("policy", ["reconnect", "none"])
@@ -514,6 +593,146 @@ def test_drop_while_loop_stopped_kills(
     assert fake_adb.survivors(PROMPT) == []
     warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert warned == []
+
+
+def test_kill_while_loop_stopped_kills_at_once(fake_adb: FakeAdb) -> None:
+    """kill() while the stream's loop is stopped (between two
+    ``run_until_complete`` calls, or once Ctrl+C left it) kills adb at once
+    (design 3.4), before the loop runs again: a loop closed meanwhile never
+    runs the kill, and kill() does nothing once it is closed (5.4), so adb
+    ran on with no way left to end it. The kill it posted runs first when
+    the loop runs again: the run ends KILLED, and nothing is respawned
+    although reconnect is configured.
+    """
+    fake_adb.logcat(
+        run(out(logcat_line("a")), wait("never")),
+        run(out(logcat_line("again")), wait("never")),
+    )
+    stream = AsyncLogStream(config(reconnect=Reconnect(delay=0.05, max_delay=0.05)))
+
+    async def first() -> None:
+        stream.start()
+        await stream.wait_running(TIMEOUT)
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_bounded(first(), "the first run"))
+        stream.kill()  # the loop is stopped: it runs nothing until resumed
+        survivors = fake_adb.survivors(PROMPT)
+        stopped_state = stream.state
+        loop.run_until_complete(_bounded(stream.join(), "join()"))
+    finally:
+        _close_loop(loop)
+
+    assert survivors == [], "adb ran on until the loop ran again"
+    assert stopped_state is S.RUNNING  # the core acts once the loop runs
+    assert stream.state is S.KILLED
+    assert "killed" in stream.stats.incomplete
+    assert len(fake_adb.calls("logcat")) == 1
+
+
+@contextlib.contextmanager
+def _threaded_watcher() -> Iterator[None]:
+    """Loops made inside use asyncio's threaded child watcher, as where pidfd
+    is missing (macOS, Linux before 5.3 or under a seccomp filter): a thread
+    per child reaps it the moment it exits, and the loop sets ``returncode``
+    only once it runs again. Python 3.14 picks the watcher per loop; 3.12
+    and 3.13 per policy, at its first spawn, so a fresh policy is installed
+    meanwhile (its setter is deprecated in 3.14). POSIX only.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("asyncio.unix_events.can_use_pidfd", lambda: False)
+        if sys.version_info < (3, 14):
+            policy = asyncio.DefaultEventLoopPolicy()
+            patch.setattr("asyncio.events._event_loop_policy", policy)
+        yield
+
+
+def _reaped(pid: int) -> bool:
+    """Whether our child ``pid`` was reaped: a zombie still takes signal 0."""
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return True
+    return False
+
+
+@pytest.mark.parametrize("check", ["waitid", "poll"])
+@pytest.mark.parametrize("child", ["exited", "running"])
+@pytest.mark.parametrize("how", ["kill", "drop"])
+def test_stopped_kill_spares_a_reaped_pid(
+    fake_adb: FakeAdb, how: str, child: str, check: str
+) -> None:
+    """kill(), or the finalizer of a dropped stream, while the loop is stopped
+    signals adb only while its pid is an unreaped child of ours (design 3.4,
+    5.11), under asyncio's threaded child watcher (`_threaded_watcher`). That
+    watcher reaps a child that exits while the loop is stopped, and
+    ``returncode`` stays None until the loop runs again: by then the pid may
+    be another process's. The logcat exits on its own while the loop is
+    stopped (exited), and the stream sent it a SIGKILL all the same; or it
+    runs (running), and is killed at once. The check is ``os.waitid`` with
+    ``WNOWAIT``, which reaps nothing, and where that is missing (macOS;
+    ``poll`` removes it) the poll of ``Popen.send_signal``, which sees the
+    reap; asyncio's ``Process.kill`` signals the pid without it on 3.13+.
+    The posted kill runs first once the loop runs again: the run ends KILLED.
+    """
+    if sys.platform == "win32":
+        pytest.skip("asyncio's child watchers are POSIX only")
+    tail = sleep(0.2) if child == "exited" else wait("never")
+    fake_adb.logcat(run(out(logcat_line("a")), tail))
+    held = [AsyncLogStream(config())]
+    stream_run = held[0]._run
+    signals: list[tuple[int, int]] = []
+    real_kill = os.kill
+
+    async def first() -> None:
+        held[0].start()
+        await held[0].wait_running(TIMEOUT)
+
+    with _threaded_watcher():
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(_bounded(first(), "the first run"))
+            (logcat,) = fake_adb.children("logcat")
+            assert logcat.process is not None
+            if child == "exited":
+                wait_until(lambda: _reaped(logcat.pid), timeout=TIMEOUT)
+            returncode = logcat.process.returncode
+
+            def spy(pid: int, sig: int) -> None:
+                signals.append((pid, sig))
+                if pid != logcat.pid or child == "running":  # else it is free
+                    real_kill(pid, sig)
+
+            gc.collect()  # no other finalizer runs in the window
+            with pytest.MonkeyPatch.context() as patch:
+                if check == "poll":
+                    patch.delattr(os, "waitid", raising=False)
+                patch.setattr(os, "kill", spy)
+                if how == "kill":
+                    held[0].kill()
+                else:
+                    held.clear()
+                    gc.collect()  # its finalizer runs while the loop is stopped
+            survivors = fake_adb.survivors(PROMPT)
+            loop.run_until_complete(
+                _bounded(
+                    async_wait_until(lambda: stream_run.ended, timeout=TIMEOUT),
+                    "the end of the run",
+                )
+            )
+        finally:
+            _close_loop(loop)
+
+    assert returncode is None  # the loop is stopped, so asyncio has not set it
+    sent = [sig for pid, sig in signals if pid == logcat.pid]
+    if child == "exited":
+        assert sent == [], "a pid that asyncio had reaped was signalled"
+    else:
+        assert sent == [signal.SIGKILL]
+    assert survivors == []
+    assert stream_run.state is S.KILLED
+    assert len(fake_adb.calls("logcat")) == 1
 
 
 # -- F3-3: a cancellation through the stop --------------------------------------
@@ -610,74 +829,122 @@ async def _in_except_clause(
         await work()
 
 
-@pytest.mark.parametrize("body", ["raised", "clean"])
+class _ExitBlock:
+    """The with-block of `test_cancel_in_exit_kills`, with its stuck on_item.
+
+    Once every line was read, the body raises a ValueError (``raised``),
+    leaves the block (``clean``), or waits until the test cancels it
+    (``cancelled``). ``thrown`` is what the body raised (None when clean),
+    and ``escaped`` the CancelledErrors that left the ``async with``.
+    """
+
+    def __init__(self, body: str, count: int) -> None:
+        self.body = body
+        self.count = count
+        self.busy = asyncio.Event()
+        self.release = asyncio.Event()
+        self.parked = asyncio.Event()
+        self.calls: list[str] = []
+        self.thrown: BaseException | None = None
+        self.escaped: list[BaseException] = []
+        self.stream = AsyncLogStream(
+            config(close_timeout=TIMEOUT), on_item=self.on_item
+        )
+
+    async def on_item(self, entry: LogEntry) -> None:
+        self.calls.append(entry.message)
+        self.busy.set()
+        await self.release.wait()
+
+    async def run(self) -> None:
+        stream = self.stream
+        try:
+            async with stream:
+                await self.busy.wait()
+                await async_wait_until(
+                    lambda: stream.stats.lines == self.count, timeout=TIMEOUT
+                )
+                await self._end_body()
+        except asyncio.CancelledError as exc:
+            self.escaped.append(exc)
+            raise
+
+    async def _end_body(self) -> None:
+        if self.body == "raised":
+            self.thrown = ValueError("the body failed")
+            raise self.thrown
+        if self.body == "cancelled":
+            self.parked.set()
+            try:
+                await asyncio.Event().wait()  # until the test cancels it
+            except asyncio.CancelledError as exc:
+                self.thrown = exc
+                raise
+
+
+@pytest.mark.parametrize("body", ["raised", "clean", "cancelled"])
 @pytest.mark.asyncio
-async def test_cancel_in_exit_kills(fake_adb: FakeAdb, body: str) -> None:
+async def test_cancel_in_exit_kills(
+    fake_adb: FakeAdb, monkeypatch: pytest.MonkeyPatch, body: str
+) -> None:
     """A task cancelled while its with-block exit waits kills the run before
     the cancellation propagates (design 3.4, A.23): the state is KILLED right
     after, the stuck on_item is the last call (no item is taken after the
     block), and the capture names the kill. on_item is stuck, so the exit
     waits: up to close_timeout after the body raised an Exception (raised),
-    or for the end of a stopped run (clean).
+    for the end of a stopped run (clean), or, once a first cancellation of
+    the body made the exit kill, up to 1 s for the end (cancelled; the test
+    makes that wait TIMEOUT, so the second cancellation lands in it).
 
     The CancelledError keeps as its ``__context__`` the exception the block
     was handling, as with Ctrl+C in the thread driver's exit: the body's
-    exception (raised), or the one the ``except`` clause around a clean block
-    handles. asyncio throws the cancellation into the exit's wait, and the
-    exit awaits its kill before it re-raises, so Python does not chain it.
+    exception (raised, cancelled), or the one the ``except`` clause around a
+    clean block handles. asyncio throws the cancellation into the exit's
+    wait, and the exit awaits its kill before it re-raises, so Python does
+    not chain it. In clean and cancelled, a caller of the block handles a
+    LookupError: while that throw unwinds, each frame that handles an
+    exception chains it, the outermost last, so the cancelled body's exit,
+    which re-raised the cancellation of its wait at once, gave it that
+    LookupError instead of the body's CancelledError.
     """
     count = 50
     fake_adb.logcat(run(lines(count, logcat_line("m{i}")), wait("never")))
-    busy = asyncio.Event()
-    release = asyncio.Event()
-    calls: list[str] = []
-    escaped: list[BaseException] = []
-
-    async def on_item(entry: LogEntry) -> None:
-        calls.append(entry.message)
-        busy.set()
-        await release.wait()
-
-    stream = AsyncLogStream(config(close_timeout=TIMEOUT), on_item=on_item)
-    error = ValueError("the body failed")
-    handled = LookupError("around the block") if body == "clean" else None
-
-    async def block() -> None:
-        try:
-            async with stream:
-                await busy.wait()
-                await async_wait_until(
-                    lambda: stream.stats.lines == count, timeout=TIMEOUT
-                )
-                if body == "raised":
-                    raise error
-        except asyncio.CancelledError as exc:
-            escaped.append(exc)
-            raise
-
-    task = asyncio.create_task(_in_except_clause(block, handled))
+    if body == "cancelled":
+        monkeypatch.setattr(async_stream, "_KILL_WAIT", TIMEOUT)
+    block = _ExitBlock(body, count)
+    stream = block.stream
+    handled = LookupError("around the block") if body != "raised" else None
+    task = asyncio.create_task(_in_except_clause(block.run, handled))
     try:
-        await _bounded(busy.wait(), "the first on_item")
-        await async_wait_until(lambda: stream.state is S.STOPPING, timeout=TIMEOUT)
+        await _bounded(block.busy.wait(), "the first on_item")
+        if body == "cancelled":
+            await _bounded(block.parked.wait(), "the body's wait")
+            task.cancel()  # the body: the exit kills, then waits for the end
+            await async_wait_until(lambda: stream.state is S.KILLED, timeout=TIMEOUT)
+            assert not task.done(), "the exit did not wait for the end"
+        else:
+            await async_wait_until(lambda: stream.state is S.STOPPING, timeout=TIMEOUT)
         task.cancel()
         await asyncio.wait({task}, timeout=TIMEOUT)
         cancelled = task.cancelled()
         state_after = stream.state
-        release.set()
+        block.release.set()
         await _bounded(stream.join(), "join()")
         survivors = await fake_adb.async_survivors(PROMPT)
     finally:
-        release.set()
+        block.release.set()
         task.cancel()
         await _end(stream)
 
     assert cancelled, "the library swallowed the task's cancellation"
     assert state_after is S.KILLED
-    assert calls == ["m0"]
+    assert block.calls == ["m0"]
     assert "killed" in stream.stats.incomplete
     assert survivors == []
-    assert len(escaped) == 1
-    assert escaped[0].__context__ is (handled or error)
+    assert len(block.escaped) == 1
+    escaped = block.escaped[0]
+    assert escaped is not block.thrown
+    assert escaped.__context__ is (block.thrown or handled)
 
 
 # -- F2-7: kill() from on_item ----------------------------------------------------
@@ -824,6 +1091,61 @@ async def test_stop_in_on_item_on_the_loop(fake_adb: FakeAdb, kind: str) -> None
     assert "m2" in calls
     assert calls == [f"m{i}" for i in range(stats.lines)]
     assert (stats.delivered, stats.undelivered) == (stats.lines, 0)
+
+
+@pytest.mark.parametrize("stage", ["on_item", "on_event", "pull_on_event"])
+@pytest.mark.asyncio
+async def test_plain_callback_runs_on_the_loop(fake_adb: FakeAdb, stage: str) -> None:
+    """A plain callback runs on the loop, in the consumer's task step (design
+    A.24): on_item and on_event on the dispatcher, and on_event inside
+    ``__anext__()``. So it may use the loop's objects as any code of the loop
+    does: it feeds an ``asyncio.Queue`` with ``put_nowait``, and a task that
+    waits on that queue wakes. The conformance adapter runs the shared
+    tests' plain callbacks through ``asyncio.to_thread``, so a driver that
+    ran them in a worker thread passed every other test.
+    """
+    fake_adb.logcat(run(out(logcat_line("a")), wait("never")))
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    queue: asyncio.Queue[str] = asyncio.Queue()
+    on_loop: list[bool] = []
+
+    def plain(record: LogEntry | StreamEvent) -> None:
+        if isinstance(record, LogEntry | StateChange):
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:  # no loop runs in this thread
+                running = None
+            on_loop.append(running is loop and threading.get_ident() == loop_thread)
+            queue.put_nowait(type(record).__name__)
+
+    if stage == "on_item":
+        stream = AsyncLogStream(config(), on_item=plain)
+    elif stage == "on_event":
+        stream = AsyncLogStream(config(), on_item=[].append, on_event=plain)
+    else:
+        stream = AsyncLogStream(config(), on_event=plain)
+
+    async def pull() -> list[str]:
+        return await _rest(aiter(stream))
+
+    stream.start()
+    consumer = asyncio.create_task(pull()) if stage == "pull_on_event" else None
+    try:
+        first = await _bounded(queue.get(), "the callback's put_nowait")
+        stream.stop()
+        await _bounded(stream.join(), "join()")
+        if consumer is not None:
+            await _bounded(consumer, "the end of the iteration")
+    finally:
+        if consumer is not None:
+            consumer.cancel()
+        await _end(stream)
+
+    assert first == ("LogEntry" if stage == "on_item" else "StateChange")
+    assert on_loop, "the callback never ran"
+    assert all(on_loop), f"a plain callback ran off the loop: {on_loop}"
+    assert stream.state is S.STOPPED
 
 
 # -- F3-6: a callback's own CancelledError -------------------------------------
@@ -1622,7 +1944,70 @@ def test_start_on_a_windows_selector_loop_raises_usage_error(
     assert stream.state is S.STOPPED
 
 
-def _on_another_loop(wait: Callable[[], Awaitable[None]]) -> BaseException | None:
+@pytest.mark.asyncio
+async def test_eager_task_factory_runs_nothing_in_start(
+    fake_adb: FakeAdb, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under ``asyncio.eager_task_factory``, which runs a new task's first step
+    inside ``create_task``, start() still runs no user code and starts no adb
+    (design 2.3, 3.3, A.24): the engine and the dispatcher yield before their
+    first step. Without the engine's yield, start() handled the run's Start
+    and spawned adb; without either yield, the dispatcher also ran on_event
+    inside it. The dispatcher's yield alone is not observable: the engine
+    yields first, so the outbox is still empty when the dispatcher starts.
+    The run then goes on as under the default factory.
+    """
+    fake_adb.logcat(run(out(logcat_line("a")), wait("never")))
+    starting = [False]
+    inside: list[str] = []  # what ran while start() was on the stack
+    messages: list[str] = []
+    states: list[StreamState] = []
+    real_spawn = adb._async_spawn_adb
+
+    async def spawn(argv: Sequence[str]) -> Any:  # noqa: ANN401
+        if starting[0]:
+            inside.append(f"adb {' '.join(argv[1:])}")
+        return await real_spawn(argv)
+
+    def on_item(entry: LogEntry) -> None:
+        if starting[0]:
+            inside.append(f"on_item {entry.message}")
+        messages.append(entry.message)
+
+    def on_event(event: StreamEvent) -> None:
+        if isinstance(event, StateChange):
+            if starting[0]:
+                inside.append(f"on_event {event.new}")
+            states.append(event.new)
+
+    monkeypatch.setattr(adb, "_async_spawn_adb", spawn)
+    stream = AsyncLogStream(config(), on_item=on_item, on_event=on_event)
+    loop = asyncio.get_running_loop()
+    factory = loop.get_task_factory()
+    loop.set_task_factory(asyncio.eager_task_factory)
+    try:
+        starting[0] = True
+        try:
+            stream.start()
+        finally:
+            starting[0] = False
+        await _bounded(stream.wait_running(), "wait_running()")
+        await _bounded(
+            async_wait_until(lambda: messages == ["a"], timeout=TIMEOUT), "on_item"
+        )
+        stream.stop()
+        await _bounded(stream.join(), "join()")
+    finally:
+        loop.set_task_factory(factory)
+        await _end(stream)
+
+    assert inside == []
+    assert messages == ["a"]
+    assert states == [S.CONNECTING, S.RUNNING, S.STOPPING, S.STOPPED]
+    assert stream.state is S.STOPPED
+
+
+def _on_another_loop(wait: Callable[[], Awaitable[object]]) -> BaseException | None:
     """Await ``wait()`` under an ``asyncio.run`` of this thread; what it raised."""
 
     async def main() -> None:
@@ -1676,6 +2061,38 @@ async def test_aiter_off_the_loop_raises(fake_adb: FakeAdb) -> None:
         await _end(stream)
 
     assert entry.message == "a"
+
+
+@pytest.mark.asyncio
+async def test_anext_off_the_loop_raises(fake_adb: FakeAdb) -> None:
+    """An iterator made on the run's loop and awaited on another loop, in
+    another thread, raises UsageError (design 3.5, 4.2) and takes nothing: a
+    consumer step is a task step of the run's loop (design A.24). It popped
+    the outbox and ran on_event in that thread. The item and the events
+    before it are still delivered on the run's loop afterwards.
+    """
+    fake_adb.logcat(run(out(logcat_line("a")), wait("never")))
+    loop_thread = threading.get_ident()
+    seen: list[tuple[StreamState, bool]] = []
+
+    def on_event(event: StreamEvent) -> None:
+        if isinstance(event, StateChange):
+            seen.append((event.new, threading.get_ident() == loop_thread))
+
+    stream = AsyncLogStream(config(), on_event=on_event)
+    stream.start()
+    try:
+        iterator = aiter(stream)
+        await async_wait_until(lambda: stream.stats.lines == 1, timeout=TIMEOUT)
+        error = await asyncio.to_thread(_on_another_loop, lambda: _next(iterator))
+        assert isinstance(error, UsageError), f"it returned or raised {error!r}"
+        entry = await _bounded(_next(iterator), "the first item")
+    finally:
+        await _end(stream)
+
+    assert "outside the event loop" in str(error)
+    assert entry.message == "a"
+    assert seen == [(S.CONNECTING, True), (S.RUNNING, True)]
 
 
 @pytest.mark.asyncio

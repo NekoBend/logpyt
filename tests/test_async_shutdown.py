@@ -3,10 +3,10 @@
 ``asyncio.run`` cancels every task still pending once its main coroutine
 returns, the stream's engine among them. The engine then kills adb at once,
 starts nothing more and waits until asyncio has reaped what it killed
-(design 5.4): the adb is gone before ``asyncio.run`` returns, not killed later
-by the interpreter's exit, no adb was respawned although reconnect is
-configured, and nothing is reported on stderr (no log record, no destroyed
-pending task, no unclosed transport). 2.x skipped its teardown when its
+(design 5.4): the adb is gone, and reaped, before ``asyncio.run`` returns,
+not killed later by the interpreter's exit, no adb was respawned although
+reconnect is configured, and nothing is reported on stderr (no log record,
+no destroyed pending task, no unclosed transport). 2.x skipped its teardown when its
 connection task was cancelled in ``process.wait()``, respawned adb, and
 ``asyncio.run()`` never returned.
 
@@ -143,10 +143,26 @@ def _accept(server: socket.socket, proc: subprocess.Popen[bytes]) -> socket.sock
 
 def test_teardown_kills_a_running_logcat() -> None:
     """``asyncio.run`` ends while the stream is RUNNING: its teardown kills the
-    logcat adb, the script goes on, and no second logcat was spawned.
+    logcat adb and reaps it before ``asyncio.run`` returns (its
+    ``returncode`` is set then), the script goes on, and no second logcat was
+    spawned. Once the test saw adb gone, the script drops the stream and the
+    logcat's Process: a transport left open by a missing reap would be
+    reported on stderr then.
     """
     body = """\
+    import gc
     PROGRAMS = {"date": DATE, "logcat": LOGCAT}
+    LOGCATS = []  # the asyncio Process of each logcat adb
+
+
+    async def recording_spawn(argv):
+        proc = await spawn(argv)
+        if "logcat" in argv:
+            LOGCATS.append(proc)
+        return proc
+
+
+    adb._async_spawn_adb = recording_spawn
 
 
     async def main():
@@ -159,8 +175,12 @@ def test_teardown_kills_a_running_logcat() -> None:
 
 
     asyncio.run(main())
-    print("returned", SPAWNED.count("logcat"), flush=True)
+    reaped = [proc.returncode is not None for proc in LOGCATS]
+    print("returned", SPAWNED.count("logcat"), "reaped", reaped, flush=True)
     sys.stdin.readline()  # the test checked that adb is gone
+    KEEP.clear()
+    LOGCATS.clear()
+    gc.collect()
     """
     with _server() as (server, port):
         proc = _start(body, port)
@@ -170,7 +190,7 @@ def test_teardown_kills_a_running_logcat() -> None:
             status, stdout, stderr = _finish(proc)
 
     assert status == 0, stderr
-    assert stdout == ["running", "returned 1"], stderr
+    assert stdout == ["running", "returned 1 reaped [True]"], stderr
     assert gone, "the logcat adb outlived asyncio.run"
     assert stderr == ""
 
