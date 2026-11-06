@@ -36,9 +36,25 @@ was carried out keeps its outcome then (G4, `_Run._abandoned`). A task that
 raises (a logpyt bug) ends the run as an engine crash does
 (`_Run._worker_failed`, `_Run._crashed`): adb is killed and reaped, then
 every wait ends and raises that exception. ``KeyboardInterrupt`` (Ctrl+C on
-the loop's thread) in the engine or an I/O task is no bug: adb is killed at
-once and the run ends as for a cancelled engine, nothing is logged, and the
-interrupt leaves the loop without waiting (`_Run._interrupted`).
+the loop's thread) and ``SystemExit`` (``sys.exit()``, from a SIGTERM
+handler say) are neither a bug nor a callback failure, in any task of the
+run: the engine (``where`` and ``group_by`` included), an I/O task, or the
+dispatcher (a push callback). adb is killed at once and the run ends as for
+a cancelled engine, with that exception (unless its ``Finished`` was carried
+out); nothing is logged, and it leaves the loop without waiting
+(`_Run._interrupted`), as asyncio raises both out of the loop. One in the
+engine leaves the engine's end to a task of its own (`_Run._close_later`),
+which the loop's teardown runs to its end, so the killed adb is reaped. A
+first end of the run is kept: a crash that such an interrupt cut short does
+not replace it (`_Run._fail_run`). Two cases in a one-shot command differ,
+because adb's own code runs there (`adb._async_run_adb`): one in that
+function first waits for the bounded reap of the child it killed, and one in
+its pipe readers leaves the loop at once but ends the run only when the
+runner next runs (and raises it once more), or through the loop's teardown,
+whose waits raise the engine's ``CancelledError``. The thread driver takes
+a SystemExit in its dispatcher thread for a callback failure, because a
+thread would drop it (design A.23). In pull mode either one propagates from
+``__anext__()``, and the next step settles the record in hand.
 
 Everything a run shares lives on its loop, so a task step is the critical
 section of the protocol (no lock): the mailbox (the core's `ControlInbox`
@@ -163,7 +179,8 @@ _TERMINAL: Final = frozenset(
 _TICK: Final = Tick()
 
 # The run whose user code (on_item, on_event; the engine for where and
-# group_by) runs in this context (F3-7). Tasks created there inherit it.
+# group_by) runs in this context (F3-7). Tasks created there inherit it, so
+# their waits raise UsageError while the run lives (`_Run.check_wait`).
 _IN_CALLBACK: contextvars.ContextVar[_Run | None] = contextvars.ContextVar(
     "logpyt_async_stream_callback", default=None
 )
@@ -259,9 +276,11 @@ class _Run:
         self.seen = False
         # How the AsyncLogStream was dropped, for the unseen-outcome ERROR.
         self.orphaned: str | None = None
-        # The engine and dispatcher tasks, for the F3-7 check.
+        # The engine and dispatcher tasks, and the task a callback runs in
+        # while it runs (`_call`), for the F3-7 check.
         self.engine_task: weakref.ref[asyncio.Task[Any]] | None = None
         self.dispatcher_task: weakref.ref[asyncio.Task[Any]] | None = None
+        self.calling: asyncio.Task[Any] | None = None
         # Wake-ups, on the loop only.
         self._engine_waiter: asyncio.Future[None] | None = None
         self._consumer_waiter: asyncio.Future[None] | None = None
@@ -478,12 +497,23 @@ class _Run:
     # -- waits, from user code ---------------------------------------------------------
 
     def check_wait(self, what: str, *, iterator: bool) -> None:
-        """UsageError for a wait from the stream's own user code (F3-7, design 3.5)."""
+        """UsageError for a wait from the stream's own user code (F3-7, design 3.5).
+
+        The stream's own user code runs in the engine and the dispatcher
+        task, and in the task a callback runs in while it runs (`calling`):
+        a wait there raises also after the run's end, as in the thread
+        driver. A task created inside that code inherits the mark
+        (`_IN_CALLBACK`) with its context; its waits raise only while the run
+        lives, because the callback may await that task. Once the run has
+        ended there is nothing to deadlock on.
+        """
         task = _current_task()
-        if _IN_CALLBACK.get() is self or (
-            task is not None
-            and (_is(task, self.engine_task) or _is(task, self.dispatcher_task))
-        ):
+        own = task is not None and (
+            task is self.calling
+            or _is(task, self.engine_task)
+            or _is(task, self.dispatcher_task)
+        )
+        if own or (_IN_CALLBACK.get() is self and not self.ended):
             msg = (
                 f"{what} called from a stream callback; call stream.stop() and "
                 "return instead"
@@ -603,8 +633,13 @@ class _Run:
             while (item := await self.deliver_next(consumer)) is not None:
                 if not await self._call(consumer, "on_item", on_item, item):
                     return
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            raise  # a real cancellation, or Ctrl+C on the loop's thread
+        except asyncio.CancelledError:
+            raise  # a real cancellation
+        except (KeyboardInterrupt, SystemExit) as exc:
+            # Ctrl+C or sys.exit() on the loop's thread, a callback's too: not
+            # a failure; the run ends with it, and it leaves the loop.
+            self._interrupted(exc)
+            raise
         except BaseException as exc:  # noqa: BLE001  (_call takes the callbacks')
             self._worker_failed(exc)
         finally:
@@ -690,13 +725,15 @@ class _Run:
         False if it failed (design 2.4, F3-6).
 
         A ``CancelledError`` while the task is not being cancelled
-        (``Task.cancelling() == 0``) is the callback's own failure; a real
-        cancellation, and Ctrl+C (``KeyboardInterrupt``) propagate and leave
-        the record to the next step. On the dispatcher any other
-        ``BaseException`` (``SystemExit``) is a callback failure, as in the
-        thread driver (design A.23).
+        (``Task.cancelling() == 0``) is the callback's own failure. A real
+        cancellation, Ctrl+C (``KeyboardInterrupt``) and ``sys.exit()``
+        (``SystemExit``) propagate and leave the record to the next step; on
+        the dispatcher the last two end the run (`_dispatch`). On the
+        dispatcher any other ``BaseException`` is a callback failure, as in
+        the thread driver (design A.23).
         """
         token = _IN_CALLBACK.set(self)
+        calling, self.calling = self.calling, _current_task()
         try:
             result = callback(record)
             if result is not None and inspect.isawaitable(result):
@@ -711,13 +748,17 @@ class _Run:
         except Exception as exc:  # noqa: BLE001  (fail fast: CallbackError)
             await self._fail(consumer, stage, exc)
             return False
+        except (KeyboardInterrupt, SystemExit):
+            consumer.owe_done = True  # interrupted, not failed
+            raise
         except BaseException as exc:
-            if consumer.push and not isinstance(exc, KeyboardInterrupt):
-                await self._fail(consumer, stage, exc)  # SystemExit (A.23)
+            if consumer.push:
+                await self._fail(consumer, stage, exc)  # A.23
                 return False
             consumer.owe_done = True  # interrupted, not failed
             raise
         finally:
+            self.calling = calling
             _IN_CALLBACK.reset(token)
         consumer.owe_done = True
         return True
@@ -916,10 +957,13 @@ class _Run:
             # now, start nothing more (F3-2), and end every wait.
             self._abandoned(exc)
             raise
-        except KeyboardInterrupt as exc:
-            # Ctrl+C on the loop's thread: not a bug, and not swallowed.
+        except (KeyboardInterrupt, SystemExit) as exc:
+            # Ctrl+C or sys.exit() on the loop's thread (in where or group_by,
+            # say): not a bug, and not swallowed. It leaves the loop without
+            # an await; the engine's end goes on in a task of its own.
             interrupted = True
             self._interrupted(exc)
+            self._close_later()
             raise
         except BaseException as exc:  # noqa: BLE001  (a bug: end the run visibly)
             _log.error(
@@ -927,7 +971,7 @@ class _Run:
             )
             await self._crashed(exc)
         finally:
-            if not interrupted:  # the interrupt leaves the loop without an await
+            if not interrupted:  # else `_close_later` does it
                 await self._close_tasks()
 
     def _carry_out(self, commands: Iterable[Command]) -> None:
@@ -1135,9 +1179,10 @@ class _Run:
         self._end()
 
     def _interrupted(self, error: BaseException) -> None:
-        """Ctrl+C (``KeyboardInterrupt``) in a task of the run, on the loop's
-        thread: it leaves the loop at once, and it is not a logpyt bug, so
-        nothing is logged.
+        """Ctrl+C (``KeyboardInterrupt``) or ``sys.exit()`` (``SystemExit``) in
+        a task of the run, on the loop's thread, a push callback's included:
+        it leaves the loop at once, as asyncio raises both out of it, and it
+        is neither a logpyt bug nor a callback failure, so nothing is logged.
 
         adb is killed now, nothing is started any more, the run's other I/O
         tasks are cancelled, and every wait ends: as for a cancelled engine
@@ -1154,7 +1199,15 @@ class _Run:
         self._notify_engine()
 
     def _fail_run(self, error: BaseException) -> None:
-        """End a crashed run: every wait ends and raises ``error``."""
+        """End a crashed run: every wait ends and raises ``error``.
+
+        The first end of the run is kept, as in `_abandoned`: a push
+        callback's interrupt (`_interrupted`) that ended the run while a
+        crash reaped adb stays what join() raises once the crash's reap is
+        over, so join() raises the same object every time (design 4).
+        """
+        if self.ended:
+            return
         self.crash = error
         self.stats = replace(self.stats, failed=True)
         self.finished = True
@@ -1182,6 +1235,43 @@ class _Run:
             proc.returncode is None for proc in self.procs.values()
         ):
             await asyncio.sleep(_REAP_POLL)
+
+    def _close_later(self) -> None:
+        """The engine's end (`_close_tasks`) after an interrupt in the engine,
+        which leaves the loop without an await: in a task of its own.
+
+        Nothing else awaits the logcat child that `_interrupted` killed, so
+        without it the child would stay unreaped once the loop closes (on
+        POSIX a zombie, its pidfd and transport open). The task runs its
+        first step at once (``eager_start``), so it is inside its ``try``
+        before the loop's teardown cancels what is left, as ``asyncio.run``
+        does next; a task cancelled before its first step never runs. It is
+        made with the `asyncio.Task` constructor, so it bypasses a custom
+        task factory, which cannot be asked for an eager start: the task is
+        the library's own and runs no user code.
+        """
+        loop = self.loop
+        assert loop is not None  # noqa: S101  (started)
+        task = asyncio.Task(
+            self._close_after_interrupt(),
+            loop=loop,
+            name="logpyt-close",
+            eager_start=True,
+        )
+        if not task.done():
+            _LIVE.add(task)
+            task.add_done_callback(_LIVE.discard)
+        task.add_done_callback(_retrieve)
+
+    async def _close_after_interrupt(self) -> None:
+        """`_close_tasks` for `_close_later`; cancelled (the loop's teardown),
+        it finishes first, bounded as it is, then propagates the cancellation.
+        """
+        try:
+            await self._close_tasks()
+        except asyncio.CancelledError:
+            await self._close_tasks()
+            raise
 
     def _worker_failed(self, error: BaseException) -> None:
         """A task raised (a logpyt bug): the engine ends the run.
@@ -1246,7 +1336,7 @@ class _Run:
             self._worker(self._wait_exit(connection, proc), f"logpyt-exit-{connection}")
         except asyncio.CancelledError:
             raise
-        except KeyboardInterrupt as exc:
+        except (KeyboardInterrupt, SystemExit) as exc:
             self._interrupted(exc)
             raise
         except BaseException as exc:  # noqa: BLE001  (a bug: end the run visibly)
@@ -1281,7 +1371,7 @@ class _Run:
             await self._put(Eof(connection, pipe_name))
         except asyncio.CancelledError:
             raise
-        except KeyboardInterrupt as exc:
+        except (KeyboardInterrupt, SystemExit) as exc:
             self._interrupted(exc)
             raise
         except BaseException as exc:  # noqa: BLE001  (a bug: end the run visibly)
@@ -1308,7 +1398,7 @@ class _Run:
             self._post(Exited(connection, returncode))
         except asyncio.CancelledError:
             raise
-        except KeyboardInterrupt as exc:
+        except (KeyboardInterrupt, SystemExit) as exc:
             self._interrupted(exc)
             raise
         except BaseException as exc:  # noqa: BLE001  (a bug: end the run visibly)
@@ -1353,8 +1443,8 @@ class _Run:
             self._post(CommandDone(command.request, result))
         except asyncio.CancelledError:
             raise
-        except KeyboardInterrupt as exc:  # its child was killed and reaped
-            self._interrupted(exc)
+        except (KeyboardInterrupt, SystemExit) as exc:
+            self._interrupted(exc)  # _async_run_adb killed and reaped its child
             raise
         except BaseException as exc:  # noqa: BLE001  (a bug: end the run visibly)
             self._worker_failed(exc)
@@ -1369,10 +1459,11 @@ def _retrieve(task: asyncio.Task[Any]) -> None:
     """Done-callback of a run's task: mark its exception retrieved.
 
     A task of a run ends with an exception only for ``KeyboardInterrupt``
-    (`_Run._interrupted`, or one raised by a push callback), which asyncio
-    raises out of the loop as it ends the task; asyncio would otherwise
-    report it once more, as 'Task exception was never retrieved', when the
-    task is collected. Everything else is caught and ends the run visibly.
+    and ``SystemExit`` (`_Run._interrupted`, a push callback's included),
+    which asyncio raises out of the loop as it ends the task; asyncio would
+    otherwise report it once more, as 'Task exception was never retrieved',
+    when the task is collected. Everything else is caught and ends the run
+    visibly.
     """
     if not task.cancelled():
         task.exception()
@@ -1489,6 +1580,29 @@ def _abandon(run: _Run) -> None:
         abandon()
 
 
+def _keep_context(error: BaseException, handled: BaseException | None) -> None:
+    """Chain ``handled`` to ``error`` as its ``__context__`` (with-exit, 3.4).
+
+    Python gives an exception raised while another one is handled that one
+    as its ``__context__``, as for Ctrl+C in the thread driver's exit. A
+    cancellation that asyncio throws into a wait of the exit is chained only
+    to what a coroutine it passes through handles at that moment; once the
+    exit awaited its kill, the re-raised cancellation passes no such frame
+    any more and has none (observed on CPython 3.14). This sets it whatever
+    the version does. A ``__context__`` it has is kept, and no cycle is made.
+    """
+    if handled is None or error.__context__ is not None:
+        return
+    seen: set[int] = set()
+    link: BaseException | None = handled
+    while link is not None and id(link) not in seen:
+        if link is error:
+            return  # it would be a cycle
+        seen.add(id(link))
+        link = link.__context__
+    error.__context__ = handled
+
+
 async def _kill_and_wait(run: _Run, *, detach_own: bool = False) -> None:
     """with-exit's kill: ``kill()``, then wait at most 1 s for the end (3.4).
 
@@ -1562,7 +1676,13 @@ class AsyncLogStream[T]:
     events in order with the items, in the consumer context. The callbacks
     may be plain or async functions: what they return is awaited when it is
     awaitable. ``where`` and ``group_by`` run in the engine task, on the
-    loop. Any of them raising ends the run with `CallbackError`.
+    loop. Any of them raising an `Exception` ends the run with
+    `CallbackError`. ``KeyboardInterrupt`` and ``SystemExit`` are no
+    failure: raised in the engine or by a push callback, one kills adb and
+    leaves the event loop; a run that had not finished ends with it
+    (``join()`` raises it), and one that had keeps its outcome. Raised by
+    ``on_event`` in pull mode, it propagates from the iteration, which can
+    go on.
 
     The stream lives on the event loop that runs ``start()`` (``async with``
     starts it). ``stop()`` and ``kill()`` may be called from any thread;
@@ -1734,12 +1854,23 @@ class AsyncLogStream[T]:
         Returns once the run ended and its consumer finished (or detached).
         Cancelling the caller cancels only this wait.
 
+        A task created inside a callback inherits the callback's context, and
+        with it the mark that makes this raise UsageError while the run goes
+        on, because the callback may await that task (F3-7). Once the run has
+        ended there is nothing to deadlock on, and such a task may await it.
+        To wait for the run from such a task while it goes on, create it with
+        an empty context:
+        ``asyncio.create_task(coro, context=contextvars.Context())``.
+
         Raises:
             StreamError: The run ended FAILED (the same object every time).
+            KeyboardInterrupt: Ctrl+C in a task of the run ended it (as
+                ``SystemExit`` from ``sys.exit()`` there does).
             TimeoutError: ``timeout`` seconds passed; the stream keeps running.
-            UsageError: Awaited from the stream's own callbacks, from the task
-                that owns an attached iterator, before ``start()``, or on
-                another event loop while the run goes on.
+            UsageError: Awaited from the stream's own callbacks (also after
+                the end), from a task created inside them while the run goes
+                on, from the task that owns an attached iterator, before
+                ``start()``, or on another event loop while the run goes on.
 
         """
         run = self._run
@@ -1760,11 +1891,18 @@ class AsyncLogStream[T]:
     async def wait_running(self, timeout: float | None = None) -> None:
         """Wait until a connection is RUNNING (adb printed), or the run concluded.
 
+        A task created inside a callback may await it once the run has
+        ended, as `join` explains.
+
         Raises:
             StreamError: The run concluded FAILED before it was RUNNING.
+            KeyboardInterrupt: Ctrl+C in a task of the run ended it (as
+                ``SystemExit`` from ``sys.exit()`` there does).
             TimeoutError: ``timeout`` seconds passed; the stream keeps running.
-            UsageError: Awaited from the stream's own callbacks, before
-                ``start()``, or on another event loop while the run goes on.
+            UsageError: Awaited from the stream's own callbacks (also after
+                the end), from a task created inside them while the run goes
+                on, before ``start()``, or on another event loop while the
+                run goes on.
 
         """
         run = self._run
@@ -1855,17 +1993,22 @@ class AsyncLogStream[T]:
         exception (a cancellation, ``KeyboardInterrupt``, ``SystemExit``)
         kills, then waits at most 1 s. An exception that interrupts the exit's
         own wait (a cancellation there) kills too before it propagates: adb
-        does not outlive the block (design 9.2). A run that ended FAILED
-        before the kill took effect is not killed (kill() after the end does
-        nothing, design A.23): the items it left are still delivered.
+        does not outlive the block (design 9.2). It keeps as its
+        ``__context__`` the exception the block was handling, as in the thread
+        driver: the body's, or for a clean body the one an ``except`` clause
+        around the block handles. A run that ended FAILED before the kill took
+        effect is not killed (kill() after the end does nothing, design A.23):
+        the items it left are still delivered.
         """
         run = self._run
         if exc is None:
+            handled = sys.exception()  # an except clause around the block
             run.check_wait("the with-block exit", iterator=False)
             try:
                 run.stop(None, detach_own=True)
                 await run.wait_ended(None, "the with-block exit")
-            except BaseException:
+            except BaseException as interrupt:
+                _keep_context(interrupt, handled)
                 await _kill_and_wait(run, detach_own=True)
                 raise
             error = run.take_error(unseen_only=True)
@@ -1878,7 +2021,8 @@ class AsyncLogStream[T]:
         try:
             run.stop(None, detach_own=True)
             progressing = await run.wait_while_progressing(self._config.close_timeout)
-        except BaseException:
+        except BaseException as interrupt:
+            _keep_context(interrupt, exc)
             await _kill_and_wait(run, detach_own=True)
             raise
         if not progressing:

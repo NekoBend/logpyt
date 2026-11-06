@@ -245,7 +245,10 @@ def test_ctrl_c_in_the_with_exit_kills(
     raised: the body raised, and the exit waits while the consumer may still
     take items (``close_timeout``). A stuck on_item is released only after
     the with-block was left, so a backlog it then took would show in
-    ``calls``.
+    ``calls``. The interrupt keeps as its ``__context__`` the exception the
+    block was handling: the body's (raised), or that of the ``except`` clause
+    the clean block runs in (drain, flush), as Python chains it; the async
+    driver keeps it too (``test_async.py::test_cancel_in_exit_kills``).
     """
     count = _script_exit_case(fake_adb, body)
     busy = threading.Event()
@@ -260,8 +263,9 @@ def test_ctrl_c_in_the_with_exit_kills(
 
     stream = driver.open(config(close_timeout=TIMEOUT), on_item=on_item)
     error = ValueError("the body")
+    handled = LookupError("around the block")
 
-    def run_body() -> None:
+    def block() -> None:
         with driver.session(stream):
             assert busy.wait(TIMEOUT)
             fake_adb.wait_for("sent")
@@ -271,6 +275,15 @@ def test_ctrl_c_in_the_with_exit_kills(
             interrupter.armed.set()
             if body == "raised":
                 raise error
+
+    def run_body() -> None:
+        if body == "raised":
+            block()
+            return
+        try:
+            raise handled
+        except LookupError:
+            block()
 
     try:
         with pytest.raises(KeyboardInterrupt) as info:
@@ -287,8 +300,7 @@ def test_ctrl_c_in_the_with_exit_kills(
 
     assert interrupter.sent_at is not None, "the main thread never waited"
     assert ended_at - interrupter.sent_at < WITHIN + KILL_WAIT
-    if body == "raised":
-        assert info.value.__context__ is error
+    assert info.value.__context__ is (error if body == "raised" else handled)
     assert calls == ["m0"]
     assert "killed" in stream.stats.incomplete
 
