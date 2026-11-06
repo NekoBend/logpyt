@@ -59,7 +59,9 @@ if TYPE_CHECKING:
 ADB = "/fake/adb"
 APP = "com.example.app"
 APP_UID = 10065
-CLOCK = 1_793_756_125
+# The device clock, in whole seconds, just after STAMP: a resume's clock check
+# (design 5.6) sees no step back.
+CLOCK = 1_793_769_077
 STAMP = "2026-11-04 05:11:16.661446 +0000"
 # The wall-clock time of unparsed lines: fixed, so no test reads the host clock.
 WALL = datetime(2026, 11, 4, 5, 11, 16)  # noqa: DTZ001  (fallback entries are naive)

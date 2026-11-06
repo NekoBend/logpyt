@@ -120,7 +120,7 @@ def test_exit_kills_a_pending_clock_read() -> None:
     """
     body = """\
     PROGRAMS = {"date": HOLD}
-    stream = LogStream(StreamConfig(adb_path="adb", stall_timeout=None))
+    stream = LogStream(StreamConfig(adb_path="adb"))
     stream.start()
     sys.stdin.readline()  # the test saw the clock read start
     # The script ends with the stream referenced and the clock read running.
@@ -150,7 +150,7 @@ def test_exit_logs_an_unseen_failed_outcome() -> None:
         "date": "import time; print(int(time.time()))",
         "logcat": "import sys; sys.exit(1)",
     }
-    stream = LogStream(StreamConfig(adb_path="adb", stall_timeout=None))
+    stream = LogStream(StreamConfig(adb_path="adb"))
     stream.start()
     deadline = time.monotonic() + 10
     while stream.state is not StreamState.FAILED and time.monotonic() < deadline:
@@ -193,7 +193,7 @@ def test_exit_kills_an_adb_spawned_during_it() -> None:
 
 
     adb._spawn_adb = slow_spawn
-    stream = LogStream(StreamConfig(adb_path="adb", stall_timeout=None))
+    stream = LogStream(StreamConfig(adb_path="adb"))
     stream.start()
     entered.wait(10)
     sys.stdin.readline()  # the test saw the clock read's adb start

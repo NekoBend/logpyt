@@ -12,8 +12,10 @@ Package attribution is the policy of `logpyt._core.attribution` (design
 ``where``; the core runs its lookups, fires its deadline and accounts for the
 lines it holds, and counts in ``unattributed`` the lines that went on before a
 lookup answer named their package (a reinstall under a new uid). The start and
-resume positions are a minimal policy behind a small interface that PR-14
-replaces (`logpyt._core.resume`).
+resume positions, the replay screen of a resumed connection and the chatty
+notices are the resume planner's (`logpyt._core.resume`, design 5.6): the
+core reads the device clock before every attempt, hands the planner each
+stdout line with its host time, and emits the `Gap` events it finds.
 
 Facts the code relies on:
 
@@ -47,9 +49,15 @@ Facts the code relies on:
   run discards and counts them instead.
 - Line conservation: every framed stdout line is delivered (admitted to the
   outbox, as an entry or a group member), filtered, discarded and counted in
-  ``undelivered``, counted in ``before_start`` (or by PR-14 in
-  ``deduplicated``/``below_cursor``), or still held for attribution or in an
-  open group. `StreamCore.unaccounted_lines` is that balance; it is always 0.
+  ``undelivered``, counted in ``before_start``, ``deduplicated`` or
+  ``below_cursor``, or still held for attribution or in an open group.
+  `StreamCore.unaccounted_lines` is that balance; it is always 0.
+- A stall resume (design 5.6) and an end that logd caused while the reader
+  was behind (design A.6: an unbroken prefix, then EOF and status 1, while
+  intake was closed or within ``stall_timeout`` of its reopening, intake
+  having been closed while that adb ran) resume without a reconnect attempt:
+  RECONNECTING with ``error=None``, then CONNECTING once intake has reopened.
+  The resume's screen reports what the ring lost.
 """
 
 from __future__ import annotations
@@ -93,7 +101,7 @@ from logpyt._core.protocol import (
     Terminate,
     Tick,
 )
-from logpyt._core.resume import Positioner
+from logpyt._core.resume import ResumePlanner
 from logpyt.adb import (
     _describe,
     _device_clock_argv,
@@ -113,7 +121,7 @@ from logpyt.exceptions import (
     StreamError,
 )
 from logpyt.parsers import ParseContext, ThreadTimeLogParser
-from logpyt.streams._events import StateChange, StreamState, StreamStats
+from logpyt.streams._events import Gap, StateChange, StreamState, StreamStats
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -143,6 +151,9 @@ TERMINAL = frozenset({S.STOPPED, S.KILLED, S.FAILED})
 # Design 5.6: the one-shot runner's timeout for the clock, markers, state check
 # and lookup.
 COMMAND_TIMEOUT = 5.0
+# The status of an adb logcat whose reader logd ended for falling behind its
+# ring (design A.6; FINDINGS.md, check 5).
+LOGD_DROP_STATUS = 1
 _PIPES: tuple[Pipe, Pipe] = ("stdout", "stderr")
 # The commands that belong to CONNECTING (G5); "lookup" belongs to the run.
 _CONNECTING_KINDS = frozenset({"clock", "start_marker", "state"})
@@ -183,6 +194,7 @@ class _Request:
     connection: int | None = None
     token: str | None = None  # the marker a marker command writes
     lookup: int | None = None  # the attribution's id of a lookup
+    issued: float = 0.0  # when the core issued it (host-monotonic)
 
 
 @dataclass(slots=True, eq=False)
@@ -206,6 +218,9 @@ class _Connection:
     stop_grace: float | None = None
     last_activity: float = 0.0
     killed: bool = False  # Kill(c) was issued
+    # Intake was closed (a full outbox, or the first package lookup) at some
+    # time while its adb ran (design A.6).
+    pressed: bool = False
     # Why the stall ended it: held lines alone kept the outbox full, or not.
     stalled: Literal["consumer", "attribution"] | None = None
     # Why the core ended it: a read timeout or a failed state check.
@@ -272,7 +287,14 @@ class StreamCore:
             serial=config.serial,
             package_hold=config.package_hold,
         )
-        self._positioner = Positioner(config.since)
+        self._planner = ResumePlanner(
+            config.since,
+            overlap=config.resume_overlap,
+            max_lines=config.resume_window_lines,
+            max_bytes=config.resume_window_bytes,
+            # Design 2.2: the window is kept when the run can resume.
+            keep=config.reconnect is not None or config.stall_timeout is not None,
+        )
         self._admission = Admission(config.buffer_entries, config.buffer_bytes)
 
         self._state = S.IDLE
@@ -288,8 +310,7 @@ class StreamCore:
         self._outcome: StreamError | None = None
         self._kill_requested = False
         self._detached = False
-        self._started = not self._positioner.start_marker  # start marker read
-        self._read_any = False  # a stdout line was read
+        self._started = not self._planner.start_marker  # start marker read
         # Reconnect budget (design 5.6).
         reconnect = config.reconnect
         self._attempts = 0
@@ -420,12 +441,16 @@ class StreamCore:
         pressure = self._bp_total
         if self._bp_since is not None:
             pressure += self._now - self._bp_since
+        planner = self._planner
         return self._tally.snapshot(
             connections=self._number,
             counts=self._counts,
             backpressure_seconds=pressure,
             killed=self._state is S.KILLED,
             failed=self._state is S.FAILED,
+            device_lost=planner.device_lost,
+            backlog_pruned=planner.backlog_pruned,
+            overlap_shortened=planner.overlap_shortened,
         )
 
     def unaccounted_lines(self) -> int:
@@ -697,7 +722,9 @@ class StreamCore:
         lookup: int | None = None,
     ) -> None:
         request = next(self._request_ids)
-        self._requests[request] = _Request(kind, argv, connection, token, lookup)
+        self._requests[request] = _Request(
+            kind, argv, connection, token, lookup, issued=self._now
+        )
         self._out.append(RunCommand(request, kind, argv, COMMAND_TIMEOUT))
 
     def _next_lookup(self, now: float) -> None:
@@ -740,9 +767,10 @@ class StreamCore:
             self._attempt_failed(request, exc)
             return
         conn.clock = seconds
-        for gap in self._positioner.clock(seconds, resume=self._read_any):
-            self._tally.gaps += 1
-            self._records.append(gap)
+        # The start position, or the resume's clock check (design 5.6).
+        gap = self._planner.clock(seconds, issued=request.issued)
+        if gap is not None:
+            self._gap(gap)
         if not self._started:
             token = self._new_marker("start")
             self._run(
@@ -752,7 +780,7 @@ class StreamCore:
                 token=token,
             )
         else:
-            self._spawn(conn, self._positioner.position(resume=self._read_any))
+            self._spawn(conn, self._planner.position())
 
     def _start_marker_done(
         self, conn: _Connection, request: _Request, result: _AdbResult | Exception
@@ -764,7 +792,7 @@ class StreamCore:
             self._attempt_failed(request, exc)
             return
         conn.marker = request.token
-        self._spawn(conn, self._positioner.position(resume=self._read_any))
+        self._spawn(conn, self._planner.position())
 
     def _state_checked(
         self, conn: _Connection, result: _AdbResult | Exception, now: float
@@ -951,7 +979,37 @@ class StreamCore:
         if conn.stalled is not None:
             self._attempt_ended(None, stalled=conn.stalled, retry=True)
             return
+        if (
+            conn.returncode == LOGD_DROP_STATUS
+            and conn.cause is None
+            and self._behind(conn, now)
+        ):
+            # Design A.6: logd ends a reader that falls behind its ring with
+            # an unbroken prefix, then EOF and status 1 (API 24 and 36), before
+            # the stall rule may fire; a disconnect ends with 143 or 255
+            # (FINDINGS.md, checks 4 and 5). The end is the only signal of the
+            # hole, so it resumes like a stall, and the resume's screen
+            # reports what the ring lost.
+            self._attempt_ended(None, stalled="dropped", retry=True)
+            return
         self._attempt_ended(self._end_cause(conn), stalled=None, retry=True)
+
+    def _behind(self, conn: _Connection, now: float) -> bool:
+        """Whether logd may have ended the reader of ``conn`` (design A.6).
+
+        Only with the stall rule on, and only when intake was closed while its
+        adb ran, by a full outbox or by the first package lookup (the reader
+        stops either way), and is still closed or reopened less than
+        ``stall_timeout`` ago: a reader that logd dropped ends once the stream
+        has read what adb had buffered, while a closure long before the end
+        says nothing about it. A dropped reader also printed a prefix (only a
+        reader with unread output can fall behind), so an adb that failed
+        without stdout output is an ordinary end.
+        """
+        timeout = self._config.stall_timeout
+        if timeout is None or not conn.pressed or not conn.output:
+            return False
+        return not self._intake_was or now - self._reopened_at < timeout
 
     def _end_cause(self, conn: _Connection) -> StreamError:
         """The error of a connection that ended unrequested (design 3.2)."""
@@ -978,10 +1036,16 @@ class StreamCore:
         self,
         cause: StreamError | None,
         *,
-        stalled: Literal["consumer", "attribution"] | None,
+        stalled: Literal["consumer", "attribution", "dropped"] | None,
         retry: bool,
     ) -> None:
-        """RECONNECTING with attempts left or after a stall; else FAILED."""
+        """RECONNECTING with attempts left or after a stall; else FAILED.
+
+        ``stalled``: the stall rule ended the connection (held lines alone
+        kept the outbox full, or not), or its adb ended with status 1 soon
+        after intake was closed while it ran (``"dropped"``, design A.6).
+        Then the run resumes once intake is open, without an attempt.
+        """
         number = self._number
         reconnect = self._config.reconnect
         left = reconnect is not None and (
@@ -991,19 +1055,25 @@ class StreamCore:
             self._set_state(S.RECONNECTING, error=cause)
             if stalled is not None:
                 self._resume_on_intake = True
-                why = (
-                    "lines waited for package attribution (held lines count "
-                    "against the outbox); it resumes once they have gone on"
-                    if stalled == "attribution"
-                    else "the consumer fell behind; it resumes when the consumer "
-                    "catches up"
-                )
-                self._out.append(
-                    Diagnostic(
-                        logging.INFO,
-                        f"logcat connection {number} was disconnected because {why}",
+                if stalled == "dropped":
+                    message = (
+                        f"logcat connection {number} ended with status 1 soon "
+                        "after reading from it was paused (logd ends a reader "
+                        "that falls behind its ring); it resumes once reading "
+                        "can go on and checks the ring for lost lines"
                     )
-                )
+                else:
+                    why = (
+                        "lines waited for package attribution (held lines count "
+                        "against the outbox); it resumes once they have gone on"
+                        if stalled == "attribution"
+                        else "the consumer fell behind; it resumes when the "
+                        "consumer catches up"
+                    )
+                    message = (
+                        f"logcat connection {number} was disconnected because {why}"
+                    )
+                self._out.append(Diagnostic(logging.INFO, message))
             else:
                 self._backoff_at = self._now + self._delay
                 self._out.append(
@@ -1205,15 +1275,16 @@ class StreamCore:
             return
         if not entry.parsed:
             self._tally.unparsed += 1
-        self._read_any = True  # a line past the start: later attempts resume
-        verdict = self._positioner.screen(entry)
+        planner = self._planner
+        verdict = planner.screen(entry, len(line.data) + 1, now)
+        if planner.out:
+            self._planned()
         if verdict == "deduplicated":
             self._tally.deduplicated += 1
             return
         if verdict == "below_cursor":
             self._tally.below_cursor += 1
             return
-        self._positioner.observe(entry)
         token = self._flush_token
         if (
             token is not None
@@ -1239,14 +1310,17 @@ class StreamCore:
         if entry is None:  # a buffer divider
             return
         # Every line read from stdout moves the resume cursor (design 5.6).
-        self._positioner.observe(entry)
+        nbytes = len(line.data) + 1
         if not entry.parsed or not _is_marker(entry.tag, entry.message, marker):
+            self._planner.before_start(entry, nbytes, now)
             return
+        # The marker is read: S is its timestamp, and a later attempt resumes
+        # after it instead of starting at its own clock.
+        self._planner.marker(entry, nbytes, now)
+        if self._planner.out:
+            self._planned()
         conn.marker = None
         self._started = True
-        # The marker is read: a later attempt resumes after it instead of
-        # starting at its own clock.
-        self._read_any = True
         if self._state is S.CONNECTING and not conn.killed:
             self._enter_running(now)
 
@@ -1384,6 +1458,23 @@ class StreamCore:
             self._drop(attribution.discard(), reason)
             self._held_changed()
 
+    def _gap(self, gap: Gap) -> None:
+        """Emit a Gap event, in order with the items (G3)."""
+        self._tally.gaps += 1
+        self._records.append(gap)
+
+    def _planned(self) -> None:
+        """Emit what the resume planner queued: Gaps, and INFO messages."""
+        for item in self._planner.take():
+            if isinstance(item, Gap):
+                self._gap(item)
+            else:
+                self._out.append(
+                    Diagnostic(
+                        logging.INFO, f"logcat connection {self._number}: {item}"
+                    )
+                )
+
     def _held_changed(self) -> None:
         """Held lines count against the outbox (design 5.10)."""
         attribution = self._attribution
@@ -1458,7 +1549,13 @@ class StreamCore:
 
     def _settle(self, now: float) -> None:
         """Follow intake changes: backpressure time, paused timers, the stall resume."""
-        pressed = self._gating() and not self._admission.open
+        gating = self._gating()
+        pressed = gating and not self._admission.open
+        conn = self._conn
+        if gating and conn is not None and conn.alive and not self.intake_open:
+            # A full outbox or the first package lookup: either way the reader
+            # stops, so it may fall behind logd's ring (design A.6).
+            conn.pressed = True
         if pressed and self._bp_since is None:
             self._bp_since = now
         elif not pressed and self._bp_since is not None:

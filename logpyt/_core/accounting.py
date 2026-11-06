@@ -62,8 +62,15 @@ class Tally:
         backpressure_seconds: float,
         killed: bool,
         failed: bool,
+        device_lost: int = 0,
+        backlog_pruned: int = 0,
+        overlap_shortened: int = 0,
     ) -> StreamStats:
-        """The `StreamStats` of the run, with the outbox's latest counts."""
+        """The `StreamStats` of the run, with the outbox's latest counts.
+
+        The chatty-notice and window counters come from the resume planner
+        (`logpyt._core.resume`).
+        """
         return StreamStats(
             connections=connections,
             reconnects=self.reconnects,
@@ -81,6 +88,9 @@ class Tally:
             truncated=self.truncated,
             unattributed=self.unattributed,
             gaps=self.gaps,
+            device_lost=device_lost,
+            backlog_pruned=backlog_pruned,
+            overlap_shortened=overlap_shortened,
             events_coalesced=counts.events_coalesced,
             flush_timeout=self.flush_timeout,
             flush_failed=self.flush_failed,

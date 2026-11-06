@@ -21,6 +21,7 @@ from logpyt.streams import AsyncLogStream, LogStream
 from tests.conftest import (
     WATCHDOG_ENV,
     FakeAdb,
+    clock,
     device_date,
     dumpsys_package,
     err,
@@ -31,11 +32,13 @@ from tests.conftest import (
     out,
     raw,
     run,
+    stream,
     touch,
     wait,
     wait_until,
     waiting_for_device,
 )
+from tests.fake_adb import device_stamp
 
 if TYPE_CHECKING:
     from logpyt.models import LogEntry
@@ -695,6 +698,306 @@ def test_an_unreleased_gate_times_out_and_fails_the_teardown(
 
 
 # -- hang watchdog ------------------------------------------------------------
+
+
+# -- the simulated device (design 5.6, PR-14) -----------------------------------------
+
+_T0 = 1_793_769_076_000_000  # 2026-11-04 05:11:16 UTC, epoch microseconds
+
+
+def _T(micros: int) -> str:  # noqa: N802
+    """The library's ``-T`` form of epoch ``micros``."""
+    return f"{micros // 1_000_000}.{micros % 1_000_000:06d}"
+
+
+def _messages(stdout: bytes) -> list[str]:
+    return [line.rpartition(": ")[2] for line in stdout.decode().splitlines()]
+
+
+def _reader(fake: FakeAdb, *args: str) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
+        [fake.path, "logcat", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+
+
+def test_device_ring_honors_epoch_T_inclusively(fake_adb: FakeAdb) -> None:  # noqa: N802
+    """-T <sec>.<usec> starts at the first entry at or above it (A.7: exact)."""
+    fake_adb.device()
+    fake_adb.device_log("before", at=_T0 - 1)
+    fake_adb.device_log("at-1", "at-2", at=_T0)
+    fake_adb.device_log("after", at=_T0 + 1)
+    fake_adb.logcat(run(stream(lines=3)))
+
+    result = _adb(fake_adb, "logcat", "-v", "threadtime", "-T", _T(_T0))
+
+    assert result.returncode == 0
+    assert _messages(result.stdout) == ["at-1", "at-2", "after"]
+    assert result.stdout.decode().startswith("2026-11-04 05:11:16.000000 +0000 10065 ")
+
+
+def test_device_T_of_digits_only_is_a_count(fake_adb: FakeAdb) -> None:  # noqa: N802
+    """A digits-only -T is a line count (n-logcat.cpp:672-693; R2 on 24 and 36)."""
+    fake_adb.device()
+    fake_adb.device_log(*[f"m{i}" for i in range(6)], at=_T0)
+    fake_adb.logcat(run(stream(lines=2)))
+
+    result = _adb(fake_adb, "logcat", "-T", "2")
+
+    assert _messages(result.stdout) == ["m4", "m5"]
+
+
+def test_device_ring_overwrites_its_oldest_entries(fake_adb: FakeAdb) -> None:
+    fake_adb.device(ring=3)
+    fake_adb.device_log(*[f"m{i}" for i in range(5)], at=_T0)
+    fake_adb.logcat(run(stream(lines=3)))
+
+    assert _messages(_adb(fake_adb, "logcat").stdout) == ["m2", "m3", "m4"]
+    assert len(fake_adb.device_entries()) == 5  # the log keeps them all
+
+
+def test_device_T_returns_later_lower_entries_in_arrival_order(  # noqa: N802
+    fake_adb: FakeAdb,
+) -> None:
+    """After a clock step logd returns, from the first entry at or above -T,
+    every later entry, also the lower ones: they are below_cursor for the
+    stream (design 5.6, A.7; R2x on API 24)."""
+    fake_adb.device()
+    fake_adb.device_log("old", at=_T0 - 10)
+    fake_adb.device_log("high", at=_T0 + 5)
+    fake_adb.device_log("stepped", at=_T0 - 5)
+    fake_adb.logcat(run(stream(lines=2)))
+
+    assert _messages(_adb(fake_adb, "logcat", "-T", _T(_T0)).stdout) == [
+        "high",
+        "stepped",
+    ]
+
+
+def test_device_stream_follows_new_entries_until_released(fake_adb: FakeAdb) -> None:
+    fake_adb.device()
+    fake_adb.device_log("backlog", at=_T0)
+    fake_adb.logcat(run(stream(until="cut", ready="ready"), exit_code=255))
+    proc = _reader(fake_adb)
+    try:
+        fake_adb.wait_for("ready")
+        fake_adb.device_log("live")
+        assert proc.stdout is not None
+        assert proc.stdout.readline().endswith(b": backlog\n")
+        assert proc.stdout.readline().endswith(b": live\n")
+        fake_adb.release("cut")
+        assert proc.wait(timeout=TIMEOUT) == 255
+    finally:
+        _end(proc)
+
+
+def test_device_logcat_without_runs_streams_until_killed(fake_adb: FakeAdb) -> None:
+    fake_adb.device()
+    fake_adb.device_log("first", at=_T0)
+    proc = _reader(fake_adb)
+    try:
+        assert proc.stdout is not None
+        assert proc.stdout.readline().endswith(b": first\n")
+        assert proc.poll() is None
+    finally:
+        _end(proc)
+
+
+def test_device_clock_answers_shell_date_and_steps_back(fake_adb: FakeAdb) -> None:
+    fake_adb.device()
+    fake_adb.device_clock(_T0)
+    assert _T0 // 1_000_000 <= _clock(fake_adb) <= _T0 // 1_000_000 + 60
+
+    fake_adb.step_clock(-3600)
+
+    assert _T0 // 1_000_000 - 3600 <= _clock(fake_adb) <= _T0 // 1_000_000 - 3540
+    (line,) = fake_adb.device_log("stamped")
+    assert line.startswith("2026-11-04 04:11:")  # lines take the stepped clock
+
+
+def test_clock_step_reads_the_clock_when_it_runs(fake_adb: FakeAdb) -> None:
+    """A scripted ``clock`` step prints the device clock as it reads after the
+    run's ``wait``: the clock read sees a step made while it waited."""
+    fake_adb.device()
+    fake_adb.device_clock(_T0)
+    fake_adb.date(run(wait("stepped"), clock()))
+    argv = adb._device_clock_argv(fake_adb.path, None)
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        fake_adb.step_clock(-3600)
+        fake_adb.release("stepped")
+        stdout, _ = proc.communicate(timeout=TIMEOUT)
+    finally:
+        _end(proc)
+
+    assert proc.returncode == 0
+    assert _T0 // 1_000_000 - 3600 <= int(stdout) <= _T0 // 1_000_000 - 3540
+
+
+def test_shell_log_is_echoed_into_the_running_logcat(fake_adb: FakeAdb) -> None:
+    """The library's marker command writes an entry the running stream reads
+    (design 5.6; uid shell; API 24's trailing space, FINDINGS.md check 11)."""
+    fake_adb.device(log_space=True)
+    fake_adb.logcat(run(stream(ready="ready", lines=1)))
+    proc = _reader(fake_adb)
+    try:
+        fake_adb.wait_for("ready")
+        argv = adb._log_marker_argv(fake_adb.path, None, "start-0123abcd")
+        adb._parse_log_marker(adb._run_adb(argv, timeout=TIMEOUT))
+        stdout, _ = proc.communicate(timeout=TIMEOUT)
+    finally:
+        _end(proc)
+
+    entry = ThreadTimeLogParser().parse(stdout.decode().rstrip("\n"), ParseContext())
+    assert entry is not None
+    assert (entry.tag, entry.message, entry.uid_raw) == (
+        "logpyt",
+        "start-0123abcd ",
+        "shell",
+    )
+    assert adb._is_marker(entry.tag, entry.message, "start-0123abcd")
+    assert [call["key"] for call in fake_adb.calls("log")] == ["log"]
+
+
+def test_scripted_log_runs_replace_the_echo(fake_adb: FakeAdb) -> None:
+    fake_adb.device()
+    fake_adb.log(run(err("adb: device offline\n"), exit_code=1))
+
+    argv = adb._log_marker_argv(fake_adb.path, None, "flush-00")
+    result = adb._run_adb(argv, timeout=TIMEOUT)
+
+    assert result.returncode == 1
+    assert fake_adb.device_entries() == []
+
+
+def test_overwritten_position_ends_a_stalled_reader_with_eof(fake_adb: FakeAdb) -> None:
+    """A reader that falls behind the ring gets an unbroken prefix, then EOF
+    with status 1 and no notice of the loss (FINDINGS.md check 5, design A.6)."""
+    fake_adb.device(ring=1000)
+    payload = "x" * 1000  # 256 lines (one write) fill any pipe buffer
+    fake_adb.device_log(*[f"{i} {payload}" for i in range(900)], at=_T0)
+    proc = _reader(fake_adb)
+    try:
+        assert proc.stdout is not None
+        first = proc.stdout.readline()  # the reader is inside its first write
+        fake_adb.device_log(*[f"late {payload}" for _ in range(2000)], at=_T0 + 1)
+        rest = proc.stdout.read()  # to EOF; communicate() would skip the buffer
+        assert proc.wait(timeout=TIMEOUT) == 1
+        assert proc.stderr is not None
+        stderr = proc.stderr.read()
+    finally:
+        _end(proc)
+
+    numbers = [int(text.split()[0]) for text in _messages(first + rest)]
+    assert numbers == list(range(256))  # the first write, then nothing
+    assert stderr == b"logcat: Unexpected EOF!\n"
+
+
+def test_caught_up_reader_keeps_up_with_a_large_append(fake_adb: FakeAdb) -> None:
+    """A reader that wrote every entry is not behind: one append larger than
+    the ring reaches it whole, and it goes on following."""
+    fake_adb.device(ring=100)
+    fake_adb.device_log("0", at=_T0)
+    fake_adb.logcat(run(stream(ready="ready", lines=102)))
+    proc = _reader(fake_adb)
+    try:
+        fake_adb.wait_for("ready")
+        assert proc.stdout is not None
+        first = proc.stdout.readline()  # the reader is idle: it wrote everything
+        fake_adb.device_log(*[str(i) for i in range(1, 102)], at=_T0 + 1)
+        rest = proc.stdout.read()  # to EOF; communicate() would skip the buffer
+        assert proc.wait(timeout=TIMEOUT) == 0
+    finally:
+        _end(proc)
+
+    assert [int(text) for text in _messages(first + rest)] == list(range(102))
+
+
+def test_overrun_skip_goes_on_at_the_oldest_entry(fake_adb: FakeAdb) -> None:
+    """With overrun="skip" the reader silently skips what the ring overwrote
+    (nougat's logd source, design 5.1); the run's own exit then follows."""
+    fake_adb.device(ring=1000, overrun="skip")
+    payload = "x" * 1000
+    fake_adb.device_log(*[f"{i} {payload}" for i in range(900)], at=_T0)
+    fake_adb.logcat(run(stream(lines=256 + 1000)))
+    proc = _reader(fake_adb)
+    try:
+        assert proc.stdout is not None
+        first = proc.stdout.readline()
+        fake_adb.device_log(*[f"{900 + i} {payload}" for i in range(2000)], at=_T0 + 1)
+        rest = proc.stdout.read()  # to EOF; communicate() would skip the buffer
+        assert proc.wait(timeout=TIMEOUT) == 0
+    finally:
+        _end(proc)
+
+    numbers = [int(text.split()[0]) for text in _messages(first + rest)]
+    assert numbers == [*range(256), *range(1900, 2900)]
+
+
+def test_device_ring_of_a_long_log(fake_adb: FakeAdb) -> None:
+    """A spawn seeks to the ring from the end of the log (O(ring), the soak):
+    the ring, -T counts and times, and indices are those of the whole log."""
+    fake_adb.device(ring=1000)
+    payload = "x" * 200  # 3000 entries: several of the reader's seek blocks
+    for start in range(0, 3000, 500):
+        fake_adb.device_log(
+            *[f"{i} {payload}" for i in range(start, start + 500)], at=_T0 + start
+        )
+    fake_adb.logcat(run(stream(lines=1000)), run(stream(lines=3)))
+
+    ring = [int(text.split()[0]) for text in _messages(_adb(fake_adb, "logcat").stdout)]
+    tail = _adb(fake_adb, "logcat", "-T", "3").stdout
+    timed = _adb(fake_adb, "logcat", "-T", _T(_T0 + 2500)).stdout
+
+    assert ring == list(range(2000, 3000))
+    assert [int(text.split()[0]) for text in _messages(tail)] == [2997, 2998, 2999]
+    assert [int(text.split()[0]) for text in _messages(timed)] == [2500, 2501, 2502]
+    assert len(fake_adb.device_entries()) == 3000
+
+
+def test_device_expire_prunes_in_place_with_a_notice(fake_adb: FakeAdb) -> None:
+    """logd's chatty pruning: the entries leave, a notice at the newest one's
+    time takes their place, and later entries keep their order (design 5.6)."""
+    fake_adb.device()
+    fake_adb.device_log("a", at=_T0)
+    fake_adb.device_log("b", at=_T0 + 1)
+    fake_adb.device_log("c", at=_T0 + 2)
+    fake_adb.device_log("d", at=_T0 + 3)
+    fake_adb.logcat(run(stream(lines=3)))
+
+    notice = fake_adb.device_expire(1, 2)
+    fake_adb.device_log("e", at=_T0 + 4)
+    result = _adb(fake_adb, "logcat")
+
+    assert notice.endswith(" I chatty: uid=10065 expire 2 lines")
+    assert notice.startswith(device_stamp(_T0 + 2))
+    assert [stamp for stamp, _ in fake_adb.device_entries()] == [
+        _T0,
+        _T0 + 2,
+        _T0 + 3,
+        _T0 + 4,
+    ]
+    assert _messages(result.stdout) == ["a", "uid=10065 expire 2 lines", "d"]
+    with pytest.raises(IndexError):
+        fake_adb.device_expire(3, 2)
+
+
+def test_unsupported_T_is_refused(fake_adb: FakeAdb) -> None:  # noqa: N802
+    fake_adb.device()
+    fake_adb.logcat(run(stream(lines=1)))
+
+    result = _adb(fake_adb, "logcat", "-T", "11-04 05:11:16.000")
+
+    assert result.returncode == 2
+    assert b"unsupported -T" in result.stderr
+
+
+def test_device_steps_need_a_device(fake_adb: FakeAdb) -> None:
+    fake_adb.logcat(run(stream(lines=1)))
+
+    result = _adb(fake_adb, "logcat")
+
+    assert result.returncode == 99
+    assert b"needs a device" in result.stderr
 
 
 def test_watchdog_ends_a_hung_test_with_tracebacks(tmp_path: Path) -> None:

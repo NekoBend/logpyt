@@ -411,10 +411,11 @@ def test_no_entry_of_a_burst_is_lost_while_the_callback_is_behind(
     stops adb's progress, one that drops has overflowed by then. Only
     complete, in-order delivery is pinned (X-1).
 
-    The stall resume is off (``stall_timeout=None``): until PR-14 a resumed
-    connection replays from the first position (design A.20), which would
-    deliver the burst twice. The ``end`` lines are written after the callback
-    resumed; they only tell the test that delivery has settled.
+    The stall resume keeps its default: should intake stay closed for
+    ``stall_timeout``, the resumed connection's replay of the scripted run is
+    dropped (design 5.6), so the burst still comes once. The ``end`` lines
+    are written after the callback resumed; they only tell the test that
+    delivery has settled.
     """
     chunks, chunk = 20, 1_000
     held_back_after = 2.0
@@ -455,7 +456,7 @@ def test_no_entry_of_a_burst_is_lost_while_the_callback_is_behind(
         if entry.tag == "End":
             settled.set()
 
-    stream = LogStream(StreamConfig(stall_timeout=None), on_item=lagging)
+    stream = LogStream(StreamConfig(), on_item=lagging)
 
     _start(stream)
     try:

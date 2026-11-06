@@ -45,9 +45,6 @@ what another task of the same loop sees:
   loop, and runs nothing under an eager task factory; waits and iteration
   (``__aiter__`` and ``__anext__``) on another loop or thread, and two tasks
   in one iterator, raise UsageError.
-
-Until PR-14 a reconnect replays from the first position (design A.20), so
-`config` turns the stall resume off.
 """
 
 from __future__ import annotations

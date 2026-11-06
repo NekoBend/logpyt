@@ -2425,6 +2425,7 @@ def test_random_runs_reach_the_main_paths() -> None:
         commands = driver.harness.commands
         reach["read lines"] += stats.lines > 0
         reach["reconnected"] += stats.reconnects > 0
+        reach.update(_resume_paths(driver))
         reach["stall resumed"] += stats.stall_resumes > 0
         reach["flushed"] += any(
             isinstance(cmd, RunCommand) and cmd.kind == "flush_marker"
@@ -2472,6 +2473,7 @@ def test_random_runs_reach_the_main_paths() -> None:
 
     assert reach["read lines"] >= 0.8 * len(_SEEDS)
     floors = {"reconnected": 20, "stall resumed": 10, "flushed": 10}
+    floors |= {"deduplicated": 15, "below cursor": 20, "ring rotated": 3}
     floors |= {"STOPPED": 20, "KILLED": 15, "FAILED": 40}
     floors |= {"drained": 8, "drain failure": 4, "last item failure": 2}
     floors |= {"drain killed": 2, "drain ended by progress": 2}
@@ -2485,6 +2487,18 @@ def test_random_runs_reach_the_main_paths() -> None:
     assert {name: reach[name] for name in floors} == {
         name: max(reach[name], floor) for name, floor in floors.items()
     }
+
+
+def _resume_paths(driver: RandomDriver) -> list[str]:
+    """Design 5.6: replays dropped, lines below a request, ring rotations."""
+    stats = driver.harness.core.stats()
+    gaps = driver.harness.gaps()
+    found = {
+        "deduplicated": stats.deduplicated > 0,
+        "below cursor": stats.below_cursor > 0,
+        "ring rotated": any(gap.reason == "ring_rotated" for gap in gaps),
+    }
+    return [name for name, reached in found.items() if reached]
 
 
 def test_flush_timer_counts_only_open_intake() -> None:
