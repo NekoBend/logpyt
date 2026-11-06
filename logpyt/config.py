@@ -21,8 +21,7 @@ from pydantic import (
     AwareDatetime,
     BaseModel,
     Field,
-    NonNegativeFloat,
-    PositiveFloat,
+    StrictFloat,
     StrictInt,
     ValidationInfo,
     field_validator,
@@ -292,6 +291,8 @@ class Reconnect(
     """Reconnect policy for a stream whose adb connection ends unrequested.
 
     The defaults retry until ``stop()``, backing off from 1 s to 30 s.
+    ``delay``, ``max_delay``, ``backoff`` and ``stable_after`` take a number,
+    stored as a float, not a ``str`` or ``bytes`` (as in `StreamConfig`).
     ``model_copy(update=...)`` validates its result like the constructor.
 
     Attributes:
@@ -305,12 +306,13 @@ class Reconnect(
             first output, before the attempts and the delay reset.
     """
 
-    delay: PositiveFloat = 1.0
-    max_delay: PositiveFloat = 30.0
-    backoff: float = Field(2.0, ge=1.0)
-    # Strict like every int field of StreamConfig (see the comment there).
+    # Strict like every float and int field of StreamConfig (see the
+    # comments there).
+    delay: StrictFloat = Field(1.0, gt=0)
+    max_delay: StrictFloat = Field(30.0, gt=0)
+    backoff: StrictFloat = Field(2.0, ge=1.0)
     max_attempts: StrictInt | None = Field(None, gt=0)
-    stable_after: PositiveFloat = 10.0
+    stable_after: StrictFloat = Field(10.0, gt=0)
 
     @field_validator("*", mode="before")
     @classmethod
@@ -347,11 +349,15 @@ class StreamConfig(
 ):
     """Configuration of one stream run, shared by `LogStream` and `AsyncLogStream`.
 
-    Durations are seconds. Counts and sizes, here and in `Reconnect`, take
-    only an int: a float (even ``8192.0``), a ``str`` or ``bytes`` is refused,
-    also from JSON, unless a caller passes ``strict=False`` to
-    ``model_validate`` or ``model_validate_json``, which pydantic lets override
-    it; buffer and window sizes are ``>= 1`` (design D-15).
+    Durations are seconds. Every float field, here and in `Reconnect`
+    (``delay``, ``max_delay``, ``backoff`` and ``stable_after``), takes a
+    number, stored as a float: a ``str`` or ``bytes`` (``"5"``, ``b"5"``) is
+    refused, also as a JSON string. Counts and sizes, here and in
+    `Reconnect`, take only an int: a float (even ``8192.0``), a ``str`` or
+    ``bytes`` is refused, also from JSON. Both hold unless a caller passes
+    ``strict=False`` to ``model_validate`` or ``model_validate_json``, which
+    pydantic lets override them; buffer and window sizes are ``>= 1`` (design
+    D-15).
     Validation errors are pydantic ``ValidationError``s, which are
     ``ValueError``s; a bare ``str`` or another non-sequence for ``logcat_args``
     raises ``TypeError``. ``model_copy(update=...)`` (and ``copy.replace`` on
@@ -399,11 +405,15 @@ class StreamConfig(
     serial: str | None = None
     logcat_args: tuple[str, ...] = ()
     since: Literal["backlog", "now"] | AwareDatetime = "backlog"
-    read_timeout: PositiveFloat | None = None
-    connect_timeout: PositiveFloat = 10.0
-    stall_timeout: PositiveFloat | None = 1.0
+    # Every float field here and in Reconnect is a StrictFloat (design A.23):
+    # pydantic's lax mode would read "5" or b"5" as 5.0. An int, a Decimal or
+    # a Fraction is still taken and stored as a float. gt=0 and ge=0 keep
+    # PositiveFloat's and NonNegativeFloat's bounds and messages.
+    read_timeout: StrictFloat | None = Field(None, gt=0)
+    connect_timeout: StrictFloat = Field(10.0, gt=0)
+    stall_timeout: StrictFloat | None = Field(1.0, gt=0)
     reconnect: Reconnect | None = None
-    resume_overlap: PositiveFloat = 2.0
+    resume_overlap: StrictFloat = Field(2.0, gt=0)
     # Every int field here and Reconnect.max_attempts is a StrictInt, like
     # read_file(max_line_bytes=) (design A.19): pydantic's lax mode would read
     # 8192.0, "8192" or b"8192" as 8192. gt=0 keeps PositiveInt's bound and
@@ -413,10 +423,10 @@ class StreamConfig(
     buffer_entries: StrictInt = Field(10_000, gt=0)
     buffer_bytes: StrictInt = Field(16 * 1024 * 1024, gt=0)
     max_line_bytes: StrictInt = Field(DEFAULT_MAX_LINE_BYTES, ge=MIN_MAX_LINE_BYTES)
-    stop_grace: PositiveFloat = 2.0
-    exit_drain: PositiveFloat = 2.0
-    close_timeout: PositiveFloat = 5.0
-    package_hold: NonNegativeFloat = 2.0
+    stop_grace: StrictFloat = Field(2.0, gt=0)
+    exit_drain: StrictFloat = Field(2.0, gt=0)
+    close_timeout: StrictFloat = Field(5.0, gt=0)
+    package_hold: StrictFloat = Field(2.0, ge=0)
     stderr_tail: StrictInt = Field(20, ge=0)
 
     @field_validator("*", mode="before")

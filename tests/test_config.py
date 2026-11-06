@@ -71,6 +71,11 @@ STREAM_FLOATS = [
     "package_hold",
 ]
 RECONNECT_FLOATS = ["delay", "max_delay", "backoff", "stable_after"]
+# Every float field (a duration, or Reconnect.backoff), with its model.
+FLOAT_FIELDS: dict[str, type[StreamConfig] | type[Reconnect]] = {
+    **dict.fromkeys(STREAM_FLOATS, StreamConfig),
+    **dict.fromkeys(RECONNECT_FLOATS, Reconnect),
+}
 # Every int field, with its model and an int it accepts.
 INT_FIELDS: dict[str, tuple[type[StreamConfig] | type[Reconnect], int]] = {
     "resume_window_lines": (StreamConfig, 8192),
@@ -120,7 +125,11 @@ def _errors(make: Callable[[], object]) -> list[tuple[object, str]]:
 
 
 def _leaf_types(annotation: object) -> set[object]:
-    """Return the types ``annotation`` names, through aliases, Annotated and unions."""
+    """Return the types ``annotation`` names, through aliases, Annotated and unions.
+
+    A container is a leaf: ``tuple[PositiveFloat, ...]`` yields the alias
+    itself, so the int and float guards do not find a number inside one.
+    """
     if isinstance(annotation, TypeAliasType):
         return _leaf_types(annotation.__value__)
     if isinstance(annotation, NewType):
@@ -140,6 +149,19 @@ def _int_fields() -> list[tuple[type[StreamConfig] | type[Reconnect], str]]:
         for name, info in model.model_fields.items()
         if any(
             isinstance(leaf, type) and issubclass(leaf, int) and leaf is not bool
+            for leaf in _leaf_types(info.annotation)
+        )
+    ]
+
+
+def _float_fields() -> list[tuple[type[StreamConfig] | type[Reconnect], str]]:
+    """Return every field of both models whose annotation names float or a subclass."""
+    return [
+        (model, name)
+        for model in (StreamConfig, Reconnect)
+        for name, info in model.model_fields.items()
+        if any(
+            isinstance(leaf, type) and issubclass(leaf, float)
             for leaf in _leaf_types(info.annotation)
         )
     ]
@@ -325,7 +347,9 @@ def test_max_line_bytes_has_a_floor_of_4096() -> None:
 
 
 @pytest.mark.parametrize("field", INT_FIELDS)
-@pytest.mark.parametrize("kind", ["float", "str", "bytes", "bool"])
+@pytest.mark.parametrize(
+    "kind", ["float", "str", "bytes", "decimal", "fraction", "bool"]
+)
 def test_int_fields_take_only_an_int(field: str, kind: str) -> None:
     """Like read_file(max_line_bytes=) (design A.19): no lax coercion to an int."""
     model, value = INT_FIELDS[field]
@@ -333,6 +357,8 @@ def test_int_fields_take_only_an_int(field: str, kind: str) -> None:
         "float": float(value),
         "str": str(value),
         "bytes": str(value).encode(),
+        "decimal": Decimal(value),
+        "fraction": Fraction(value),
         "bool": True,
     }[kind]
     # A bool is refused by _refuse_bool, which runs before the int check.
@@ -419,6 +445,109 @@ def test_float_fields_reject_inf_and_nan(
     make: Callable[..., object], field: str, value: float
 ) -> None:
     _rejects(lambda: make(**{field: value}), field)
+
+
+@pytest.mark.parametrize("field", FLOAT_FIELDS)
+@pytest.mark.parametrize("kind", ["str", "bytes"])
+def test_float_fields_refuse_text(field: str, kind: str) -> None:
+    """A duration is a number of seconds: no lax parsing of "5" or b"5" (A.23)."""
+    model = FLOAT_FIELDS[field]
+    raw = {"str": "5", "bytes": b"5"}[kind]
+    assert _errors(lambda: model.model_validate({field: raw})) == [
+        ((field,), "float_type")
+    ]
+    assert _errors(lambda: model().model_copy(update={field: raw})) == [
+        ((field,), "float_type")
+    ]
+    if sys.version_info >= (3, 13):
+        assert _errors(lambda: copy.replace(model(), **{field: raw})) == [
+            ((field,), "float_type")
+        ]
+
+
+@pytest.mark.parametrize("field", FLOAT_FIELDS)
+@pytest.mark.parametrize(
+    "value",
+    [5, 5.5, Decimal("5.5"), Fraction(11, 2)],
+    ids=["int", "float", "decimal", "fraction"],
+)
+def test_float_fields_take_an_int_or_a_float(
+    field: str, value: float | Decimal | Fraction
+) -> None:
+    """A Decimal or a Fraction is taken too; each is stored as a plain float."""
+    model = FLOAT_FIELDS[field]
+    taken = getattr(model.model_validate({field: value}), field)
+    assert taken == value
+    assert type(taken) is float
+    assert getattr(model().model_copy(update={field: value}), field) == value
+
+
+@pytest.mark.parametrize("field", FLOAT_FIELDS)
+@pytest.mark.parametrize("value", [5, 5.5], ids=["int", "float"])
+def test_float_fields_take_only_a_json_number(field: str, value: float) -> None:
+    model = FLOAT_FIELDS[field]
+    refused = json.dumps({field: str(value)})
+    assert _errors(lambda: model.model_validate_json(refused)) == [
+        ((field,), "float_type")
+    ]
+    accepted = json.dumps({field: value})
+    assert getattr(model.model_validate_json(accepted), field) == value
+
+
+def test_float_fields_are_the_listed_ones() -> None:
+    assert {name: model for model, name in _float_fields()} == FLOAT_FIELDS
+
+
+@pytest.mark.parametrize(
+    ("model", "field"), [pytest.param(*pair, id=pair[1]) for pair in _float_fields()]
+)
+@pytest.mark.parametrize("raw", ["5", b"5"], ids=["str", "bytes"])
+def test_every_float_field_is_strict(
+    model: type[StreamConfig] | type[Reconnect], field: str, raw: object
+) -> None:
+    """A guard for float fields added later: the annotation alone finds them."""
+    assert _errors(lambda: model.model_validate({field: raw})) == [
+        ((field,), "float_type")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("model", "field", "raw", "taken"),
+    [
+        pytest.param(model, field, "5", 5.0, id=field)
+        for field, model in FLOAT_FIELDS.items()
+    ]
+    + [
+        pytest.param(model, field, str(value), value, id=field)
+        for field, (model, value) in INT_FIELDS.items()
+    ],
+)
+def test_number_fields_follow_a_callers_strict_false(
+    model: type[StreamConfig] | type[Reconnect], field: str, raw: str, taken: float
+) -> None:
+    """A caller's explicit strict=False keeps pydantic's lax meaning (A.23)."""
+    assert getattr(model.model_validate({field: raw}, strict=False), field) == taken
+    lax_bytes = model.model_validate({field: raw.encode()}, strict=False)
+    assert getattr(lax_bytes, field) == taken
+    lax_json = model.model_validate_json(json.dumps({field: raw}), strict=False)
+    assert getattr(lax_json, field) == taken
+
+
+@pytest.mark.parametrize(
+    ("field", "raw", "error"),
+    [pytest.param(field, "5", "float_type", id=field) for field in RECONNECT_FLOATS]
+    + [pytest.param("max_attempts", "3", "int_type", id="max_attempts")],
+)
+def test_a_nested_reconnect_mapping_is_as_strict(
+    field: str, raw: str, error: str
+) -> None:
+    """The error names the nested field, also through model_copy and JSON."""
+    nested = {"reconnect": {field: raw}}
+    errors = [(("reconnect", field), error)]
+    assert _errors(lambda: StreamConfig.model_validate(nested)) == errors
+    assert _errors(lambda: StreamConfig().model_copy(update=nested)) == errors
+    raw_json = json.dumps(nested)
+    assert _errors(lambda: StreamConfig.model_validate_json(raw_json)) == errors
 
 
 @pytest.mark.parametrize(
