@@ -51,6 +51,7 @@ from tests.core.harness import (
     LOOKUP_OK,
     MARKER_FAILED,
     MARKER_OK,
+    STAMP,
     STATE_DEVICE,
     STATE_OFFLINE,
     Harness,
@@ -522,6 +523,15 @@ TERMINAL = frozenset({S.STOPPED, S.KILLED, S.FAILED})
 # app's, APP's on a secondary user, system uids), and a lookup that names
 # another uid for APP (an install during the capture).
 _UIDS: tuple[int | str, ...] = (APP_UID, APP_UID, 10_070, 1_010_065, 1000, "root")
+# Line times: STAMP mostly, a microsecond later, a second later, 3 s earlier.
+_STAMPS = (
+    STAMP,
+    STAMP,
+    STAMP,
+    STAMP.replace(".661446", ".661447"),
+    STAMP.replace(":16.", ":17."),
+    STAMP.replace(":16.", ":13."),
+)
 OTHER_LOOKUP = lookup(10_070)
 # The other watched packages of some runs, so that re-lookups of several
 # packages take turns (X-3) and packages share a uid; a lookup answers one of
@@ -604,6 +614,7 @@ class RandomDriver:
                 ),
             )
         self.queue: list[bytes] = []  # stdout bytes read but not yet handed over
+        self.stamps = random.Random(seed + 100_000)  # noqa: S311  (a test)
         self.queue_of: int | None = None
         self.harness = Harness.make(
             where=where,
@@ -1013,7 +1024,12 @@ class RandomDriver:
             return line("boom")
         tag = rng.choice(["App", "App", "Other"])
         uid = rng.choice(_UIDS)
-        return line(f"m{rng.randint(0, 99)}", tag=tag, pid=rng.choice([1, 2]), uid=uid)
+        text = f"m{rng.randint(0, 99)}"
+        # Times around STAMP from a generator of their own, so the other
+        # choices stay as they were: replays, lines below a resume's request
+        # and lines past its position (design 5.6).
+        when = self.stamps.choice(_STAMPS)
+        return line(text, tag=tag, pid=rng.choice([1, 2]), uid=uid, stamp=when)
 
     def close_pipe(self) -> None:
         conn = self.harness.core._conn

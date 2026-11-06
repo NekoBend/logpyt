@@ -124,7 +124,8 @@ def test_a_blocked_consumer_holds_adb_back(driver: Driver, fake_adb: FakeAdb) ->
 
     adb writes about 3 MB, more than the outbox, the data inbox (16 reads)
     and the pipe hold together, then touches ``sent``; a stream that kept
-    reading would let it get there.
+    reading would let it get there. The stall rule is off: this is pure
+    backpressure, with no stall kill within ``HELD_BACK_FOR``.
     """
     buffer, count = 10, 3000
     template = logcat_line("x" * 1000 + "{i}")
@@ -138,7 +139,9 @@ def test_a_blocked_consumer_holds_adb_back(driver: Driver, fake_adb: FakeAdb) ->
         busy.set()
         release.wait(TIMEOUT)
 
-    stream = driver.open(config(buffer_entries=buffer), on_item=on_item)
+    stream = driver.open(
+        config(buffer_entries=buffer, stall_timeout=None), on_item=on_item
+    )
     driver.start(stream)
     held_back = False
     try:
@@ -155,5 +158,6 @@ def test_a_blocked_consumer_holds_adb_back(driver: Driver, fake_adb: FakeAdb) ->
 
     assert held_back, f"adb wrote everything; the stream read {stream.stats.lines}"
     assert read_while_blocked <= buffer + READ_SIZE // line_bytes + 1
+    assert stream.stats.stall_resumes == 0
     assert stream.state is S.KILLED
     assert fake_adb.survivors() == []

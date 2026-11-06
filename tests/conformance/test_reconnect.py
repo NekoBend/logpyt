@@ -1,8 +1,8 @@
 """Reconnect conformance: the core's reconnect decision, carried out by the driver.
 
 Design 3.2, 5.6, 5.7 and the F4-2 row of the coverage matrix, for every driver
-(see ``conftest.py``). Until PR-14 a reconnect replays from the first
-position (design A.20); these fakes give each connection its own lines.
+(see ``conftest.py``). These fakes give each connection its own lines, so no
+reconnect here replays one (resume: ``test_resume.py``).
 """
 
 from __future__ import annotations

@@ -6,13 +6,24 @@ The child side and the config format are described in ``tests/fake_adb.py``.
     Patches ``subprocess.Popen`` and ``asyncio.create_subprocess_exec`` so
     that a spawn of ``fake.path`` runs ``tests/fake_adb.py`` instead, and
     patches ``resolve_adb`` to return ``fake.path``. Configure behavior with
-    ``logcat()`` / ``pidof()`` / ``dumpsys()`` / ``date()`` /
+    ``logcat()`` / ``pidof()`` / ``dumpsys()`` / ``date()`` / ``log()`` /
     ``get_state()`` / ``device_absent()`` / ``command()``, observe it with
     ``calls()``, ``wait_for()`` and ``release()``. Every stream connection
     reads the device clock first (``adb shell date +%s``), which the fake
     answers with the host clock unless ``date()`` scripts it. Outside pytest,
     ``install_fake_adb()`` sets up the same interception
     (``bench/stream_bench.py`` uses it).
+
+Simulated device (design 5.6, PR-14)
+    ``device()`` turns on a device log: a ring that ``adb logcat`` streams
+    honoring ``-T`` (`stream`), a clock that ``shell date`` answers and the
+    test sets or steps back (``device_clock()``, ``step_clock()``), and
+    ``shell log`` echoed into the running logcat. ``device_log()`` appends
+    lines as an app would; a ring that overwrites the entry a stalled reader
+    would read next ends that reader with EOF and status 1 (design A.6).
+    ``device_expire()`` prunes entries as logd's chatty rule does, with an
+    ``expire N lines`` notice in their place (``expire_notice()``).
+    ``tests/fake_adb.py`` describes the model.
 
 Child registry
     Every fake adb child is registered, with its ``subprocess.Popen`` or
@@ -46,7 +57,9 @@ Hang watchdog (autouse)
     deadlocks dumps every thread's traceback to the real stderr and ends
     pytest with exit status 1 instead of hanging CI. The limit is
     ``WATCHDOG_DEFAULT_LIMIT`` seconds; the ``LOGPYT_TEST_WATCHDOG`` environment
-    variable overrides it, and ``0`` disables it (for a debugger session).
+    variable overrides it, and ``0`` disables it (for a debugger session). A
+    test meant to run longer (the soak, the device gates) carries its own
+    limit as ``@pytest.mark.watchdog(seconds)``.
 """
 
 from __future__ import annotations
@@ -69,7 +82,15 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from tests.fake_adb import split_command
+from tests.fake_adb import (
+    DeviceLog,
+    append_device_log,
+    device_line,
+    device_now,
+    expire_device_entries,
+    set_device_clock,
+    split_command,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
@@ -141,6 +162,31 @@ def touch(name: str) -> Step:
     return {"touch": name}
 
 
+def clock() -> Step:
+    """Print the device clock as ``adb shell date +%s`` does, read when the step
+    runs (after a ``wait``, the clock a test set meanwhile)."""
+    return {"clock": {}}
+
+
+def stream(
+    *, until: str | None = None, lines: int | None = None, ready: str | None = None
+) -> Step:
+    """Print the simulated device's ring as ``adb logcat`` would (``-T`` honored).
+
+    It follows new entries until ``release(until)`` or until it printed
+    ``lines`` entries, then the run goes on; it touches ``ready`` once the
+    entries the ring held at its start are written. Needs ``FakeAdb.device``.
+    """
+    spec: dict[str, Any] = {}
+    if until is not None:
+        spec["until"] = until
+    if lines is not None:
+        spec["lines"] = lines
+    if ready is not None:
+        spec["ready"] = ready
+    return {"stream": spec}
+
+
 def hold_stdout(until: str, then: str = "") -> Step:
     """Start a grandchild that holds adb's stdout until ``release(until)``.
 
@@ -202,6 +248,15 @@ def logcat_line(
     """
     thread = pid if tid is None else tid
     return f"{stamp} {uid!s:>5} {pid:5d} {thread:5d} {level} {tag}: {message}\n"
+
+
+def expire_notice(lines: int, *, uid: int = 10065) -> str:
+    """The message of logd's chatty pruning notice (tag ``chatty``; API 24).
+
+    The text of FINDINGS.md check 6 (``tests/device_facts.py`` CHATTY):
+    ``uid=<uid> expire <N> line(s)``.
+    """
+    return f"uid={uid} expire {lines} line{'' if lines == 1 else 's'}"
 
 
 def device_date(seconds: int) -> str:
@@ -441,7 +496,7 @@ class SpawnGate:
             await asyncio.sleep(_POLL)
 
 
-class FakeAdb:
+class FakeAdb:  # noqa: PLR0904  (one method per scripted command or device action)
     """Handle returned by the ``fake_adb`` fixture (see the module docstring).
 
     Pass ``fake.path`` as ``adb_path`` (``resolve_adb`` is also patched to
@@ -498,6 +553,108 @@ class FakeAdb:
         """
         self._config["date"] = list(runs)
         self._write_config()
+
+    def log(self, *runs: Run) -> None:
+        """Set the runs for successive ``adb shell log ...`` calls (the markers).
+
+        Unscripted, ``shell log`` falls back to the ``shell`` and ``default``
+        runs, or with ``device()`` writes its entry into the device log.
+        """
+        self._config["log"] = list(runs)
+        self._write_config()
+
+    # -- the simulated device --------------------------------------------------
+
+    def device(
+        self, *, ring: int = 10_000, overrun: str = "eof", log_space: bool = False
+    ) -> None:
+        """Simulate a device log (``tests/fake_adb.py``, "Device").
+
+        Args:
+            ring: How many entries the ring holds; older ones are overwritten.
+            overrun: What a reader gets when the ring overwrote its next entry:
+                ``"eof"`` (API 24 and 36: EOF, status 1, design A.6) or
+                ``"skip"`` (nougat's source: a silent skip).
+            log_space: ``shell log`` appends a space to the message (API 24).
+
+        """
+        if overrun not in {"eof", "skip"}:
+            msg = f"overrun is 'eof' or 'skip', not {overrun!r}"
+            raise ValueError(msg)
+        self._config["device"] = {
+            "ring": ring,
+            "overrun": overrun,
+            "log_space": log_space,
+        }
+        self._write_config()
+
+    def device_log(
+        self,
+        *messages: str,
+        tag: str = "Tag",
+        level: str = "I",
+        uid: int | str = 10065,
+        pid: int = 1234,
+        tid: int | None = None,
+        at: int | None = None,
+    ) -> list[str]:
+        """Log ``messages`` on the device, in order; return their lines.
+
+        Each line takes the device clock as it is logged, or ``at`` (epoch
+        microseconds) for all of them: equal timestamps, as a burst within one
+        microsecond has.
+        """
+        entries: list[tuple[int, str]] = []
+        base = device_now(self.state) if at is None else at
+        started = time.perf_counter_ns()
+        for message in messages:
+            micros = base
+            if at is None:  # the device clock runs on while it logs
+                micros += (time.perf_counter_ns() - started) // 1000
+            text = device_line(
+                micros, message, tag=tag, level=level, uid=uid, pid=pid, tid=tid
+            )
+            entries.append((micros, text))
+        append_device_log(self.state, entries)
+        return [text for _, text in entries]
+
+    def device_entries(self) -> list[tuple[int, str]]:
+        """The device log so far, ``(epoch microseconds, line)`` in arrival order."""
+        log = DeviceLog(self.state)
+        try:
+            return [(micros, text.decode()) for _, micros, text in log.poll()]
+        finally:
+            log.close()
+
+    def device_expire(
+        self, first: int, count: int = 1, *, uid: int = 10065, pid: int = 1234
+    ) -> str:
+        """Prune entries as logd's chatty rule does; return the notice line.
+
+        The ``count`` entries from arrival index ``first`` (as
+        ``device_entries()`` lists them) leave the log, and a ``chatty``
+        notice ``uid=<uid> expire <count> line(s)`` takes their place with
+        the timestamp of the newest of them (FINDINGS.md check 6). Call it
+        only while no ``adb logcat`` streams: it rewrites the log.
+        """
+
+        def notice(micros: int) -> str:
+            text = expire_notice(count, uid=uid)
+            return device_line(micros, text, tag="chatty", uid=uid, pid=pid)
+
+        return expire_device_entries(self.state, first, count, notice)
+
+    def device_now(self) -> int:
+        """The device clock, epoch microseconds."""
+        return device_now(self.state)
+
+    def device_clock(self, micros: int) -> None:
+        """Set the device clock to ``micros`` now; it runs on with the host clock."""
+        set_device_clock(self.state, micros)
+
+    def step_clock(self, seconds: float) -> None:
+        """Step the device clock by ``seconds`` (negative: back, as an NTP sync)."""
+        set_device_clock(self.state, device_now(self.state) + round(seconds * 1e6))
 
     def get_state(self, *runs: Run) -> None:
         """Set the runs for successive ``adb get-state`` calls.
@@ -592,6 +749,21 @@ class FakeAdb:
     def live_children(self, command: str | None = None) -> list[SpawnedChild]:
         """The children (optionally of ``command``) that have not exited yet."""
         return [c for c in self.children(command) if c.alive()]
+
+    def forget_exited(self) -> int:
+        """Drop the children that have exited from the registry; return how many.
+
+        For a run that spawns thousands of children (the soak, design 9.1),
+        whose memory the registry's Popen objects would otherwise grow:
+        ``children()`` then lists only the children kept, and ``close()``
+        still reaps every live one.
+        """
+        with self._lock:
+            spawned = list(self._children)
+        gone = {id(c) for c in spawned if not c.alive()}
+        with self._lock:
+            self._children = [c for c in self._children if id(c) not in gone]
+        return len(gone)
 
     def survivors(
         self, timeout: float = 5.0, command: str | None = None
@@ -809,6 +981,17 @@ def pytest_configure(config: pytest.Config) -> None:
     config.stash[_watchdog_limit] = _parse_watchdog_limit()
     with contextlib.suppress(AttributeError, OSError, ValueError):
         config.stash[_watchdog_fd] = os.dup(sys.stderr.fileno())
+    config.addinivalue_line(
+        "markers",
+        "watchdog(seconds): this test's hang-watchdog limit, for a test meant to "
+        f"run longer than the default (the soak, device gates); {WATCHDOG_ENV}=0 "
+        "still turns the watchdog off",
+    )
+    config.addinivalue_line(
+        "markers",
+        "soak: the hours-long monitoring soak (design 9.1); runs only when selected "
+        "with -m, for example -m soak",
+    )
 
 
 def pytest_unconfigure(config: pytest.Config) -> None:
@@ -826,9 +1009,14 @@ def _hang_watchdog(request: pytest.FixtureRequest) -> Iterator[None]:
 
     Autouse fixtures are set up first and torn down last, so the limit also
     covers the other fixtures' setup and teardown (the fake_adb finalizer).
+    A ``watchdog(seconds)`` marker replaces the limit for its test (the soak
+    and the device gates run for minutes or hours by design).
     """
     limit = request.config.stash.get(_watchdog_limit, WATCHDOG_DEFAULT_LIMIT)
     fd = request.config.stash.get(_watchdog_fd, None)
+    marker = request.node.get_closest_marker("watchdog")
+    if marker is not None and limit > 0:
+        limit = float(marker.args[0])
     if limit <= 0 or fd is None:
         yield
         return

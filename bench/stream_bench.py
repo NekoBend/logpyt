@@ -235,14 +235,11 @@ class SyncDriver:
         def on_entry(_entry: LogEntry) -> None:
             probe.hit()
 
-        if lossless:
-            # 3.0 never drops an entry (backpressure), but until PR-14 a stall
-            # resume replays from the first position (design A.20) and would
-            # count lines twice, so the lossless case turns it off.
-            config = StreamConfig(adb_path=adb_path, stall_timeout=None)
-        else:
-            config = StreamConfig(adb_path=adb_path)
-        return LogStream(config, on_item=on_entry)
+        # 3.0's defaults are lossless: backpressure never drops an entry, and
+        # a stall resume drops its replay (design 5.6), so the window's cost
+        # per line is measured too.
+        del lossless
+        return LogStream(StreamConfig(adb_path=adb_path), on_item=on_entry)
 
 
 class AsyncDriver:
@@ -289,13 +286,8 @@ class AsyncDriver:
         def on_entry(_entry: LogEntry) -> None:
             probe.hit()
 
-        if lossless:
-            # Same as the sync driver: until PR-14 a stall resume replays from
-            # the first position (design A.20).
-            config = StreamConfig(adb_path=adb_path, stall_timeout=None)
-        else:
-            config = StreamConfig(adb_path=adb_path)
-        return AsyncLogStream(config, on_item=on_entry)
+        del lossless  # lossless by default, as for the sync driver
+        return AsyncLogStream(StreamConfig(adb_path=adb_path), on_item=on_entry)
 
 
 DRIVERS: dict[str, Driver] = {"sync": SyncDriver(), "async": AsyncDriver()}

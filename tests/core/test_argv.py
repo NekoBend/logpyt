@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 
 import pytest
 
 from logpyt._core.argv import WIRE_FORMAT, epoch_position, format_position, logcat_argv
+from logpyt._core.protocol import Spawn
 from tests.core.harness import ADB, CLOCK, CLOCK_OK, MARKER_OK, Harness, config
+from tests.core.scenarios import RandomDriver
+
+if TYPE_CHECKING:
+    from logpyt._core.protocol import Command
 
 _ZONE_WORDS = {"zone", "UTC", "GMT"}
 
@@ -89,6 +96,25 @@ def test_core_positions_have_a_fraction() -> None:
     argv = harness.spawns[1].argv
 
     assert argv[argv.index("-T") + 1] == f"{CLOCK - 1}.000000"
+
+
+def test_random_runs_emit_every_T_with_a_fraction() -> None:  # noqa: N802
+    """Every -T the core emits, resumes and re-anchors included (design 5.6)."""
+    values = [
+        command.argv[command.argv.index("-T") + 1]
+        for seed in range(200)
+        for command in _run(seed)
+        if isinstance(command, Spawn) and "-T" in command.argv
+    ]
+
+    assert len(values) > 100
+    assert all(re.fullmatch(r"\d+\.\d{6}", value) for value in values), values
+
+
+def _run(seed: int) -> list[Command]:
+    driver = RandomDriver(seed)
+    driver.run(steps=250)
+    return driver.harness.commands
 
 
 def test_position_checks() -> None:

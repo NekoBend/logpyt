@@ -25,10 +25,11 @@ timeout, and a pull ``next()`` or a with-block exit by `_bounded`, which kills
 the stream when the call has not returned within `TIMEOUT`, so a hang fails
 the test instead of waiting for the hang watchdog.
 
-Until PR-14 a reconnect and a stall resume replay from the first position
-(design A.20), so `config` turns the stall resume off unless a test asks for
-it. The fake adb answers the clock read that precedes every connection with
-the host clock (``tests/conftest.py``).
+The stall resume runs with its default (``stall_timeout=1.0``): since PR-14
+a resumed connection drops its replay (design 5.6), also the scripted fake
+adb's, which replays a run from its start whatever ``-T`` says. The fake adb
+answers the clock read that precedes every connection with the host clock
+(``tests/conftest.py``).
 """
 
 from __future__ import annotations
@@ -63,8 +64,7 @@ TIMEOUT = 10.0
 
 
 def config(**fields: Any) -> StreamConfig:  # noqa: ANN401
-    """A `StreamConfig` for these tests: no stall resume unless asked (A.20)."""
-    fields.setdefault("stall_timeout", None)
+    """A `StreamConfig` for these tests (the defaults, stall resume included)."""
     return StreamConfig(**fields)
 
 

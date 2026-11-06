@@ -58,9 +58,7 @@ _real = adb._async_spawn_adb
 PYTHON, PORT = sys.argv[1], sys.argv[2]
 SPAWNED = []
 KEEP = []  # the streams stay referenced: only an exit finalizer ends their runs
-CONFIG = StreamConfig(
-    adb_path="adb", stall_timeout=None, reconnect=Reconnect(delay=0.05)
-)
+CONFIG = StreamConfig(adb_path="adb", reconnect=Reconnect(delay=0.05))
 
 
 async def spawn(argv):
@@ -371,7 +369,7 @@ def test_exit_logs_an_unseen_failed_outcome() -> None:
 
 
     async def main():
-        stream = AsyncLogStream(StreamConfig(adb_path="adb", stall_timeout=None))
+        stream = AsyncLogStream(StreamConfig(adb_path="adb"))
         KEEP.append(stream)
         stream.start()
         for _ in range(1000):
