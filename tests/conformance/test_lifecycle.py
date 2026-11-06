@@ -493,7 +493,11 @@ def test_body_exception_carries_the_failed_outcome(
     assert logged[0].exc_info[1] is outcome
 
 
-@pytest.mark.parametrize("kind", ["error", "exit"])
+class _Bug(BaseException):
+    """A BaseException that is neither an Exception nor an interrupt."""
+
+
+@pytest.mark.parametrize("kind", ["error", "base", "exit"])
 def test_engine_crash_raises_from_every_wait(
     driver: Driver,
     fake_adb: FakeAdb,
@@ -504,19 +508,31 @@ def test_engine_crash_raises_from_every_wait(
     """A logpyt bug that escapes the core ends the run visibly: join() raises
     that same exception every time, so does assert_complete(), the engine
     logs it at ERROR, and no adb is left once join() returned (it is killed
-    and reaped first). ``exit``: a BaseException (here SystemExit) that is
-    not an Exception, which the engine catches too.
+    and reaped first). ``base``: a BaseException that is not an Exception,
+    which the engine catches too. ``exit``: SystemExit, which the thread
+    driver's engine takes for a crash too (design A.23); the async driver
+    ends the run with it as with Ctrl+C, and it leaves the event loop
+    (design A.24, ``test_async.py::test_interrupt_in_a_task_leaves_the_loop``).
 
     No driver invents a state (design 5.2): ``state`` stays the last one the
     core published, here CONNECTING, since the crash comes with the first
     output. ``stats`` names the reason ``failed`` (design 4.4: a fixture that
     checks only ``stats.complete`` saves the log of a failed capture).
     """
+    if kind == "exit" and driver.name == "async":
+        pytest.skip(
+            "a SystemExit in the async engine is an interrupt that leaves the "
+            "loop (design A.24): test_async.py::"
+            "test_interrupt_in_a_task_leaves_the_loop[exit-engine]"
+        )
     caplog.set_level(logging.ERROR, logger="logpyt.stream")
     fake_adb.logcat(run(out(logcat_line("a")), wait("never")))
-    error: BaseException = (
-        RuntimeError("a core bug") if kind == "error" else SystemExit(7)
-    )
+    errors: dict[str, BaseException] = {
+        "error": RuntimeError("a core bug"),
+        "base": _Bug("a core bug"),
+        "exit": SystemExit(7),
+    }
+    error = errors[kind]
     real = StreamCore.handle
 
     def handle(core: StreamCore, event: Event, now: float) -> list[Command]:

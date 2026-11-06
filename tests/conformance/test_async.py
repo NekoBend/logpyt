@@ -13,11 +13,20 @@ what another task of the same loop sees:
   with a stream running, and the interpreter with a loop in a thread, in a
   child interpreter. Cancelled once the run finished, it keeps the outcome
   (G4). A stream dropped while its loop is stopped is killed (design 3.4).
-- Ctrl+C: a KeyboardInterrupt raised in any task of the run leaves the loop
-  at once and kills adb; one raised by on_event propagates from
-  ``__anext__()``.
+- Ctrl+C and ``sys.exit()``: a KeyboardInterrupt or SystemExit raised in a
+  task of the run, the push callbacks and ``where`` included, leaves the loop
+  at once, kills adb and ends the run with it; one raised by on_event in pull
+  mode propagates from ``__anext__()``. One in the engine still gets adb
+  reaped under ``asyncio.run``, and a crash it cut short keeps it as the
+  end of the run. One in the pipe readers of a one-shot command (adb's own
+  code) is not covered here.
 - F3-3: a task cancelled while it waits for a stopped run gets its
-  CancelledError, and the run's one-shot adb commands are still reaped.
+  CancelledError, and the run's one-shot adb commands are still reaped. A
+  cancellation of the with-block exit's own wait kills, and keeps the body's
+  exception as its ``__context__``.
+- F3-7: a task created inside a callback inherits its mark, so its waits
+  raise UsageError while the run lives, and return once it has ended; the
+  callback's own waits raise after the end too.
 - F2-7: kill() from an async on_item, on the loop or from a thread, stops
   delivery before it returns; a kill() from a thread racing a pop. stop()
   from on_item on the loop.
@@ -40,11 +49,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import gc
 import itertools
 import logging
 import sys
 import threading
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -60,6 +71,7 @@ from logpyt import (
     StateChange,
     Tag,
     UsageError,
+    Where,
     adb,
 )
 from logpyt._core.machine import StreamCore
@@ -190,8 +202,19 @@ def _close_loop(loop: asyncio.AbstractEventLoop) -> None:
     loop.close()
 
 
+def _interrupt(kind: str) -> KeyboardInterrupt | SystemExit:
+    """A new interrupt of ``kind``: ``ctrl_c`` (KeyboardInterrupt) or ``exit``
+    (the SystemExit of ``sys.exit(3)``, as a SIGTERM handler raises it).
+    """
+    return KeyboardInterrupt() if kind == "ctrl_c" else SystemExit(3)
+
+
+# The two interrupts that leave the loop (design A.24): Ctrl+C and sys.exit().
+INTERRUPTS = ("ctrl_c", "exit")
+
+
 def _interrupt_of(call: Callable[[], object]) -> BaseException | None:
-    """The KeyboardInterrupt ``call()`` raised, or None.
+    """The KeyboardInterrupt or SystemExit ``call()`` raised, or None.
 
     Its traceback is dropped: the frames of the loop it passed through would
     keep the task it came from alive, and with it asyncio's report of an
@@ -199,7 +222,7 @@ def _interrupt_of(call: Callable[[], object]) -> BaseException | None:
     """
     try:
         call()
-    except KeyboardInterrupt as exc:
+    except (KeyboardInterrupt, SystemExit) as exc:
         exc.__traceback__ = None
         return exc
     return None
@@ -572,19 +595,43 @@ async def test_cancelled_error_propagates_through_stop(
     assert survivors == []
 
 
+async def _in_except_clause(
+    work: Callable[[], Awaitable[None]], handled: BaseException | None
+) -> None:
+    """Await ``work()``; inside an ``except`` clause that handles ``handled``,
+    when it is given.
+    """
+    if handled is None:
+        await work()
+        return
+    try:
+        raise handled
+    except type(handled):
+        await work()
+
+
+@pytest.mark.parametrize("body", ["raised", "clean"])
 @pytest.mark.asyncio
-async def test_cancel_in_raised_exit_kills(fake_adb: FakeAdb) -> None:
-    """A task cancelled while its with-block exit waits after the body raised
-    an Exception (on_item is stuck, so the exit waits up to close_timeout)
-    kills the run before the cancellation propagates (design 3.4, A.23): the
-    state is KILLED right after, the stuck on_item is the last call (no item
-    is taken after the block), and the capture names the kill.
+async def test_cancel_in_exit_kills(fake_adb: FakeAdb, body: str) -> None:
+    """A task cancelled while its with-block exit waits kills the run before
+    the cancellation propagates (design 3.4, A.23): the state is KILLED right
+    after, the stuck on_item is the last call (no item is taken after the
+    block), and the capture names the kill. on_item is stuck, so the exit
+    waits: up to close_timeout after the body raised an Exception (raised),
+    or for the end of a stopped run (clean).
+
+    The CancelledError keeps as its ``__context__`` the exception the block
+    was handling, as with Ctrl+C in the thread driver's exit: the body's
+    exception (raised), or the one the ``except`` clause around a clean block
+    handles. asyncio throws the cancellation into the exit's wait, and the
+    exit awaits its kill before it re-raises, so Python does not chain it.
     """
     count = 50
     fake_adb.logcat(run(lines(count, logcat_line("m{i}")), wait("never")))
     busy = asyncio.Event()
     release = asyncio.Event()
     calls: list[str] = []
+    escaped: list[BaseException] = []
 
     async def on_item(entry: LogEntry) -> None:
         calls.append(entry.message)
@@ -592,14 +639,23 @@ async def test_cancel_in_raised_exit_kills(fake_adb: FakeAdb) -> None:
         await release.wait()
 
     stream = AsyncLogStream(config(close_timeout=TIMEOUT), on_item=on_item)
+    error = ValueError("the body failed")
+    handled = LookupError("around the block") if body == "clean" else None
 
-    async def body() -> None:
-        async with stream:
-            await busy.wait()
-            await async_wait_until(lambda: stream.stats.lines == count, timeout=TIMEOUT)
-            raise ValueError("the body failed")
+    async def block() -> None:
+        try:
+            async with stream:
+                await busy.wait()
+                await async_wait_until(
+                    lambda: stream.stats.lines == count, timeout=TIMEOUT
+                )
+                if body == "raised":
+                    raise error
+        except asyncio.CancelledError as exc:
+            escaped.append(exc)
+            raise
 
-    task = asyncio.create_task(body())
+    task = asyncio.create_task(_in_except_clause(block, handled))
     try:
         await _bounded(busy.wait(), "the first on_item")
         await async_wait_until(lambda: stream.state is S.STOPPING, timeout=TIMEOUT)
@@ -620,6 +676,8 @@ async def test_cancel_in_raised_exit_kills(fake_adb: FakeAdb) -> None:
     assert calls == ["m0"]
     assert "killed" in stream.stats.incomplete
     assert survivors == []
+    assert len(escaped) == 1
+    assert escaped[0].__context__ is (handled or error)
 
 
 # -- F2-7: kill() from on_item ----------------------------------------------------
@@ -858,47 +916,17 @@ async def test_callback_cancelled_error_is_callback_error(
     assert current.cancelling() == 0
 
 
+@pytest.mark.parametrize("kind", INTERRUPTS)
 @pytest.mark.asyncio
-async def test_on_item_system_exit_is_callback_error(fake_adb: FakeAdb) -> None:
-    """SystemExit from an async push callback fails the run with CallbackError,
-    which chains it, and the loop goes on: on the dispatcher any
-    BaseException but a cancellation and KeyboardInterrupt is a callback
-    failure, as in the thread driver (design A.23, F3-6).
-    """
-    fake_adb.logcat(run(lines(3, logcat_line("m{i}")), wait("never")))
-    leave = SystemExit(3)
-    calls: list[str] = []
-
-    async def on_item(entry: LogEntry) -> None:
-        calls.append(entry.message)
-        raise leave
-
-    stream = AsyncLogStream(config(), on_item=on_item)
-    stream.start()
-    try:
-        with pytest.raises(CallbackError) as info:
-            await _bounded(stream.join(), "join()")
-        survivors = await fake_adb.async_survivors(PROMPT)
-    finally:
-        await _end(stream)
-
-    assert info.value.stage == "on_item"
-    assert info.value.__cause__ is leave
-    assert calls == ["m0"]
-    assert stream.state is S.FAILED
-    assert survivors == []
-
-
-@pytest.mark.asyncio
-async def test_pull_on_event_interrupt_settles(fake_adb: FakeAdb) -> None:
-    """KeyboardInterrupt from on_event in pull mode propagates from
-    ``__anext__()`` (design A.23: only an Exception there is a callback
+async def test_pull_on_event_interrupt_settles(fake_adb: FakeAdb, kind: str) -> None:
+    """KeyboardInterrupt or SystemExit from on_event in pull mode propagates
+    from ``__anext__()`` (design A.23: only an Exception there is a callback
     failure), and the next ``__anext__()`` settles that event instead of
     handing it to on_event again, then returns the next item. The stopped
     run then ends STOPPED with nothing lost.
     """
     fake_adb.logcat(run(out(logcat_line("a")), wait("never")))
-    interrupt = KeyboardInterrupt()
+    interrupt = _interrupt(kind)
     seen: list[StreamState] = []
 
     def on_event(event: StreamEvent) -> None:
@@ -911,7 +939,7 @@ async def test_pull_on_event_interrupt_settles(fake_adb: FakeAdb) -> None:
     stream.start()
     try:
         iterator = aiter(stream)
-        with pytest.raises(KeyboardInterrupt) as info:
+        with pytest.raises(type(interrupt)) as info:
             await _bounded(_next(iterator), "the first __anext__()")
         entry = await _bounded(_next(iterator), "the next __anext__()")
         stream.stop()
@@ -927,40 +955,72 @@ async def test_pull_on_event_interrupt_settles(fake_adb: FakeAdb) -> None:
     assert stream.stats.complete
 
 
+@pytest.mark.parametrize("kind", INTERRUPTS)
 def test_on_item_interrupt_leaves_the_loop(
-    fake_adb: FakeAdb, caplog: pytest.LogCaptureFixture
+    fake_adb: FakeAdb, caplog: pytest.LogCaptureFixture, kind: str
 ) -> None:
-    """KeyboardInterrupt from an async push callback leaves ``asyncio.run``:
-    Ctrl+C on the loop's thread is not a callback failure in the async
-    driver. The loop's teardown ends the run, no adb is left, and asyncio
-    does not report the interrupt once more, as a task exception never
-    retrieved, when the dispatcher task is collected.
+    """KeyboardInterrupt or SystemExit from an async push callback leaves
+    ``asyncio.run``: Ctrl+C or ``sys.exit()`` on the loop's thread is not a
+    callback failure in the async driver (design A.24; the thread driver
+    keeps A.23's rule, a callback failure, because a thread would drop a
+    SystemExit). The run ends with it: join() raises it and the capture is
+    failed; no adb is left, and asyncio does not report the interrupt once
+    more, as a task exception never retrieved, when the dispatcher task is
+    collected.
     """
     caplog.set_level(logging.WARNING)
     fake_adb.logcat(run(lines(3, logcat_line("m{i}")), wait("never")))
-    interrupt = KeyboardInterrupt()
+    interrupt = _interrupt(kind)
+    calls: list[str] = []
 
     async def on_item(entry: LogEntry) -> None:
-        del entry
+        calls.append(entry.message)
         raise interrupt
 
+    stream = AsyncLogStream(config(), on_item=on_item)
+
     async def main() -> None:
-        async with AsyncLogStream(config(), on_item=on_item) as stream:
+        async with stream:
             await stream.join()
+
+    async def joined() -> BaseException | None:
+        try:
+            await stream.join()
+        except BaseException as exc:  # noqa: BLE001  (the test looks at it)
+            return exc
+        return None
 
     raised = _interrupt_of(lambda: asyncio.run(_bounded(main(), "the run")))
     gc.collect()  # a task whose exception nobody retrieved reports it now
+    error = asyncio.run(joined())
 
     assert raised is interrupt
+    assert error is interrupt
+    assert calls == ["m0"]
+    assert stream.stats.failed
     assert fake_adb.survivors(PROMPT) == []
     assert _errors(caplog) == []
 
 
+@dataclass(frozen=True, slots=True)
+class _UserCode:
+    """The user code of the stream in `test_interrupt_in_a_task_leaves_the_loop`."""
+
+    where: Where | None = None
+    on_item: Callable[[LogEntry], object] | None = None
+    on_event: Callable[[StreamEvent], object] | None = None
+
+
 def _interrupt_in(
-    where: str, monkeypatch: pytest.MonkeyPatch, interrupt: KeyboardInterrupt
-) -> None:
+    where: str, monkeypatch: pytest.MonkeyPatch, interrupt: BaseException
+) -> _UserCode:
     """Raise ``interrupt`` once in the task of the run that ``where`` names,
-    as Python raises Ctrl+C in whatever frame runs on the main thread.
+    as Python raises Ctrl+C (or a SIGTERM handler's ``sys.exit()``) in
+    whatever frame runs on the main thread; the user code the stream takes.
+
+    ``where``, ``on_item`` and ``on_event`` (on the dispatcher) raise it
+    themselves, in the engine and the dispatcher; the other cases patch the
+    task's code.
     """
     raised: list[bool] = []
 
@@ -969,6 +1029,25 @@ def _interrupt_in(
             raised.append(True)
             raise interrupt
 
+    def condition(entry: LogEntry) -> bool:
+        del entry
+        once()
+        return True
+
+    def on_item(entry: LogEntry) -> None:
+        del entry
+        once()
+
+    def on_event(event: StreamEvent) -> None:
+        if isinstance(event, StateChange) and event.new is S.RUNNING:
+            once()
+
+    if where == "where":
+        return _UserCode(where=Where(condition))
+    if where == "on_item":
+        return _UserCode(on_item=on_item)
+    if where == "on_event":
+        return _UserCode(on_item=lambda _: None, on_event=on_event)
     if where == "reader":
         real_put = async_stream._Run._put
 
@@ -1012,35 +1091,51 @@ def _interrupt_in(
             return real_handle(core, event, now)
 
         monkeypatch.setattr(StreamCore, "handle", handle)
+    return _UserCode()
 
 
-@pytest.mark.parametrize("where", ["reader", "exit", "spawn", "command", "engine"])
+@pytest.mark.parametrize(
+    "where",
+    ["reader", "exit", "spawn", "command", "engine", "where", "on_item", "on_event"],
+)
+@pytest.mark.parametrize("kind", INTERRUPTS)
 def test_interrupt_in_a_task_leaves_the_loop(
     fake_adb: FakeAdb,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    kind: str,
     where: str,
 ) -> None:
-    """A KeyboardInterrupt raised in a task of the run (Ctrl+C on the loop's
-    thread lands in whatever frame runs there) leaves the loop at once: in a
-    reader, an exit watcher, a spawn, a one-shot command (the clock read) or
-    the engine, as from the dispatcher.
+    """A KeyboardInterrupt or SystemExit raised in a task of the run (Ctrl+C
+    on the loop's thread, or a SIGTERM handler's ``sys.exit()``, lands in
+    whatever frame runs there) leaves the loop at once: in a reader, an exit
+    watcher, a spawn, a one-shot command (the clock read), the engine (the
+    core, or the user's ``where``) or the dispatcher (``on_item``, or
+    ``on_event`` in push mode).
 
-    It is no logpyt bug, so nothing is logged: neither 'the run is abandoned'
-    nor a task exception never retrieved. adb is killed before the loop
-    stops, every wait ends, nothing is respawned although reconnect is
-    configured, and the run ends as for a cancelled engine: join() raises
-    that interrupt, and the capture is not complete (design A.23). A worker
-    swallowed it and the program went on.
+    It is no logpyt bug and no callback failure, so nothing is logged:
+    neither 'the run is abandoned' nor a task exception never retrieved. adb
+    is killed before the loop stops, every wait ends, nothing is respawned
+    although reconnect is configured, and the run ends as for a cancelled
+    engine: join() raises that interrupt, and the capture is failed (design
+    A.23, A.24). A worker swallowed a KeyboardInterrupt and the program went
+    on; a SystemExit was logged as a crash, or failed the run with
+    CallbackError from a callback; one from the dispatcher only detached it,
+    and adb ran until the loop's teardown.
     """
     caplog.set_level(logging.WARNING)
-    interrupt = KeyboardInterrupt()
-    _interrupt_in(where, monkeypatch, interrupt)
+    interrupt = _interrupt(kind)
+    user = _interrupt_in(where, monkeypatch, interrupt)
     first = run(out(logcat_line("a")), exit_code=1)
     if where != "exit":
         first = run(out(logcat_line("a")), wait("never"))
     fake_adb.logcat(first, run(out(logcat_line("again")), wait("never")))
-    stream = AsyncLogStream(config(reconnect=Reconnect(delay=0.05, max_delay=0.05)))
+    stream = AsyncLogStream(
+        config(reconnect=Reconnect(delay=0.05, max_delay=0.05)),
+        where=user.where,
+        on_item=user.on_item,
+        on_event=user.on_event,
+    )
 
     async def main() -> None:
         stream.start()
@@ -1050,7 +1145,7 @@ def test_interrupt_in_a_task_leaves_the_loop(
     async def joined() -> BaseException | None:
         try:
             await stream.join()
-        except KeyboardInterrupt as exc:
+        except BaseException as exc:  # noqa: BLE001  (the test looks at it)
             return exc
         return None
 
@@ -1071,8 +1166,120 @@ def test_interrupt_in_a_task_leaves_the_loop(
     assert survivors == []
     assert len(fake_adb.calls("logcat")) == (0 if where in {"spawn", "command"} else 1)
     assert error is interrupt
+    assert stream.stats.failed
     assert not stream.stats.complete
     assert _errors(caplog) == []
+
+
+@pytest.mark.parametrize("where", ["engine", "where"])
+@pytest.mark.parametrize("kind", INTERRUPTS)
+def test_engine_interrupt_reaps_adb(
+    fake_adb: FakeAdb, monkeypatch: pytest.MonkeyPatch, kind: str, where: str
+) -> None:
+    """An interrupt in the engine (the core, or the user's ``where``) under
+    ``asyncio.run`` leaves the loop before the engine's end ran; that end is
+    under way already, so the loop's teardown, which cancels what is left,
+    runs it to its end: the killed logcat child is reaped before the loop
+    closes. Before, nothing awaited the child any more, and it stayed a
+    zombie with its pidfd and its transport open.
+
+    `SpawnedChild.alive` counts an exited child that nobody reaped as gone,
+    so this reads ``returncode``, which asyncio sets once it reaped it.
+    """
+    interrupt = _interrupt(kind)
+    user = _interrupt_in(where, monkeypatch, interrupt)
+    fake_adb.logcat(run(out(logcat_line("a")), wait("never")))
+    stream = AsyncLogStream(config(), where=user.where)
+
+    async def main() -> None:
+        async with stream:
+            await stream.join()
+
+    raised = _interrupt_of(lambda: asyncio.run(_bounded(main(), "the run")))
+    codes = [
+        None if child.process is None else child.process.returncode
+        for child in fake_adb.children("logcat")
+    ]
+
+    assert raised is interrupt
+    assert len(codes) == 1
+    assert None not in codes, "the killed logcat child was not reaped"
+    assert fake_adb.survivors(PROMPT) == []
+
+
+@pytest.mark.parametrize("kind", INTERRUPTS)
+def test_crash_keeps_an_earlier_end(
+    fake_adb: FakeAdb,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    """A push callback's interrupt while a crash (a logpyt bug in the core)
+    reaps adb ends the run first, and the crash's own end, once its reap is
+    over, keeps that end: join() raises the interrupt before and after the
+    reap, the same object every time (design 4, A.23). The bug is still
+    logged. Before, the crash replaced the interrupt once its reap was over,
+    and join() raised the bug from then on.
+    """
+    caplog.set_level(logging.WARNING)
+    fake_adb.logcat(
+        run(
+            out(logcat_line("m0")),
+            wait("more"),
+            out(logcat_line("m1")),
+            wait("never"),
+        )
+    )
+    interrupt = _interrupt(kind)
+    bug = RuntimeError("a bug in the core")
+    crashing = asyncio.Event()
+    real_handle = StreamCore.handle
+    real_crashed = async_stream._Run._crashed
+
+    def handle(core: StreamCore, event: Any, now: float) -> Any:  # noqa: ANN401
+        if isinstance(event, Data) and b"m1" in event.chunk:
+            raise bug
+        return real_handle(core, event, now)
+
+    async def crashed(run: Any, error: BaseException) -> None:  # noqa: ANN401
+        crashing.set()
+        await real_crashed(run, error)
+
+    async def on_item(entry: LogEntry) -> None:
+        del entry
+        fake_adb.release("more")
+        await crashing.wait()  # the crash has begun its reap
+        raise interrupt
+
+    monkeypatch.setattr(StreamCore, "handle", handle)
+    monkeypatch.setattr(async_stream._Run, "_crashed", crashed)
+    stream = AsyncLogStream(config(), on_item=on_item)
+
+    async def main() -> None:
+        stream.start()
+        await async_wait_until(lambda: stream._run.ended, timeout=TIMEOUT)
+
+    async def reaped() -> None:
+        await async_wait_until(lambda: not _run_tasks(), timeout=TIMEOUT)
+
+    loop = asyncio.new_event_loop()
+    try:
+        raised = _interrupt_of(lambda: loop.run_until_complete(main()))
+        before = loop.run_until_complete(_join_error(stream))
+        loop.run_until_complete(reaped())
+        after = loop.run_until_complete(_join_error(stream))
+        survivors = fake_adb.survivors(PROMPT)
+    finally:
+        _close_loop(loop)
+
+    assert raised is interrupt
+    assert before is interrupt
+    assert after is interrupt, "the crash replaced the end of the run"
+    assert stream.stats.failed
+    assert survivors == []
+    assert _errors(caplog) == [
+        "logpyt.stream: the AsyncLogStream engine failed; the run is abandoned"
+    ]
 
 
 # -- A.21: a cancelled __anext__ -------------------------------------------------
@@ -1493,3 +1700,123 @@ async def test_second_anext_raises(fake_adb: FakeAdb) -> None:
         await _end(stream)
 
     assert entry.message == "a"
+
+
+# -- F3-7: waits from a task a callback created --------------------------------
+
+
+async def _try_waits(
+    stream: AsyncLogStream[LogEntry], name: str, said: dict[str, str]
+) -> None:
+    """Await join() and wait_running(); record in ``said`` what each did."""
+    for what in ("join", "wait_running"):
+        wait = stream.join if what == "join" else stream.wait_running
+        try:
+            await _bounded(wait(TIMEOUT), f"{what}() in the {name} task")
+        except UsageError:
+            said[f"{name} {what}"] = "UsageError"
+        except BaseException as exc:  # noqa: BLE001  (the test looks at it)
+            said[f"{name} {what}"] = type(exc).__name__
+        else:
+            said[f"{name} {what}"] = "returned"
+
+
+@pytest.mark.asyncio
+async def test_callback_task_waits_after_the_end(fake_adb: FakeAdb) -> None:
+    """A task created inside a callback inherits the callback's mark with its
+    context (F3-7): while the run lives, its join() and wait_running() raise
+    UsageError, because the callback may await that task (design 3.6, 4.2).
+    Once the run has ended there is nothing to deadlock on: they return. A
+    task created with an empty context (``context=contextvars.Context()``)
+    is no stream code: its waits wait for the end.
+    """
+    fake_adb.logcat(run(out(logcat_line("a")), wait("never")))
+    ended = asyncio.Event()
+    said: dict[str, str] = {}
+    later: list[asyncio.Task[None]] = []
+    stream: AsyncLogStream[LogEntry]
+
+    async def after_the_end() -> None:
+        await ended.wait()
+        await _try_waits(stream, "after", said)
+
+    async def on_item(entry: LogEntry) -> None:
+        del entry
+        # The case F3-7 is for: the callback awaits a task that waits.
+        await asyncio.create_task(_try_waits(stream, "live", said))
+        later.append(asyncio.create_task(after_the_end()))
+        later.append(
+            asyncio.create_task(
+                _try_waits(stream, "fresh", said), context=contextvars.Context()
+            )
+        )
+        stream.stop()
+
+    stream = AsyncLogStream(config(), on_item=on_item)
+    stream.start()
+    try:
+        await _bounded(stream.join(), "join()")
+        ended.set()
+        await _bounded(asyncio.gather(*later), "the tasks on_item created")
+    finally:
+        ended.set()
+        await _end(stream)
+
+    assert said == {
+        "live join": "UsageError",
+        "live wait_running": "UsageError",
+        "fresh join": "returned",
+        "fresh wait_running": "returned",
+        "after join": "returned",
+        "after wait_running": "returned",
+    }
+    assert stream.state is S.STOPPED
+
+
+@pytest.mark.parametrize("mode", ["push", "pull"])
+@pytest.mark.asyncio
+async def test_callback_waits_after_the_end_raise(fake_adb: FakeAdb, mode: str) -> None:
+    """A callback's own join() and wait_running() raise UsageError after the
+    run has ended too, as in the thread driver (F3-7): only a task created
+    inside a callback is let wait once the run ended. The run ends while
+    on_item (push) or on_event (pull, inside ``__anext__()``) awaits: its
+    engine is cancelled, as a loop shutdown does (F3-2).
+    """
+    fake_adb.logcat(run(out(logcat_line("a")), wait("never")))
+    inside = asyncio.Event()
+    go = asyncio.Event()
+    said: dict[str, str] = {}
+    stream: AsyncLogStream[LogEntry]
+
+    async def callback(record: object) -> None:
+        if inside.is_set():
+            return
+        if mode == "pull" and not (
+            isinstance(record, StateChange) and record.new is S.RUNNING
+        ):
+            return
+        inside.set()
+        await go.wait()
+        await _try_waits(stream, "own", said)
+
+    if mode == "push":
+        stream = AsyncLogStream(config(), on_item=callback)
+    else:
+        stream = AsyncLogStream(config(), on_event=callback)
+    stream.start()
+    pull = asyncio.create_task(_rest(aiter(stream))) if mode == "pull" else None
+    try:
+        await _bounded(inside.wait(), "the callback")
+        _task("logpyt-engine").cancel()
+        await async_wait_until(lambda: stream._run.ended, timeout=TIMEOUT)
+        go.set()
+        if pull is not None:
+            await asyncio.wait({pull}, timeout=TIMEOUT)
+        await async_wait_until(lambda: len(said) == 2, timeout=TIMEOUT)
+    finally:
+        go.set()
+        if pull is not None:
+            pull.cancel()
+        await _end(stream)
+
+    assert said == {"own join": "UsageError", "own wait_running": "UsageError"}

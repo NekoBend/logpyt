@@ -1,7 +1,9 @@
 """Callback conformance: push delivery, the consumer context, fail fast.
 
 Design 2.4, 3.6, 4.2, A.21 and the F2-5, F2-6, F3-1 and F3-7 rows of the
-coverage matrix, for every driver (see ``conftest.py``).
+coverage matrix, for every driver (see ``conftest.py``). A push callback's
+KeyboardInterrupt or SystemExit is a callback failure in the thread driver
+only (design A.23); the asyncio driver's rule is in ``test_async.py``.
 """
 
 from __future__ import annotations
@@ -174,6 +176,53 @@ def test_on_event_raising_on_connecting_fails_cleanly(
 
     assert info.value.stage == "on_event"
     assert entries == []
+    assert stream.state is S.FAILED
+    assert fake_adb.survivors() == []
+
+
+@pytest.mark.parametrize("stage", ["on_item", "on_event"])
+@pytest.mark.parametrize("kind", ["ctrl_c", "exit"])
+def test_push_interrupt_is_callback_error(
+    driver: Driver, fake_adb: FakeAdb, kind: str, stage: str
+) -> None:
+    """The thread driver takes a KeyboardInterrupt or SystemExit raised by a
+    push callback in its dispatcher thread for a callback failure (design
+    A.23): a thread would drop the SystemExit, and Python raises Ctrl+C in
+    the main thread, not there. join() raises CallbackError with that stage,
+    chained to it, the run ends FAILED and no adb is left.
+    """
+    if driver.name == "async":
+        pytest.skip(
+            "in the asyncio driver the interrupt ends the run with it and "
+            "leaves the loop (design A.24): "
+            "test_on_item_interrupt_leaves_the_loop"
+        )
+    fake_adb.logcat(run(out(logcat_line("a")), wait("never")))
+    leave = KeyboardInterrupt() if kind == "ctrl_c" else SystemExit(3)
+
+    def on_item(entry: LogEntry) -> None:
+        del entry
+        if stage == "on_item":
+            raise leave
+
+    def on_event(event: StreamEvent) -> None:
+        running = isinstance(event, StateChange) and event.new is S.RUNNING
+        if stage == "on_event" and running:
+            raise leave
+
+    stream = driver.open(config(), on_item=on_item, on_event=on_event)
+    driver.start(stream)
+    error: BaseException | None = None
+    try:
+        driver.join(stream)
+    except BaseException as exc:  # noqa: BLE001  (a raw interrupt fails the test only)
+        error = exc
+    if not isinstance(error, CallbackError):
+        driver.kill(stream)  # the run went on: do not leave it running
+
+    assert isinstance(error, CallbackError), f"join() raised {error!r}"
+    assert error.stage == stage
+    assert error.__cause__ is leave
     assert stream.state is S.FAILED
     assert fake_adb.survivors() == []
 
