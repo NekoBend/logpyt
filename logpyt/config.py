@@ -22,9 +22,7 @@ from pydantic import (
     BaseModel,
     Field,
     NonNegativeFloat,
-    NonNegativeInt,
     PositiveFloat,
-    PositiveInt,
     StrictInt,
     ValidationInfo,
     field_validator,
@@ -300,8 +298,9 @@ class Reconnect(
         delay: Seconds before the first retry.
         max_delay: Cap on the retry delay; at least ``delay``.
         backoff: Factor the delay grows by after each failed attempt.
-        max_attempts: Consecutive failed attempts before the run fails;
-            None retries until ``stop()``.
+        max_attempts: Consecutive failed attempts before the run fails, an
+            int ``>= 1`` (a float, even ``3.0``, a ``str`` or ``bytes`` is
+            refused); None retries until ``stop()``.
         stable_after: Seconds a connection must stay RUNNING, counted from its
             first output, before the attempts and the delay reset.
     """
@@ -309,7 +308,8 @@ class Reconnect(
     delay: PositiveFloat = 1.0
     max_delay: PositiveFloat = 30.0
     backoff: float = Field(2.0, ge=1.0)
-    max_attempts: PositiveInt | None = None
+    # Strict like every int field of StreamConfig (see the comment there).
+    max_attempts: StrictInt | None = Field(None, gt=0)
     stable_after: PositiveFloat = 10.0
 
     @field_validator("*", mode="before")
@@ -347,7 +347,11 @@ class StreamConfig(
 ):
     """Configuration of one stream run, shared by `LogStream` and `AsyncLogStream`.
 
-    Durations are seconds; buffer and window sizes are ``>= 1`` (design D-15).
+    Durations are seconds. Counts and sizes, here and in `Reconnect`, take
+    only an int: a float (even ``8192.0``), a ``str`` or ``bytes`` is refused,
+    also from JSON, unless a caller passes ``strict=False`` to
+    ``model_validate`` or ``model_validate_json``, which pydantic lets override
+    it; buffer and window sizes are ``>= 1`` (design D-15).
     Validation errors are pydantic ``ValidationError``s, which are
     ``ValueError``s; a bare ``str`` or another non-sequence for ``logcat_args``
     raises ``TypeError``. ``model_copy(update=...)`` (and ``copy.replace`` on
@@ -381,8 +385,7 @@ class StreamConfig(
         resume_window_bytes: Cap on the bytes kept to deduplicate a resume.
         buffer_entries: Outbox capacity in entries; a group counts its members.
         buffer_bytes: Outbox capacity in bytes.
-        max_line_bytes: Longer lines are truncated; an int (no float or str),
-            at least 4096.
+        max_line_bytes: Longer lines are truncated; at least 4096.
         stop_grace: Seconds between terminating adb and killing it.
         exit_drain: Seconds to wait for pipe EOF after adb exited, counted only
             while the intake is open.
@@ -401,18 +404,20 @@ class StreamConfig(
     stall_timeout: PositiveFloat | None = 1.0
     reconnect: Reconnect | None = None
     resume_overlap: PositiveFloat = 2.0
-    resume_window_lines: PositiveInt = 32_768
-    resume_window_bytes: PositiveInt = 4 * 1024 * 1024
-    buffer_entries: PositiveInt = 10_000
-    buffer_bytes: PositiveInt = 16 * 1024 * 1024
-    # Strict, like read_file(max_line_bytes=) (design A.19): pydantic's lax mode
-    # would read 8192.0 or "8192" as 8192.
+    # Every int field here and Reconnect.max_attempts is a StrictInt, like
+    # read_file(max_line_bytes=) (design A.19): pydantic's lax mode would read
+    # 8192.0, "8192" or b"8192" as 8192. gt=0 keeps PositiveInt's bound and
+    # its "greater than 0" message.
+    resume_window_lines: StrictInt = Field(32_768, gt=0)
+    resume_window_bytes: StrictInt = Field(4 * 1024 * 1024, gt=0)
+    buffer_entries: StrictInt = Field(10_000, gt=0)
+    buffer_bytes: StrictInt = Field(16 * 1024 * 1024, gt=0)
     max_line_bytes: StrictInt = Field(DEFAULT_MAX_LINE_BYTES, ge=MIN_MAX_LINE_BYTES)
     stop_grace: PositiveFloat = 2.0
     exit_drain: PositiveFloat = 2.0
     close_timeout: PositiveFloat = 5.0
     package_hold: NonNegativeFloat = 2.0
-    stderr_tail: NonNegativeInt = 20
+    stderr_tail: StrictInt = Field(20, ge=0)
 
     @field_validator("*", mode="before")
     @classmethod

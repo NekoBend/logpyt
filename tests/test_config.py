@@ -7,11 +7,21 @@ leaves implicit (bools, inf/nan, NUL characters, the -T epoch range).
 from __future__ import annotations
 
 import copy
+import json
 import sys
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from fractions import Fraction
-from typing import TYPE_CHECKING
+from types import UnionType
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    NewType,
+    TypeAliasType,
+    Union,
+    get_args,
+    get_origin,
+)
 
 import pytest
 from pydantic import ValidationError
@@ -61,6 +71,16 @@ STREAM_FLOATS = [
     "package_hold",
 ]
 RECONNECT_FLOATS = ["delay", "max_delay", "backoff", "stable_after"]
+# Every int field, with its model and an int it accepts.
+INT_FIELDS: dict[str, tuple[type[StreamConfig] | type[Reconnect], int]] = {
+    "resume_window_lines": (StreamConfig, 8192),
+    "resume_window_bytes": (StreamConfig, 8192),
+    "buffer_entries": (StreamConfig, 8192),
+    "buffer_bytes": (StreamConfig, 8192),
+    "max_line_bytes": (StreamConfig, 8192),
+    "stderr_tail": (StreamConfig, 8192),
+    "max_attempts": (Reconnect, 3),
+}
 DEFAULT_BUFFERS = frozenset({"main", "system", "crash"})
 ALL_BUFFERS = frozenset(
     {
@@ -90,6 +110,39 @@ def _config(**fields: object) -> StreamConfig:
 def _reconnect(**fields: object) -> Reconnect:
     """Validate ``fields`` like the constructor does, for inputs ty would reject."""
     return Reconnect.model_validate(fields)
+
+
+def _errors(make: Callable[[], object]) -> list[tuple[object, str]]:
+    """Return the location and type of each error ``make`` raises."""
+    with pytest.raises(ValidationError) as caught:
+        make()
+    return [(error["loc"], error["type"]) for error in caught.value.errors()]
+
+
+def _leaf_types(annotation: object) -> set[object]:
+    """Return the types ``annotation`` names, through aliases, Annotated and unions."""
+    if isinstance(annotation, TypeAliasType):
+        return _leaf_types(annotation.__value__)
+    if isinstance(annotation, NewType):
+        return _leaf_types(annotation.__supertype__)
+    if get_origin(annotation) is Annotated:
+        return _leaf_types(get_args(annotation)[0])
+    if get_origin(annotation) in {Union, UnionType}:
+        return set().union(*(_leaf_types(arg) for arg in get_args(annotation)))
+    return {annotation}
+
+
+def _int_fields() -> list[tuple[type[StreamConfig] | type[Reconnect], str]]:
+    """Return every field of both models whose annotation names int or a subclass."""
+    return [
+        (model, name)
+        for model in (StreamConfig, Reconnect)
+        for name, info in model.model_fields.items()
+        if any(
+            isinstance(leaf, type) and issubclass(leaf, int) and leaf is not bool
+            for leaf in _leaf_types(info.annotation)
+        )
+    ]
 
 
 # -- defaults, immutability, unknown fields ----------------------------------------
@@ -271,21 +324,57 @@ def test_max_line_bytes_has_a_floor_of_4096() -> None:
     _rejects(lambda: StreamConfig(max_line_bytes=4095), "greater than or equal to 4096")
 
 
-@pytest.mark.parametrize(
-    "value", [8192.0, "8192", b"8192", True], ids=["float", "str", "bytes", "bool"]
-)
-def test_max_line_bytes_takes_only_an_int(value: object) -> None:
+@pytest.mark.parametrize("field", INT_FIELDS)
+@pytest.mark.parametrize("kind", ["float", "str", "bytes", "bool"])
+def test_int_fields_take_only_an_int(field: str, kind: str) -> None:
     """Like read_file(max_line_bytes=) (design A.19): no lax coercion to an int."""
-    _rejects(lambda: _config(max_line_bytes=value), "max_line_bytes")
-    _rejects(
-        lambda: StreamConfig.model_validate_json('{"max_line_bytes": "8192"}'),
-        "max_line_bytes",
-    )
-    assert _config(max_line_bytes=8192).max_line_bytes == 8192
-    assert (
-        StreamConfig.model_validate_json('{"max_line_bytes": 8192}').max_line_bytes
-        == 8192
-    )
+    model, value = INT_FIELDS[field]
+    raw = {
+        "float": float(value),
+        "str": str(value),
+        "bytes": str(value).encode(),
+        "bool": True,
+    }[kind]
+    # A bool is refused by _refuse_bool, which runs before the int check.
+    error = "value_error" if kind == "bool" else "int_type"
+    assert _errors(lambda: model.model_validate({field: raw})) == [((field,), error)]
+    assert _errors(lambda: model().model_copy(update={field: raw})) == [
+        ((field,), error)
+    ]
+    if sys.version_info >= (3, 13):
+        assert _errors(lambda: copy.replace(model(), **{field: raw})) == [
+            ((field,), error)
+        ]
+    assert getattr(model.model_validate({field: value}), field) == value
+
+
+@pytest.mark.parametrize("field", INT_FIELDS)
+@pytest.mark.parametrize("kind", ["str", "float"])
+def test_int_fields_take_only_a_json_int(field: str, kind: str) -> None:
+    model, value = INT_FIELDS[field]
+    refused = json.dumps({field: str(value) if kind == "str" else float(value)})
+    assert _errors(lambda: model.model_validate_json(refused)) == [
+        ((field,), "int_type")
+    ]
+    accepted = json.dumps({field: value})
+    assert getattr(model.model_validate_json(accepted), field) == value
+
+
+def test_int_fields_are_the_listed_ones() -> None:
+    assert {name for _, name in _int_fields()} == set(INT_FIELDS)
+
+
+@pytest.mark.parametrize(
+    ("model", "field"), [pytest.param(*pair, id=pair[1]) for pair in _int_fields()]
+)
+@pytest.mark.parametrize("raw", [8192.0, "8192"], ids=["float", "str"])
+def test_every_int_field_is_strict(
+    model: type[StreamConfig] | type[Reconnect], field: str, raw: object
+) -> None:
+    """A guard for int fields added later: the annotation alone finds them."""
+    assert _errors(lambda: model.model_validate({field: raw})) == [
+        ((field,), "int_type")
+    ]
 
 
 @pytest.mark.parametrize(
