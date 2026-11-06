@@ -15,7 +15,6 @@ from logpyt import (
     CallbackError,
     IncompleteCaptureError,
     LogpytError,
-    LogStreamError,
     ReadTimeoutError,
     StreamError,
     StreamStats,
@@ -67,10 +66,9 @@ def test_read_timeout_is_not_a_builtin_timeout() -> None:
 
 
 @pytest.mark.parametrize("error", NEW_ERRORS)
-def test_new_errors_end_in_error_and_stay_apart_from_2x(error: type) -> None:
+def test_new_errors_end_in_error(error: type) -> None:
     assert error.__name__.endswith("Error")
-    assert not issubclass(error, LogStreamError)
-    assert not issubclass(LogStreamError, error)
+    assert issubclass(error, LogpytError)
 
 
 def test_adb_error_keeps_the_command_and_its_result() -> None:
@@ -319,6 +317,8 @@ def test_new_names_are_exported_from_the_package(name: str, module: object) -> N
         "LogStreamTimeoutError",
     ],
 )
-def test_2x_errors_are_still_exported(name: str) -> None:
-    assert name in logpyt.__all__
-    assert issubclass(getattr(logpyt, name), LogStreamError)
+def test_2x_errors_are_removed(name: str) -> None:
+    """The six 2.x stream errors are gone with the 2.x streams (design 4.1)."""
+    assert name not in logpyt.__all__
+    assert not hasattr(logpyt, name)
+    assert not hasattr(exceptions_module, name)

@@ -56,7 +56,7 @@ from typing import TYPE_CHECKING, Literal
 from logpyt.exceptions import AdbError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
+    from collections.abc import Awaitable, Callable, Iterator, Sequence
 
 __all__ = [
     "DeviceInfo",
@@ -73,8 +73,6 @@ logger = logging.getLogger(__name__)
 # On Windows a child of a GUI, pythonw or frozen app opens a console window unless
 # CREATE_NO_WINDOW is set, and CREATE_NEW_PROCESS_GROUP keeps a terminal Ctrl+C
 # away from adb. Neither flag exists on POSIX, where the child gets a new session.
-# _CREATE_NO_WINDOW alone is what the 2.x AsyncLogStream passes until PR-13.
-_CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 _CREATION_FLAGS = (
     subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
     if sys.platform == "win32"
@@ -536,7 +534,13 @@ def _kill_and_reap(proc: subprocess.Popen[bytes]) -> None:
 type _Readers = tuple[asyncio.Task[None], asyncio.Task[None]]
 
 
-async def _async_run_adb(argv: Sequence[str], *, timeout: float | None) -> _AdbResult:
+async def _async_run_adb(
+    argv: Sequence[str],
+    *,
+    timeout: float | None,
+    spawn: Callable[[Sequence[str]], Awaitable[asyncio.subprocess.Process]]
+    | None = None,
+) -> _AdbResult:
     """Async twin of `_run_adb`: also kills and reaps the child when cancelled.
 
     adb's exit is told by polling ``returncode`` (A-14), and once adb has
@@ -544,6 +548,10 @@ async def _async_run_adb(argv: Sequence[str], *, timeout: float | None) -> _AdbR
     on every platform the result then carries what was read until then. A
     cancellation that arrives while a killed child is being reaped waits for
     that bounded reap before it propagates.
+
+    ``spawn`` starts the child in place of `_async_spawn_adb`, with the same
+    arguments and errors, as in `_run_adb`: the async stream driver passes one
+    that also tracks the child, so interpreter exit can kill it.
 
     Raises:
         AdbError: adb could not be started (``returncode`` None; the
@@ -558,7 +566,7 @@ async def _async_run_adb(argv: Sequence[str], *, timeout: float | None) -> _AdbR
     args = tuple(argv)
     started = time.monotonic()
     try:
-        proc = await _async_spawn_adb(args)
+        proc = await (_async_spawn_adb if spawn is None else spawn)(args)
     except OSError as exc:
         raise _spawn_failure(args, exc) from exc
     stdout: list[bytes] = []

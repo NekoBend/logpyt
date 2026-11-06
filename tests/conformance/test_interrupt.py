@@ -13,11 +13,19 @@ wait kills too: no adb child remains once the with-block was left (design
 running finishes, since the exit waits at most 1 s. A run that had already
 ended FAILED is not killed (design A.23): the items it left are still
 delivered after the with-block (A.21).
+
+An `AsyncLogStream` has no thread wait for Ctrl+C to land in: under
+``asyncio.run`` SIGINT cancels the main task, ``async with`` kills adb on that
+cancellation, and ``asyncio.run`` raises KeyboardInterrupt once the task
+ended (design 2.11, 3.4). The driver-parametrized tests therefore run for
+the thread driver only, and `test_ctrl_c_under_asyncio_run_kills_adb` runs
+the asyncio loop in the main thread instead.
 """
 
 from __future__ import annotations
 
 import _thread
+import asyncio
 import signal
 import sys
 import threading
@@ -28,11 +36,13 @@ from typing import TYPE_CHECKING
 import pytest
 
 import logpyt
+from logpyt import AsyncLogStream
 from logpyt.exceptions import StreamError
 from logpyt.streams._events import StreamState
 from tests.conformance.conftest import TIMEOUT, Driver, config
 from tests.conftest import (
     FakeAdb,
+    async_wait_until,
     lines,
     logcat_line,
     out,
@@ -43,6 +53,8 @@ from tests.conftest import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from logpyt import LogEntry
 
 # Design 9.2: the with-block exits within 1 s of the interrupt.
@@ -75,16 +87,36 @@ def _main_thread_waits() -> bool:
     return False
 
 
+# Where the innermost Python frame of a thread whose event loop waits for I/O
+# lies: the selector's select() (selectors.py), or the proactor's _poll() on
+# Windows (asyncio/windows_events.py); the wait itself is C code below it.
+_LOOP_WAITS = frozenset({"selectors.py", "windows_events.py"})
+
+
+def _main_loop_waits() -> bool:
+    """Whether the event loop in the main thread waits for I/O, so every task
+    on it, the test body's main task included, is suspended in an await.
+    """
+    main = threading.main_thread().ident
+    frame = sys._current_frames().get(main) if main is not None else None
+    return frame is not None and Path(frame.f_code.co_filename).name in _LOOP_WAITS
+
+
 class _Interrupter:
-    """Calls ``_thread.interrupt_main()`` once the main thread blocks in a wait.
+    """Calls ``_thread.interrupt_main()`` once ``waiting()`` says the main
+    thread blocks in a wait (by default a library thread wait).
 
     It fires at most once, and never after `join` (the end of the test body),
-    so a stray KeyboardInterrupt cannot reach pytest itself.
+    so a stray KeyboardInterrupt cannot reach pytest itself. ``give_up``, if
+    set, runs instead when the main thread never waited, so that the body
+    ends (and the test fails on ``sent_at``) instead of waiting forever.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, waiting: Callable[[], bool] = _main_thread_waits) -> None:
         self.armed = threading.Event()
         self.sent_at: float | None = None
+        self.give_up: Callable[[], object] | None = None
+        self._waiting = waiting
         self._lock = threading.Lock()
         self._done = False
         self._thread = threading.Thread(
@@ -96,8 +128,10 @@ class _Interrupter:
         if not self.armed.wait(TIMEOUT):
             return
         try:
-            wait_until(lambda: self._done or _main_thread_waits(), timeout=TIMEOUT)
+            wait_until(lambda: self._done or self._waiting(), timeout=TIMEOUT)
         except TimeoutError:
+            if self.give_up is not None:
+                self.give_up()
             return  # the test fails on sent_at being None
         with self._lock:
             if self._done:
@@ -113,13 +147,26 @@ class _Interrupter:
         self._thread.join(TIMEOUT)
 
 
-@pytest.fixture
-def interrupter() -> _Interrupter:
-    """An interrupter for a test that runs in the main thread under SIGINT's default."""
+def _require_sigint_in_the_main_thread() -> None:
+    """Skip a test that cannot interrupt the main thread here."""
     if threading.current_thread() is not threading.main_thread():
         pytest.skip("interrupt_main() interrupts the main thread only")
     if signal.getsignal(signal.SIGINT) is not signal.default_int_handler:
         pytest.skip("SIGINT is not handled by Python here: interrupt_main() is a no-op")
+
+
+@pytest.fixture
+def interrupter(driver: Driver) -> _Interrupter:
+    """An interrupter for a test that runs in the main thread under SIGINT's default."""
+    if driver.name == "async":
+        pytest.skip(
+            "an async stream has no sliced thread wait for Ctrl+C to land in: "
+            "under asyncio.run, SIGINT cancels the main task, and with-exit "
+            "kills on that cancellation (design 2.11, 3.4); "
+            "test_ctrl_c_under_asyncio_run_kills_adb runs the loop in the "
+            "main thread"
+        )
+    _require_sigint_in_the_main_thread()
     return _Interrupter()
 
 
@@ -293,3 +340,58 @@ def test_ctrl_c_in_the_exit_of_a_failed_run(
     assert ended_at - interrupter.sent_at < WITHIN + KILL_WAIT
     assert calls == [f"m{i}" for i in range(count)]
     assert not stream.stats.killed
+
+
+@pytest.mark.parametrize("where", ["iterate", "join", "wait_running"])
+def test_ctrl_c_under_asyncio_run_kills_adb(fake_adb: FakeAdb, where: str) -> None:
+    """Scenario (a) of design 2.11 for AsyncLogStream: Ctrl+C while the main
+    task of ``asyncio.run`` waits in ``async for``, in ``join()`` or in
+    ``wait_running()``. asyncio.run turns SIGINT into a cancellation of the
+    main task, ``async with`` kills adb on it (design 3.4), and asyncio.run
+    raises KeyboardInterrupt, unchanged and within 1 s of the interrupt
+    (design 9.2): the run ends KILLED and no adb is left.
+
+    The interrupt is sent once the loop waits for I/O, so the main task is
+    suspended in the stream's wait. Without a real signal, Linux runs the
+    handler when the loop next wakes; the exit watcher wakes it every 50 ms
+    (design 5.4). On Windows the proactor loop's wakeup fd wakes it at once.
+    """
+    _require_sigint_in_the_main_thread()
+    if where == "wait_running":
+        fake_adb.logcat(run(touch("spawned"), hang=True))  # never RUNNING
+    else:
+        fake_adb.logcat(run(out(logcat_line("a")), touch("spawned"), wait("never")))
+    entries: list[LogEntry] = []
+    push = where == "join"
+    stream = AsyncLogStream(config(), on_item=entries.append if push else None)
+    interrupter = _Interrupter(_main_loop_waits)
+    interrupter.give_up = stream.kill
+
+    async def body() -> None:
+        async with stream:
+            await fake_adb.async_wait_for("spawned")
+            if where == "iterate":
+                iterator = aiter(stream)
+                assert (await anext(iterator)).message == "a"
+                interrupter.armed.set()
+                await anext(iterator)  # adb writes nothing more: it waits here
+            elif where == "join":
+                await async_wait_until(lambda: entries, timeout=TIMEOUT)
+                interrupter.armed.set()
+                await stream.join()
+            else:
+                interrupter.armed.set()
+                await stream.wait_running()
+
+    try:
+        with pytest.raises(KeyboardInterrupt) as info:
+            asyncio.run(body())
+        ended_at = time.monotonic()
+    finally:
+        interrupter.join()
+
+    assert interrupter.sent_at is not None, "the main task never waited"
+    assert ended_at - interrupter.sent_at < WITHIN
+    assert not getattr(info.value, "__notes__", None)  # unchanged (design 3.4)
+    assert stream.state is StreamState.KILLED
+    assert fake_adb.survivors() == []

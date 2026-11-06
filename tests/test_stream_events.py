@@ -8,8 +8,9 @@ from datetime import UTC, datetime
 
 import pytest
 
+import logpyt
+import logpyt.streams
 from logpyt import Gap, ReadTimeoutError, StateChange, StreamEvent, StreamStats
-from logpyt.streams import StreamState as LegacyStreamState
 from logpyt.streams._events import StreamState
 
 DESIGN_STATS_FIELDS = [
@@ -81,10 +82,16 @@ def test_stream_state_value_and_str_equal_the_name(state: StreamState) -> None:
     assert StreamState(state.name) is state
 
 
-def test_the_2x_stream_state_is_untouched_during_the_coexistence_window() -> None:
-    assert LegacyStreamState is not StreamState
-    assert "PAUSED" in LegacyStreamState.__members__
-    assert "STARTING" in LegacyStreamState.__members__
+def test_the_3_0_stream_state_is_exported() -> None:
+    """Both drivers report one StreamState, exported from the package and from
+    logpyt.streams; the 2.x enum is gone (design A.3).
+    """
+    assert logpyt.StreamState is StreamState
+    assert logpyt.streams.StreamState is StreamState
+    assert "StreamState" in logpyt.__all__
+    assert "StreamState" in logpyt.streams.__all__
+    with pytest.raises(ModuleNotFoundError):
+        __import__("logpyt.streams.common")
 
 
 # -- StateChange and Gap ---------------------------------------------------------

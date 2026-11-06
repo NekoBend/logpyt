@@ -76,9 +76,7 @@ class GroupBy:
             crash group is delivered without waiting for an unrelated line
             (D-10); > 0. ``"gap"`` (the default) uses ``gap_ms``, None turns
             it off. `groups` reads no clock and ignores it. ``LogStream``
-            applies it (the stream core's timer); the 2.x ``AsyncLogStream``
-            does not yet: it closes the open groups only when adb's stdout
-            ends (design 8.2: PR-13 moves it onto the core).
+            and ``AsyncLogStream`` apply it (the stream core's timer).
         max_group_size: A group closes when it reaches this many entries
             (reason ``"size"``); >= 1. The 3.0 streams also require it to be
             at most ``StreamConfig.buffer_entries``, since a group counts its

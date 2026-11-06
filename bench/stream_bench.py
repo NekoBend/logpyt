@@ -66,7 +66,7 @@ from tests.conftest import install_fake_adb, lines, run, threadtime, touch
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
 
-    from logpyt import AsyncStreamHandle, LogEntry
+    from logpyt import LogEntry
     from tests.conftest import FakeAdb
 
 DEFAULT_LINES = 200_000
@@ -246,7 +246,7 @@ class SyncDriver:
 
 
 class AsyncDriver:
-    """logpyt 2.x ``AsyncLogStream`` under ``asyncio.run`` on the main thread."""
+    """logpyt 3.0 ``AsyncLogStream`` under ``asyncio.run`` on the main thread."""
 
     name: ClassVar[str] = "async"
 
@@ -274,28 +274,28 @@ class AsyncDriver:
         timeout: float,
     ) -> None:
         stream = self._open(adb_path, probe, lossless=lossless)
-        await stream.start()
+        stream.start()
         try:
             await _async_poll(done, timeout)
         finally:
-            await stream.stop()
+            stream.stop()
             await stream.join(timeout=timeout)
 
     @staticmethod
-    def _open(adb_path: str, probe: DeliveryProbe, *, lossless: bool) -> AsyncLogStream:
-        # The 2.x callback type is a coroutine function; this one has nothing
-        # to await.
-        async def on_entry(_entry: LogEntry, _handle: AsyncStreamHandle) -> None:  # noqa: RUF029
+    def _open(
+        adb_path: str, probe: DeliveryProbe, *, lossless: bool
+    ) -> AsyncLogStream[LogEntry]:
+        # A plain callback, as the sync driver's: it runs on the event loop.
+        def on_entry(_entry: LogEntry) -> None:
             probe.hit()
 
         if lossless:
-            # Same as the sync driver: 2.x drops once a dispatch queue is full.
-            return AsyncLogStream(
-                adb_path=adb_path,
-                stdout_callback=on_entry,
-                callback_queue_size=probe.expected,
-            )
-        return AsyncLogStream(adb_path=adb_path, stdout_callback=on_entry)
+            # Same as the sync driver: until PR-14 a stall resume replays from
+            # the first position (design A.20).
+            config = StreamConfig(adb_path=adb_path, stall_timeout=None)
+        else:
+            config = StreamConfig(adb_path=adb_path)
+        return AsyncLogStream(config, on_item=on_entry)
 
 
 DRIVERS: dict[str, Driver] = {"sync": SyncDriver(), "async": AsyncDriver()}

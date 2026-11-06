@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 import logpyt
-from logpyt import filters
+from logpyt import adb, filters
 from logpyt.config import StreamConfig
 from logpyt.filters import (
     And,
@@ -31,7 +31,6 @@ from logpyt.filters import (
 from logpyt.models import LogEntry
 from logpyt.readers import read_file
 from logpyt.streams import AsyncLogStream, LogStream
-from logpyt.streams.common import build_pidof_command
 
 # Design 2.1: the condition names of the public surface.
 CONDITION_NAMES = [
@@ -871,17 +870,12 @@ def test_streams_monitor_nested_overrides(
     stream_type: type[LogStream | AsyncLogStream],
 ) -> None:
     """The streams watch the packages that overrides of packages() name
-    anywhere in the condition, not only at its root: LogStream's core
-    attributes them (design 5.8), the 2.x AsyncLogStream starts a pid monitor.
+    anywhere in the condition, not only at its root: their shared core
+    attributes them (design 5.8).
     """
     condition = (_App("com.a") & Level("E")) | ~Where(_App("com.b"))
-    if stream_type is LogStream:
-        stream = LogStream(StreamConfig(adb_path="adb"), where=condition)
-        watched = stream._run.core._attribution._packages
-    else:
-        monitor = AsyncLogStream(adb_path="adb", filter_by=condition)._pid_monitor
-        assert monitor is not None
-        watched = monitor.packages
+    stream = stream_type(StreamConfig(adb_path="adb"), where=condition)
+    watched = stream._run.core._attribution._packages
     assert sorted(watched) == ["com.a", "com.b"]
 
 
@@ -1480,9 +1474,9 @@ def test_repr_shows_the_tree() -> None:
 
 
 def test_entry_points_take_any_condition(tmp_path: Path) -> None:
-    """LogStream (where=), the 2.x AsyncLogStream (filter_by=) and read_file
-    (where=) take any Condition; a bare function raises TypeError that points to
-    Where, read_file when it is called.
+    """LogStream, AsyncLogStream and read_file (where=) take any Condition; a
+    bare function raises TypeError that points to Where, read_file when it is
+    called.
     """
     path = tmp_path / "app.log"
     path.write_text(
@@ -1497,23 +1491,24 @@ def test_entry_points_take_any_condition(tmp_path: Path) -> None:
     assert (
         LogStream(StreamConfig(adb_path="adb"), where=anr | Tag("x"))._where is not None
     )
-    assert AsyncLogStream(adb_path="adb", filter_by=Where(bool)).filter_by is not None
+    config = StreamConfig(adb_path="adb")
+    assert AsyncLogStream(config, where=Where(bool))._where is not None
 
     def keep(entry: LogEntry) -> bool:
         return entry.level == "E"
 
     with pytest.raises(TypeError, match=r"where must be a Condition.*Where"):
         LogStream(StreamConfig(adb_path="adb"), where=keep)  # ty: ignore[invalid-argument-type]
-    with pytest.raises(TypeError, match=r"filter_by must be a Condition.*Where"):
-        AsyncLogStream(adb_path="adb", filter_by=keep)  # ty: ignore[invalid-argument-type]
+    with pytest.raises(TypeError, match=r"where must be a Condition.*Where"):
+        AsyncLogStream(config, where=keep)  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError, match=r"where must be a Condition.*Where"):
         read_file(path, where=keep)  # ty: ignore[invalid-argument-type]
 
 
 def test_pidof_names_are_validated_where_they_reach_adb() -> None:
-    """A name that is not a package name never reaches ``adb shell pidof`` (F5-3),
+    """A name that is not a package name never reaches the device shell (F5-3),
     even when it bypasses Package's own check: the streams refuse it when they are
-    built, and the 2.x pidof builder refuses it too.
+    built, and the pidof argv builder refuses it too.
     """
 
     class Smuggler(Condition):
@@ -1527,14 +1522,14 @@ def test_pidof_names_are_validated_where_they_reach_adb() -> None:
     with pytest.raises(ValueError, match="is not a package name"):
         LogStream(StreamConfig(adb_path="adb"), where=Smuggler())
     with pytest.raises(ValueError, match="is not a package name"):
-        AsyncLogStream(adb_path="adb", filter_by=Smuggler())
+        AsyncLogStream(StreamConfig(adb_path="adb"), where=Smuggler())
     with pytest.raises(ValueError, match="is not a package name"):
-        build_pidof_command("adb", None, "com.a;reboot")
-    assert build_pidof_command("adb", "emulator-5554", "com.a:remote") == [
+        adb._pidof_argv("adb", None, "com.a;reboot")
+    assert adb._pidof_argv("adb", "emulator-5554", "com.a:remote") == (
         "adb",
         "-s",
         "emulator-5554",
         "shell",
         "pidof",
         "com.a:remote",
-    ]
+    )

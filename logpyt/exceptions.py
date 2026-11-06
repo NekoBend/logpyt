@@ -1,9 +1,7 @@
-"""Exceptions for logpyt stream operations.
+"""The errors logpyt raises: the hierarchy rooted at `LogpytError` (design 4.1).
 
-Two generations live here during the 3.0.0 migration (design section 8.1): the 2.x
-``LogStream*Error`` classes, which the 2.x `AsyncLogStream` still raises, and the
-3.0 hierarchy rooted at `LogpytError` (design section 4.1), which `LogStream`
-raises. The async driver rewrite (PR-13) switches over and deletes the 2.x ones.
+`LogStream` and `AsyncLogStream` raise these. The six 2.x ``LogStream*Error``
+classes are gone (design 4.1, PR-13).
 """
 
 from __future__ import annotations
@@ -22,73 +20,12 @@ __all__ = [
     "CallbackError",
     "CallbackStage",
     "IncompleteCaptureError",
-    "LogStreamError",
-    "LogStreamInternalError",
-    "LogStreamKilledError",
-    "LogStreamPidResolveError",
-    "LogStreamStderrError",
-    "LogStreamTimeoutError",
     "LogpytError",
     "ReadTimeoutError",
     "StreamError",
     "UsageError",
 ]
 
-
-class LogStreamError(Exception):
-    """Base exception for all log stream errors.
-
-    This exception serves as the parent class for all specific exceptions
-    raised by the LogStream and related components. Catching this exception
-    allows handling any error originating from the log stream processing.
-    """
-
-
-class LogStreamStderrError(LogStreamError):
-    """Raised when there is an error reading from stderr.
-
-    This exception indicates that the underlying ADB process produced output
-    to standard error, which typically signifies a problem with the command
-    execution or the device connection.
-    """
-
-
-class LogStreamPidResolveError(LogStreamError):
-    """Raised when the PID for a package cannot be resolved.
-
-    This exception occurs when the system attempts to resolve the Process ID (PID)
-    for a given package name but fails. This can happen if the package is not
-    running or if the device is not responding correctly.
-    """
-
-
-class LogStreamInternalError(LogStreamError):
-    """Raised when an internal error occurs in the log stream.
-
-    This exception indicates an unexpected state or failure within the
-    LogStream implementation itself, rather than an external error like
-    device disconnection.
-    """
-
-
-class LogStreamKilledError(LogStreamError):
-    """Raised when the log stream process is killed.
-
-    This exception is raised when the log stream is intentionally terminated
-    via the `kill()` method. It represents a specific exit state indicating
-    that the stream was stopped by user request rather than an error.
-    """
-
-
-class LogStreamTimeoutError(LogStreamError):
-    """Raised when an operation on the log stream times out.
-
-    This exception is raised when a blocking operation, such as waiting for
-    the stream to start or stop, exceeds the specified timeout duration.
-    """
-
-
-# -- 3.0 hierarchy (design section 4.1) ----------------------------------------
 
 # The user code that raised: a callback, the `where` condition or the grouper.
 type CallbackStage = Literal["on_item", "on_event", "where", "group_by"]

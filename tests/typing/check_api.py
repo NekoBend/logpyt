@@ -5,13 +5,13 @@ pins a call or assignment that ty must keep rejecting: pyproject.toml makes an
 unused ignore an error, so a line that stops failing breaks ``ty check``.
 
 The stream constructor overloads of design section 2.3 are checked on
-``LogStream`` itself (design section 11, risk 12: ty is pre-1.0 and may regress
-on self-typed overloads).
+``LogStream`` and ``AsyncLogStream`` themselves (design section 11, risk 12: ty
+is pre-1.0 and may regress on self-typed overloads).
 """
 
 from __future__ import annotations
 
-from collections.abc import Hashable, Iterator
+from collections.abc import AsyncIterator, Hashable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, assert_never, assert_type
@@ -210,10 +210,12 @@ def check_filter_by_takes_any_condition() -> None:
     # X-7: the 2.x entry points were annotated ``Filter | None``.
     where = (Package("com.example") & Level("E")) | MessageContains("CRITICAL")
     LogStream(where=where)
-    AsyncLogStream(filter_by=CrashCondition(package="com.example"))
+    AsyncLogStream(where=CrashCondition(package="com.example"))
     read_file("app.log", where=~Tag("noise"))
     read_file("app.log", where=Where(_is_error))
     LogStream(where=_is_error)  # ty: ignore[invalid-argument-type]
+    AsyncLogStream(where=_is_error)  # ty: ignore[invalid-argument-type]
+    AsyncLogStream(filter_by=Tag("x"))  # ty: ignore[no-matching-overload]
     read_file("app.log", where=_is_error)  # ty: ignore[invalid-argument-type]
 
 
@@ -337,3 +339,68 @@ def check_stream_methods(
     stream.assert_complete()
     stream.stop(5.0)  # ty: ignore[too-many-positional-arguments]
     stream.state = StreamState.RUNNING  # ty: ignore[invalid-assignment]
+
+
+# -- AsyncLogStream: the same constructor; callbacks may return awaitables (2.3) ----
+
+
+async def _async_on_item(entry: LogEntry) -> None:
+    del entry
+
+
+async def _async_on_event(event: StreamEvent) -> None:
+    del event
+
+
+def check_async_stream_overloads() -> None:
+    entries: list[LogEntry] = []
+    groups: list[LogGroup] = []
+    config = StreamConfig(serial="emulator-5554", since="now")
+    assert_type(AsyncLogStream(), AsyncLogStream[LogEntry])
+    assert_type(
+        AsyncLogStream(config, on_item=entries.append, on_event=_on_event),
+        AsyncLogStream[LogEntry],
+    )
+    assert_type(
+        AsyncLogStream(config, on_item=_async_on_item, on_event=_async_on_event),
+        AsyncLogStream[LogEntry],
+    )
+    spec = GroupBy(keys=("pid",), gap_ms=50.0)
+    assert_type(AsyncLogStream(group_by=spec), AsyncLogStream[LogGroup])
+    assert_type(
+        AsyncLogStream(config, group_by=spec, on_item=groups.append),
+        AsyncLogStream[LogGroup],
+    )
+    AsyncLogStream(group_by=spec, on_item=entries.append)  # ty: ignore[no-matching-overload]
+    AsyncLogStream(on_item=groups.append)  # ty: ignore[invalid-argument-type]
+    AsyncLogStream(config=config)  # ty: ignore[no-matching-overload]
+
+
+async def check_async_stream_methods(
+    stream: AsyncLogStream[LogEntry], grouped: AsyncLogStream[LogGroup]
+) -> None:
+    assert_type(stream.config, StreamConfig)
+    assert_type(stream.state, StreamState)
+    assert_type(stream.stats, StreamStats)
+    assert_type(stream.outcome, StreamError | None)
+    assert_type(stream.clone(), AsyncLogStream[LogEntry])
+    assert_type(grouped.clone(), AsyncLogStream[LogGroup])
+    assert_type(aiter(stream), AsyncIterator[LogEntry])
+    async for entry in stream:
+        assert_type(entry, LogEntry)
+    async for group in grouped:
+        assert_type(group, LogGroup)
+    async with stream as entered:
+        assert_type(entered, AsyncLogStream[LogEntry])
+    stream.start()
+    stream.stop()
+    stream.stop(flush=5.0)
+    stream.kill()
+    assert_type(await stream.join(), None)
+    await stream.join(timeout=1.0)
+    await stream.wait_running(timeout=30.0)
+    stream.assert_complete()
+    stream.stop(5.0)  # ty: ignore[too-many-positional-arguments]
+    stream.state = StreamState.RUNNING  # ty: ignore[invalid-assignment]
+    for item in stream:  # ty: ignore[not-iterable]
+        del item

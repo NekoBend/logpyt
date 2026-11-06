@@ -28,12 +28,6 @@ from .exceptions import (
     CallbackError,
     IncompleteCaptureError,
     LogpytError,
-    LogStreamError,
-    LogStreamInternalError,
-    LogStreamKilledError,
-    LogStreamPidResolveError,
-    LogStreamStderrError,
-    LogStreamTimeoutError,
     ReadTimeoutError,
     StreamError,
     UsageError,
@@ -58,11 +52,7 @@ from .groupers import GroupBy
 from .models import LogEntry, LogGroup
 from .parsers import LogParser, ThreadTimeLogParser
 from .readers import read_file
-from .streams import AsyncLogStream, AsyncStreamHandle, LogStream
-
-# 3.0 stream events. StreamState stays in logpyt.streams._events until the async
-# driver switches over too (PR-13, design A.3): logpyt.streams.StreamState is still
-# the 2.x enum that AsyncLogStream reports (design section 8.1).
+from .streams import AsyncLogStream, LogStream, StreamState
 from .streams._events import Gap, StateChange, StreamEvent, StreamStats
 from .utils import enable_debug
 
@@ -72,7 +62,6 @@ __all__ = [
     "And",
     "AnrCondition",
     "AsyncLogStream",
-    "AsyncStreamHandle",
     "CallbackError",
     "Condition",
     "CrashCondition",
@@ -85,12 +74,6 @@ __all__ = [
     "LogGroup",
     "LogParser",
     "LogStream",
-    "LogStreamError",
-    "LogStreamInternalError",
-    "LogStreamKilledError",
-    "LogStreamPidResolveError",
-    "LogStreamStderrError",
-    "LogStreamTimeoutError",
     "LogpytError",
     "MessageContains",
     "MinLevel",
@@ -103,6 +86,7 @@ __all__ = [
     "StreamConfig",
     "StreamError",
     "StreamEvent",
+    "StreamState",
     "StreamStats",
     "Tag",
     "ThreadTimeLogParser",

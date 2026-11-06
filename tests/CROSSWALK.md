@@ -125,3 +125,34 @@ Rules:
 | tests/behavior/test_sync_stream_behavior.py::test_a_zero_adb_exit_makes_join_return_normally | tests/behavior/test_sync_stream_behavior.py::test_a_zero_adb_exit_is_the_outcome |
 | tests/behavior/test_sync_stream_behavior.py::test_kill_makes_join_raise_killed_error | tests/behavior/test_sync_stream_behavior.py::test_kill_ends_killed_and_join_returns |
 | tests/behavior/test_sync_stream_behavior.py::test_stderr_output_reaches_only_stderr_callback | tests/behavior/test_sync_stream_behavior.py::test_stderr_lines_are_logged_not_delivered |
+| tests/test_async_stream.py::test_async_callback_backpressure_policy_drop_oldest_is_configurable | API removed by decision U-4 |
+| tests/test_async_stream.py::test_async_context_manager_does_not_swallow_join_timeout | covered by tests/conformance/test_lifecycle.py::test_clean_with_exit_raises_an_unseen_outcome |
+| tests/test_async_stream.py::test_async_join_timeout_is_nondestructive | tests/conformance/test_lifecycle.py::test_join_timeout_raises_timeout_error_while_the_consumer_is_busy |
+| tests/test_async_stream.py::test_async_pid_monitor_partial_resolve_preserves_unpolled_packages | mocked private internals; behavior covered by tests/core/test_attribution.py::test_each_package_waits_its_own_interval |
+| tests/test_async_stream.py::test_async_pid_monitor_run_loop_adaptive_backoff_when_unchanged | API removed by decision D-8 |
+| tests/test_async_stream.py::test_async_pid_monitor_run_loop_resets_backoff_on_change | API removed by decision D-8 |
+| tests/test_async_stream.py::test_async_pid_monitor_update_applies_add_remove_and_change | mocked private internals; behavior covered by tests/core/test_attribution.py::test_a_mapped_package_found_uninstalled_has_no_uid_again |
+| tests/test_async_stream.py::test_async_pid_monitor_update_no_change_keeps_map_object | API removed by decision D-8 |
+| tests/test_async_stream.py::test_async_stream_groups_stdout_and_flushes_on_eof | tests/conformance/test_callbacks.py::test_group_by_delivers_groups_and_flushes_at_the_end |
+| tests/test_async_stream.py::test_async_stream_non_zero_exit_is_raised_from_join | tests/conformance/test_lifecycle.py::test_nonzero_exit_without_reconnect_fails |
+| tests/test_async_stream.py::test_async_stream_parse_error_propagates_to_join | API removed by decision U-1 |
+| tests/test_async_stream.py::test_async_stream_startup_failure_propagates_to_join | tests/conformance/test_lifecycle.py::test_missing_adb_fails_at_the_clock_read |
+| tests/test_async_stream.py::test_auto_reconnect | tests/conformance/test_reconnect.py::test_reconnect_after_a_nonzero_exit |
+| tests/test_async_stream.py::test_callbacks | tests/conformance/test_callbacks.py::test_push_delivers_every_line_in_order |
+| tests/test_async_stream.py::test_context_manager | tests/conformance/test_lifecycle.py::test_with_block_stops_and_joins |
+| tests/test_async_stream.py::test_dispatch_drop_newest_drops_when_queue_full | API removed by decision U-4 |
+| tests/test_async_stream.py::test_dispatch_drop_oldest_evicts_when_queue_full | API removed by decision U-4 |
+| tests/test_async_stream.py::test_ingestion_not_blocked_by_slow_callback | tests/conformance/test_callbacks.py::test_on_event_not_under_lock |
+| tests/test_async_stream.py::test_lifecycle | tests/conformance/test_lifecycle.py::test_start_iterate_stop |
+| tests/test_async_stream.py::test_pause_stops_dispatch_and_resume_continues | API removed by decision D-7 |
+| tests/test_async_stream.py::test_pid_monitor | mocked private internals; behavior covered by tests/conformance/test_attribution.py::test_package_lines_are_attributed_by_uid_lookup |
+| tests/test_async_stream.py::test_read_loop_skips_oversized_line_and_continues | mocked private internals; behavior covered by tests/core/test_framing.py::test_oversized_line_keeps_following_lines |
+| tests/test_async_stream.py::test_stop_dispatcher_bounded_drain_when_callback_stuck | mocked private internals; behavior covered by tests/conformance/test_consumer.py::test_kill_ends_a_stuck_drain |
+| tests/test_async_stream.py::test_stop_dispatcher_evicts_to_enqueue_sentinel_when_queue_full | mocked private internals; behavior covered by tests/core/test_mailbox.py::test_terminal_group_survives_full_outbox |
+| tests/test_async_stream.py::test_stream_with_pid_monitor | tests/conformance/test_attribution.py::test_package_lines_are_attributed_by_uid_lookup |
+| tests/test_async_stream_timeout.py::test_read_timeout_is_raised_by_join | tests/conformance/test_reconnect.py::test_read_timeout_without_reconnect_fails |
+| tests/test_async_stream_timeout.py::test_read_timeout_raises_exception | covered by tests/conformance/test_reconnect.py::test_read_timeout_without_reconnect_fails |
+| tests/behavior/test_async_stream_behavior.py::test_zero_adb_exit_makes_join_return_normally | tests/behavior/test_async_stream_behavior.py::test_zero_adb_exit_is_the_outcome |
+| tests/behavior/test_async_stream_behavior.py::test_kill_of_a_running_stream_makes_join_raise_killed | tests/behavior/test_async_stream_behavior.py::test_kill_ends_killed_and_join_returns |
+| tests/behavior/test_async_stream_behavior.py::test_stderr_output_reaches_only_stderr_callback | tests/behavior/test_async_stream_behavior.py::test_stderr_lines_are_logged_not_delivered |
+| tests/behavior/test_async_stream_behavior.py::test_raising_data_callback_reports_to_on_error_and_stream_continues | tests/behavior/test_async_stream_behavior.py::test_raising_data_callback_ends_the_run_with_callback_error |

@@ -181,11 +181,11 @@ def test_on_event_raising_on_connecting_fails_cleanly(
 _WAITS = ("join", "join_timeout", "wait_running")
 
 
-def _try_waits(stream: LogStream[LogEntry], errors: list[str]) -> None:
+def _try_waits(driver: Driver, stream: LogStream[LogEntry], errors: list[str]) -> None:
     calls: dict[str, Callable[[], None]] = {
-        "join": stream.join,
-        "join_timeout": lambda: stream.join(timeout=1.0),
-        "wait_running": lambda: stream.wait_running(timeout=1.0),
+        "join": lambda: driver.join(stream, timeout=None),
+        "join_timeout": lambda: driver.join(stream, timeout=1.0),
+        "wait_running": lambda: driver.wait_running(stream, timeout=1.0),
     }
     for name in _WAITS:
         try:
@@ -201,8 +201,14 @@ def test_join_from_callback_raises_usage_error(
     driver: Driver, fake_adb: FakeAdb, where: str
 ) -> None:
     """join() and wait_running() from the stream's own user code raise
-    UsageError instead of deadlocking (F3-7, design 3.6).
+    UsageError instead of deadlocking (F3-7, design 3.6). For an async
+    stream, a callback's join() is the one its task awaits.
     """
+    if where == "where" and driver.name == "async":
+        pytest.skip(
+            "where runs synchronously in the engine on the event loop: it "
+            "cannot await join() or wait_running() (coroutines)"
+        )
     fake_adb.logcat(run(out(logcat_line("a")), wait("never")))
     errors: list[str] = []
     stream: LogStream[LogEntry]
@@ -212,13 +218,13 @@ def test_join_from_callback_raises_usage_error(
             isinstance(record, StateChange) and record.new is S.RUNNING
         ):
             if not errors:
-                _try_waits(stream, errors)
+                _try_waits(driver, stream, errors)
             stream.stop()
 
     def condition(entry: LogEntry) -> bool:
         del entry
         if not errors:
-            _try_waits(stream, errors)
+            _try_waits(driver, stream, errors)
         return True
 
     if where == "on_item":

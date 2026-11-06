@@ -7,8 +7,7 @@ callback raised takes nothing more, a failure the outcome cannot take is
 logged, and kill() ends a run whatever the consumer does. A.21 also lists
 ``test_never_iterated_pull_stop_join_returns`` (in ``test_lifecycle.py``) and
 the async-only ``test_anext_cancel_in_on_event_settles`` and
-``test_anext_cancel_at_checkpoint_loses_nothing``, which come with the async
-driver (PR-13).
+``test_anext_cancel_at_checkpoint_loses_nothing`` (in ``test_async.py``).
 """
 
 from __future__ import annotations
@@ -56,11 +55,7 @@ def _adb_ended(fake: FakeAdb) -> None:
     def ended() -> bool:
         children = fake.children("logcat")
         return bool(children) and all(
-            not child.alive()
-            and all(
-                p is None or p.closed for p in (child.popen.stdout, child.popen.stderr)
-            )
-            for child in children
+            not child.alive() and child.pipes_closed() for child in children
         )
 
     wait_until(ended, timeout=TIMEOUT)

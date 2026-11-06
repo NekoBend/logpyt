@@ -1,7 +1,6 @@
 """Stream configuration shared by both drivers (design section 2.2, decision D-1).
 
-`LogStream` reads it; the 2.x `AsyncLogStream` keeps its own constructor
-arguments until its rewrite switches over (design section 8.1, PR-13).
+`LogStream` and `AsyncLogStream` take it as their first argument.
 
 The ``logcat_args`` whitelist mirrors how the Android 7.0 logcat parses its
 arguments (``getopt_long`` with ``:cdDLt:T:gG:sQf:r:n:v:b:BSpP:m:e:``,

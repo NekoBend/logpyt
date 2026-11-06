@@ -111,9 +111,8 @@ def test_grandchild_holding_stdout_is_bounded(
     warned = [r.getMessage() for r in caplog.records if r.name == "logpyt.stream"]
     assert any("stdout pipe stayed open for exit_drain" in m for m in warned), warned
     (child,) = fake_adb.children("logcat")
-    pipe = child.popen.stdout
-    assert pipe is not None
-    wait_until(lambda: pipe.closed, timeout=TIMEOUT)
+    assert child.popen.stdout is not None
+    wait_until(lambda: child.pipe_closed(child.popen.stdout), timeout=TIMEOUT)
     assert stream.stats.lines == 2
     assert stream.state is S.FAILED
 
