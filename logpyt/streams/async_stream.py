@@ -32,14 +32,17 @@ Tasks of one run (design 5.4), all on the loop that called ``start()``:
 The engine's end cancels and awaits the tasks still running. Cancelled
 itself (the loop shuts down), it kills adb at once, starts nothing more and
 ends the run like a crash, so no wait hangs (F3-2); a run whose ``Finished``
-was carried out keeps its outcome then (G4, `_Run._abandoned`). A task that
-raises (a logpyt bug) ends the run as an engine crash does
-(`_Run._worker_failed`, `_Run._crashed`): adb is killed and reaped, then
-every wait ends and raises that exception. ``KeyboardInterrupt`` (Ctrl+C on
-the loop's thread) and ``SystemExit`` (``sys.exit()``, from a SIGTERM
-handler say) are neither a bug nor a callback failure, in any task of the
-run: the engine (``where`` and ``group_by`` included), an I/O task, or the
-dispatcher (a push callback). adb is killed at once and the run ends as for
+was carried out keeps its outcome then (G4, `_Run._abandoned`). A task
+cancelled before its first step runs none of its code, so the engine's and
+the dispatcher's done-callbacks do their ends then (`_Run._engine_done`,
+`_Run._detach_on`). A task that raises (a logpyt bug) ends the run as an
+engine crash does (`_Run._worker_failed`, `_Run._crashed`): adb is killed
+and reaped, then every wait ends and raises that exception.
+``KeyboardInterrupt`` (Ctrl+C on the loop's thread) and ``SystemExit``
+(``sys.exit()``, from a SIGTERM handler say) are neither a bug nor a
+callback failure, in any task of the run: the engine (``where`` and
+``group_by`` included), an I/O task, or the dispatcher (a push callback).
+adb is killed at once and the run ends as for
 a cancelled engine, with that exception (unless its ``Finished`` was carried
 out); nothing is logged, and it leaves the loop without waiting
 (`_Run._interrupted`), as asyncio raises both out of the loop. One in the
@@ -65,9 +68,9 @@ futures resolved by whoever changes what they wait for: the engine's
 ``join()``, ``wait_running()`` and with-exit (`_Run._notify_waiters`).
 ``stop()`` and ``kill()`` are plain functions: on the loop they act at once,
 from any other thread they go through ``loop.call_soon_threadsafe`` (``kill()``
-sets the consumer's kill flag before it returns, F2-7), and once the loop is
-closed they do nothing. ``state``, ``stats`` and ``outcome`` may be read from
-any thread.
+sets the consumer's kill flag before it returns, F2-7, and while the loop is
+stopped also kills adb in place), and once the loop is closed they do
+nothing. ``state``, ``stats`` and ``outcome`` may be read from any thread.
 
 The consumer side follows the contract in `logpyt._core.protocol`: one
 delivery iterator (`_Run.deliver_next`) for pull and push, each step one task
@@ -88,6 +91,7 @@ import inspect
 import logging
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -336,8 +340,9 @@ class _Run:
         self.started = True
         self.loop = loop
         self.data = asyncio.Queue(_DATA_SLOTS)
-        if push:
-            self.consumer = _Consumer(owner=None, push=True)
+        consumer = _Consumer(owner=None, push=True) if push else None
+        if consumer is not None:
+            self.consumer = consumer
             self.consumed = True
         self.control.post(Start())
         # The engine and the dispatcher run the stream's user code; the tasks
@@ -345,11 +350,13 @@ class _Run:
         context = contextvars.copy_context()
         context.run(_IN_CALLBACK.set, self)
         engine = self._task(self._engine(), "logpyt-engine", context=context)
+        engine.add_done_callback(self._engine_done)
         self.engine_task = weakref.ref(engine)
-        if push:
+        if consumer is not None:
             dispatcher = self._task(
-                self._dispatch(), "logpyt-dispatcher", context=context
+                self._dispatch(consumer), "logpyt-dispatcher", context=context
             )
+            dispatcher.add_done_callback(functools.partial(self._detach_on, consumer))
             self.dispatcher_task = weakref.ref(dispatcher)
         return True
 
@@ -383,14 +390,25 @@ class _Run:
         thread's result can wake it at once), and takes no item then. A step
         that was popping when the flag was set (`kill_lock`) began before
         kill() returned.
+
+        While the loop is stopped (between two ``run_until_complete`` calls,
+        or after Ctrl+C left it), the request waits until it runs again, and
+        a loop closed meanwhile never runs it: adb is killed here at once
+        too, as the finalizer does (`_abandon`). The loop runs the request
+        first when it runs again, so the run still ends KILLED.
         """
-        if self.loop is None:
+        loop = self.loop
+        if loop is None:
             return
         if self.on_loop():
             self._kill_now(detach_own=detach_own)
-        elif self._soon(self._kill_now) and self.started and not self.finished:
-            with self.kill_lock:
-                self.kill_flag = True
+            return
+        if not self._soon(self._kill_now) or not self.started or self.finished:
+            return
+        with self.kill_lock:
+            self.kill_flag = True
+        if not loop.is_running():
+            self.kill_children()
 
     def _kill_now(self, *, detach_own: bool = False) -> None:
         if detach_own:
@@ -620,16 +638,19 @@ class _Run:
 
     # -- the consumer side: one delivery iterator for pull and push -----------------
 
-    async def _dispatch(self) -> None:
-        """Push mode: ``for item in <the delivery iterator>: on_item(item)`` (A-4)."""
-        # An eager task factory would run this step inside start(), which
-        # runs no user code (design 3.3): yield first.
-        await asyncio.sleep(0)
-        consumer = self.consumer
+    async def _dispatch(self, consumer: _Consumer) -> None:
+        """Push mode: ``for item in <the delivery iterator>: on_item(item)`` (A-4).
+
+        Cancelled before its first step, it runs none of this: its
+        done-callback (`_detach_on`) detaches it then.
+        """
         on_item = self.on_item
-        assert consumer is not None  # noqa: S101  (set by start)
         assert on_item is not None  # noqa: S101  (push mode has one)
         try:
+            # An eager task factory would run this step inside start(), which
+            # runs no user code (design 3.3): yield first, inside the try, so
+            # a cancellation there still detaches.
+            await asyncio.sleep(0)
             while (item := await self.deliver_next(consumer)) is not None:
                 if not await self._call(consumer, "on_item", on_item, item):
                     return
@@ -822,6 +843,16 @@ class _Run:
         if empty or (low and not self.intake_open):
             self._notify_engine()
 
+    def _detach_on(self, consumer: _Consumer, task: asyncio.Task[None]) -> None:
+        """Done-callback of the dispatcher: detach it, as its ``finally`` does.
+
+        A task cancelled before its first step runs no code of its own, so
+        without this a dispatcher cancelled right after ``start()`` stayed
+        attached: the run never ended, even after ``kill()`` (F3-2).
+        """
+        del task
+        self._detach(consumer)
+
     def _detach(self, consumer: _Consumer) -> None:
         """`Outbox.detach` and `ConsumerDetached` in one task step."""
         if not consumer.attached:
@@ -929,14 +960,20 @@ class _Run:
     # -- the engine ---------------------------------------------------------------
 
     async def _engine(self) -> None:
-        # An eager task factory would run this step inside start(), which
-        # never waits for adb (design 2.3): yield first.
-        await asyncio.sleep(0)
+        """The engine task (see the module docs).
+
+        Cancelled before its first step, it runs none of this: its
+        done-callback (`_engine_done`) ends the run then.
+        """
         loop = self.loop
         assert loop is not None  # noqa: S101  (started)
         core = self.core
         interrupted = False
         try:
+            # An eager task factory would run this step inside start(), which
+            # never waits for adb (design 2.3): yield first, inside the try, so
+            # a cancellation there still ends the run (F3-2).
+            await asyncio.sleep(0)
             while (event := await self._take()) is not None:
                 if isinstance(event, CallbackFailed):
                     late = core.late_failure(event)
@@ -1177,6 +1214,21 @@ class _Run:
             if late is not None and isinstance(event, CallbackFailed):
                 _log.error("%s", late, exc_info=event.error)
         self._end()
+
+    def _engine_done(self, task: asyncio.Task[None]) -> None:
+        """Done-callback of the engine: end a run whose engine never ran.
+
+        A task cancelled before its first step runs no code of its own, so
+        the engine's handler (`_abandoned`) did not run, and every wait hung
+        (F3-2). Such an engine started nothing: there is no task to cancel
+        and no adb to reap. The waits raise the task's own CancelledError.
+        """
+        if not task.cancelled() or self.ended:
+            return
+        try:
+            task.result()
+        except asyncio.CancelledError as exc:
+            self._abandoned(exc)
 
     def _interrupted(self, error: BaseException) -> None:
         """Ctrl+C (``KeyboardInterrupt``) or ``sys.exit()`` (``SystemExit``) in
@@ -1497,22 +1549,50 @@ def _owned_here(consumer: _Consumer) -> bool:
 def _send(proc: _Process, *, kill: bool) -> None:
     """Terminate or kill ``proc`` (its pid only, design 5.11) unless it has exited.
 
-    On POSIX the signal goes to the pid with ``os.kill``: asyncio's
-    ``Process.kill`` polls the child first (``Popen.send_signal``), which can
-    reap it before asyncio's child watcher and make that report exit status
-    255. Until the watcher has set ``returncode`` the child is not reaped by
-    asyncio, so its pid is still ours. On Windows terminate is a kill (5.11).
+    On POSIX the signal goes to the pid with ``os.kill``, not through
+    ``Popen.send_signal`` (asyncio's ``Process.kill`` on 3.12): that polls the
+    child first, which can reap it before asyncio's child watcher and make
+    that report exit status 255. But asyncio sets ``returncode`` only a loop
+    step after it reaped the child, and only once the loop runs: its threaded
+    watcher (where pidfd is missing: macOS, Linux before 5.3 or under a
+    seccomp filter) reaps in a thread of its own the moment the child exits,
+    also while the loop is stopped (`_Run.kill`, `_abandon`). A reaped pid
+    may be another process's, so the pid is signalled only while
+    ``os.waitid`` finds it a child of ours that has not exited (``WNOWAIT``:
+    it reaps nothing). Without ``os.waitid`` (macOS) the check is that poll
+    after all: there the watcher is the threaded one, which reaps an exited
+    child at once, so the poll finds one to reap only in a race with it. On
+    Windows the process handle is signalled, and terminate is a kill (5.11).
     """
     if proc.returncode is not None:
         return
-    with contextlib.suppress(OSError):
+    with contextlib.suppress(OSError):  # ChildProcessError: reaped, not ours
         if sys.platform == "win32":
             if kill:
                 proc.kill()
             else:
                 proc.terminate()
+            return
+        sig = signal.SIGKILL if kill else signal.SIGTERM
+        if (waitid := getattr(os, "waitid", None)) is not None:
+            if waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+                os.kill(proc.pid, sig)
+        elif (popen := _popen(proc)) is not None:
+            popen.send_signal(sig)  # it polls first (bpo-38630)
         else:
-            os.kill(proc.pid, signal.SIGKILL if kill else signal.SIGTERM)
+            os.kill(proc.pid, sig)
+
+
+def _popen(proc: _Process) -> subprocess.Popen[bytes] | None:
+    """The `subprocess.Popen` behind an adb child, which its transport keeps
+    (``get_extra_info("subprocess")``; see `_close_pipe` for ``_transport``),
+    or None for a loop that keeps none.
+    """
+    transport = getattr(proc, "_transport", None)
+    if not isinstance(transport, asyncio.SubprocessTransport):
+        return None
+    popen = transport.get_extra_info("subprocess")
+    return popen if isinstance(popen, subprocess.Popen) else None
 
 
 def _close_pipe(proc: _Process, fd: int) -> None:
@@ -1614,13 +1694,39 @@ async def _kill_and_wait(run: _Run, *, detach_own: bool = False) -> None:
         await run.wait_ended(_KILL_WAIT, "the with-block exit")
 
 
+async def _exit_interrupted(
+    run: _Run, interrupt: BaseException, handled: BaseException | None, *, kill: bool
+) -> None:
+    """with-exit: ``interrupt`` cut its wait short (design 3.4); the caller
+    re-raises it once this returns.
+
+    ``interrupt`` gets ``handled`` as its ``__context__`` (`_keep_context`).
+    With ``kill``, the run is killed and waited for first, so adb does not
+    outlive the block. Then the exit suspends once more: asyncio throws a
+    cancellation into the innermost wait, and while that throw unwinds,
+    every awaiting coroutine frame that handles an exception (an
+    ``except`` clause in a caller of the ``async with``) makes it the
+    ``__context__``, the outermost last. A re-raise after a suspension
+    propagates as a plain return, which chains nothing. A `GeneratorExit`
+    (the exit's coroutine is being closed) gets no such suspension: a
+    coroutine that suspends while it is closed makes ``close()`` raise
+    RuntimeError.
+    """
+    _keep_context(interrupt, handled)
+    if kill:
+        await _kill_and_wait(run, detach_own=True)
+    if not isinstance(interrupt, GeneratorExit):
+        await asyncio.sleep(0)
+
+
 class _PullIterator[T]:
     """The pull iterator of a stream (design 3.5, A-21): a class, not an async
     generator.
 
     It keeps its stream alive. ``aclose()``, and ``__del__`` when a ``break``
     drops the last reference, detach it at once; the rest is discarded and
-    counted.
+    counted. ``__anext__()`` awaited outside the run's loop raises UsageError,
+    as ``__aiter__`` does there (design 4.2).
     """
 
     __slots__ = ("_consumer", "_done", "_handed", "_run", "_stream")
@@ -1638,6 +1744,14 @@ class _PullIterator[T]:
         return self
 
     async def __anext__(self) -> T:
+        if not self._run.on_loop():
+            # A step is a task step of the run's loop (the protocol's
+            # critical section): it may not pop, nor run on_event, elsewhere.
+            msg = (
+                "an AsyncLogStream iterator was awaited outside the event loop "
+                "that started the stream; await it in a coroutine on that loop"
+            )
+            raise UsageError(msg)
         if self._done:
             raise StopAsyncIteration
         consumer = self._consumer
@@ -1845,7 +1959,13 @@ class AsyncLogStream[T]:
         self._run.stop(_checked_flush(flush, self._flush_hidden_by))
 
     def kill(self) -> None:
-        """Kill adb at once and discard undelivered items; idempotent (design 3.4)."""
+        """Kill adb at once and discard undelivered items; idempotent (design 3.4).
+
+        From any thread. Called while the stream's loop is stopped (not
+        closed), it kills adb in place, and the run ends KILLED when the
+        loop runs again. Before ``start()``, after the end, and once the loop
+        is closed it does nothing.
+        """
         self._run.kill()
 
     async def join(self, timeout: float | None = None) -> None:
@@ -2008,22 +2128,25 @@ class AsyncLogStream[T]:
                 run.stop(None, detach_own=True)
                 await run.wait_ended(None, "the with-block exit")
             except BaseException as interrupt:
-                _keep_context(interrupt, handled)
-                await _kill_and_wait(run, detach_own=True)
+                await _exit_interrupted(run, interrupt, handled, kill=True)
                 raise
             error = run.take_error(unseen_only=True)
             if error is not None:
                 raise error
             return
         if not isinstance(exc, Exception | GeneratorExit):
-            await _kill_and_wait(run, detach_own=True)  # cancelled, Ctrl+C, ...
+            try:
+                await _kill_and_wait(run, detach_own=True)  # cancelled, Ctrl+C, ...
+            except BaseException as interrupt:
+                # The kill went out before the wait, which this only cut short.
+                await _exit_interrupted(run, interrupt, exc, kill=False)
+                raise
             return
         try:
             run.stop(None, detach_own=True)
             progressing = await run.wait_while_progressing(self._config.close_timeout)
         except BaseException as interrupt:
-            _keep_context(interrupt, exc)
-            await _kill_and_wait(run, detach_own=True)
+            await _exit_interrupted(run, interrupt, exc, kill=True)
             raise
         if not progressing:
             await _kill_and_wait(run)
