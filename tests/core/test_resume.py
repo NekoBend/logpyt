@@ -550,8 +550,9 @@ def test_clock_step_back_reanchors_once_and_restarts_hw() -> None:
     assert request == clock * S - 4 * S - 2 * S  # N - outage - overlap
     # A second attempt (the first read nothing) reports the step only once.
     assert connect(plan, clock + 1, at=15.0) == (None, (clock + 1) * S - 7 * S)
+    # An old line ahead of the new one, and the lines read after it.
     verdicts = screen(
-        plan, old[1], entry("new", clock * S), old[0], entry("old", BASE - S), at=15.5
+        plan, entry("old", BASE - S), entry("new", clock * S), *old, at=15.5
     )
     assert verdicts == ["deduplicated", "new", "deduplicated", "deduplicated"]
     assert plan.cursor == clock * S
@@ -1221,6 +1222,968 @@ def test_late_line_taken_for_a_step_keeps_the_caps_bound(ahead: str) -> None:
     assert gaps(plan) == []
 
 
+def test_since_now_each_attempt_is_the_first_clock_read() -> None:
+    """Every attempt before the marker starts over at its own clock (design
+    A.25): the capture's first clock read is the one of the marker's attempt,
+    so a step during the capture is reported although the clock moved forward
+    between the attempts."""
+    plan = planner("now")
+    plan.clock(CLOCK, issued=0.0)  # its marker write fails
+    plan.clock(CLOCK + 3600, issued=10.0)
+    plan.position()
+    plan.marker(entry("start-2", (CLOCK + 3600) * S, tag="logpyt"), 40, 10.5)
+    screen(plan, entry("a", (CLOCK + 3620) * S), at=30.0)
+
+    gap, _request = connect(plan, CLOCK + 3610, at=31.0)  # 10 s back
+
+    assert gap is not None
+    assert gap.reason == "clock_moved_back"
+
+
+def test_outage_counts_from_the_marker_read() -> None:
+    """The marker and the lines ahead of it are lines read: a re-anchor right
+    after the marker counts its outage from the marker's read."""
+    plan = planner("now")
+    plan.clock(CLOCK, issued=0.0)
+    plan.position()
+    plan.marker(entry("start-1", CLOCK * S + 5, tag="logpyt"), 40, 2.0)
+
+    _gap, request = connect(plan, CLOCK - 3600, at=7.0)
+
+    assert request == (CLOCK - 3600) * S - 5 * S - 2 * S
+
+
+@pytest.mark.parametrize("case", ["reanchor", "resume", "overlap", "now"])
+def test_request_is_never_negative(case: str) -> None:
+    """Near the epoch a request can fall below 0, an invalid -T: it stays at 0
+    (design A.25). The re-anchor's outage and the overlap are host times, so
+    they can exceed the clock; every attempt would ask for the same bad value."""
+    plan = planner("now" if case == "now" else "backlog")
+    if case == "reanchor":
+        connect(plan, 100, at=0.0)
+        screen(plan, entry("a", 100 * S), at=1.0)
+        request = connect(plan, 5, at=11.0)[1]
+    elif case == "resume":
+        connect(plan, 1, at=0.0)
+        screen(plan, entry("a", 3 * S // 2), at=1.0)
+        request = connect(plan, 2, at=2.0)[1]
+    elif case == "overlap":
+        plan = planner(overlap=1e12)
+        connect(plan, at=0.0)
+        screen(plan, entry("a", BASE), at=1.0)
+        request = connect(plan, at=2.0)[1]
+    else:
+        request = connect(plan, 0, at=0.0)[1]
+
+    assert request == 0
+
+
+# -- forward clock steps ---------------------------------------------------------------
+
+
+def _reanchored(plan: ResumePlanner) -> tuple[list[LogEntry], int]:
+    """A capture, a step back of an hour during an outage and its re-anchor at
+    host 5.0, whose replay shows the lines read and one of the new clock."""
+    underway(plan)
+    old = [entry("a", BASE), entry("b", BASE + S // 2)]
+    screen(plan, *old, at=1.0)
+    clock = CLOCK - 3600
+    gap, _request = connect(plan, clock, at=5.0)
+    assert gap is not None
+    new = entry("c", clock * S)
+    assert screen(plan, *old, new, at=5.1) == ["deduplicated", "deduplicated", "new"]
+    return [*old, new], clock
+
+
+@pytest.mark.parametrize("where", ["below_the_read", "among_the_read"])
+def test_forward_step_below_the_old_hw_goes_on(where: str) -> None:
+    """5.6's device with a wrong clock that then syncs: a line above every time
+    the clock can show, 1.3 s after the clock read, past the first new line, is
+    no old line: it goes on, moves hw, and the next resume replays it once."""
+    plan = planner()
+    (*old, new), clock = _reanchored(plan)
+    forward = (clock + 1800) * S if where == "below_the_read" else BASE - S
+    lines = [entry(f"f{i}", forward + i) for i in range(3)]
+
+    assert screen(plan, *lines, at=6.3) == ["new"] * 3
+
+    assert plan.take() == []
+    assert plan.cursor == forward + 2
+    gap, request = connect(plan, forward // S + 2, at=7.0)
+    assert gap is None
+    assert request == forward + 2 - 2 * S
+    later = entry("g", forward + S)
+    verdicts = screen(plan, *old, new, *lines, later, at=7.1)
+    assert verdicts == [
+        *["deduplicated"] * 2,
+        "below_cursor",
+        *["deduplicated"] * 3,
+        "new",
+    ]
+    assert plan.take() == []
+
+
+def test_forward_step_past_the_old_hw_ends_the_ceiling() -> None:
+    """The same past the old hw: the clock passed the old times, and the next
+    request lies above every line read before the step."""
+    plan = planner()
+    _lines, _clock = _reanchored(plan)
+    lines = [entry(f"f{i}", BASE + 10 * S + i) for i in range(3)]
+
+    assert screen(plan, *lines, at=6.3) == ["new"] * 3
+
+    assert plan.cursor == BASE + 10 * S + 2
+    assert plan._ceiling is None
+    gap, request = connect(plan, BASE // S + 12, at=7.0)
+    assert gap is None
+    assert request == BASE + 8 * S + 2
+    assert screen(plan, *lines, entry("g", BASE + 11 * S), at=7.1) == [
+        *["deduplicated"] * 3,
+        "new",
+    ]
+    assert plan.take() == []
+
+
+def test_forward_step_within_the_slack_comes_once() -> None:
+    """Within 1 s of the clock read such a line could be a ring in time order
+    returning old lines, but those end at the line at hw, which was replayed: it
+    is delivered, moves nothing, and later replays match it."""
+    plan = planner()
+    (*old, new), clock = _reanchored(plan)
+    line = entry("f", BASE - S)  # among the times read before the step
+
+    assert screen(plan, line, at=5.5) == ["new"]
+
+    assert plan.cursor == clock * S
+    connect(plan, clock + 1, at=5.8)
+    verdicts = screen(plan, *old, new, line, at=5.9)
+    assert verdicts == ["deduplicated"] * 4
+    assert plan.take() == []
+
+
+@pytest.mark.parametrize("where", ["above", "below"])
+def test_forward_step_ahead_of_any_new_line_comes_once(where: str) -> None:
+    """The line at hw was replayed and no line of the new clock came: lines
+    above the clock go on as lines logged before the step, however late. They
+    move nothing and later replays match them, whichever the resume's kind."""
+    plan = planner()
+    underway(plan)
+    old = [entry("a", BASE), entry("b", BASE + S // 2)]
+    screen(plan, *old, at=1.0)
+    clock = CLOCK - 3600
+    gap, _request = connect(plan, clock, at=5.0)
+    assert gap is not None
+    forward = BASE + 2 * S if where == "above" else BASE - S
+    lines = [entry(f"f{i}", forward + i) for i in range(3)]
+
+    verdicts = screen(plan, *old, *lines, at=7.0)
+
+    assert verdicts == [*["deduplicated"] * 2, *["new"] * 3]
+    assert plan.cursor == BASE + S // 2
+    seconds = BASE // S + 3 if where == "above" else clock + 1
+    gap, _request = connect(plan, seconds, at=8.0)
+    assert gap is None
+    later = entry("g", seconds * S + S // 2)
+    replay = screen(plan, *old, *lines, later, at=8.1)
+    assert replay == [*["deduplicated"] * 5, "new"]
+    assert plan.take() == []
+
+
+def test_forward_step_after_a_live_step_back_needs_no_slack() -> None:
+    """A connection that crossed the step back in its own lines has read past
+    the lines before it: a line above the clock is a forward step at once."""
+    plan = planner()
+    underway(plan)
+    old = entry("a", BASE)
+    screen(plan, old, at=1.0)
+    connect(plan, BASE // S, at=1.0)  # the clock read is 0.2 s old at the line
+    assert screen(plan, old, at=1.0) == ["deduplicated"]
+    back = entry("c", BASE - 3600 * S)
+    assert screen(plan, back, at=1.1) == ["new"]
+    assert [gap.reason for gap in gaps(plan)] == ["clock_moved_back"]
+    line = entry("f", BASE + 10 * S)
+
+    assert screen(plan, line, at=1.2) == ["new"]
+
+    assert plan.cursor == BASE + 10 * S
+    gap, request = connect(plan, BASE // S + 11, at=2.0)
+    assert gap is None
+    assert request == BASE + 8 * S
+    assert screen(plan, line, at=2.1) == ["deduplicated"]
+    assert plan.take() == []
+
+
+def test_drift_after_a_reanchor_keeps_the_lines() -> None:
+    """A device clock that gains on the host after a re-anchor leaves the
+    estimate behind: its lines are forward steps, not old lines."""
+    plan = planner()
+    (*_lines, last), clock = _reanchored(plan)
+    ts = micros(last.timestamp)
+    verdicts = []
+    for k in range(1, 1081):  # 3 h of lines; the clock gains 3 s
+        line = entry(f"x{k}", ts + k * 10 * S + k * 2778)
+        verdicts.append(plan.screen(line, 80, 5.1 + k * 10.0))
+
+    assert verdicts == ["new"] * 1080
+    assert plan.take() == []
+    assert plan.cursor == ts + 1080 * 10 * S + 1080 * 2778
+    assert clock * S == ts
+
+
+def test_forward_step_with_the_read_lines_gone_is_the_limit() -> None:
+    """The documented limit (design A.25): the ring lost the lines read before
+    and no new line came, so a line within the times read before the step
+    cannot be told from an old line that left the window. Past the first new
+    line and the slack it goes on."""
+    plan = planner()
+    underway(plan)
+    screen(plan, entry("a0", BASE - 5 * S), entry("a", BASE), at=1.0)
+    clock = CLOCK - 3600
+    connect(plan, clock, at=5.0)
+
+    assert screen(plan, entry("f", BASE - S), at=6.3) == ["deduplicated"]
+
+    assert screen(plan, entry("n", clock * S + 1), at=6.4) == ["new"]
+    assert screen(plan, entry("f2", BASE - S + 1), at=6.5) == ["new"]
+
+
+# -- a re-anchor's replay --------------------------------------------------------------
+
+
+def test_step_between_attempts_is_reported_again() -> None:
+    """A repeated attempt at the same hw reports nothing for the same step, but
+    its clock read can show a second one. The lines logged between the steps
+    are not old lines: they lie below every line read before."""
+    plan = planner()
+    underway(plan)
+    old = entry("a", BASE)
+    screen(plan, old, at=1.0)
+    clock = CLOCK - 3600
+
+    first, _request = connect(plan, clock, at=5.0)
+    same, _request = connect(plan, clock + 1, at=6.0)
+    second, _request = connect(plan, clock - 3599, at=7.0)
+    third, _request = connect(plan, clock - 3598, at=8.0)
+
+    assert first == Gap(moment(BASE), moment(clock * S), None, "clock_moved_back")
+    assert same is None
+    assert second == Gap(
+        moment(BASE), moment((clock - 3599) * S), None, "clock_moved_back"
+    )
+    assert third is None
+    middle = entry("m", (clock + 1) * S)
+    assert screen(plan, old, middle, at=8.1) == ["deduplicated", "new"]
+    assert plan.cursor == (clock + 1) * S
+
+
+def test_repeated_attempt_counts_the_outage_from_the_line_at_hw() -> None:
+    """An attempt that only replayed old lines does not shorten the next one's
+    outage: the new lines lie below a request counted from those reads."""
+    plan = planner()
+    underway(plan)
+    old = [entry("a", BASE), entry("b", BASE + S // 2)]
+    screen(plan, *old, at=1.0)
+    clock = CLOCK - 3600
+    connect(plan, clock, at=5.0)
+    assert screen(plan, old[0], at=5.5) == ["deduplicated"]
+
+    _gap, request = connect(plan, clock + 1, at=6.0)
+
+    assert request == (clock + 1) * S - 5 * S - 2 * S
+
+
+def test_lines_past_the_read_ones_are_delivered() -> None:
+    """Two steps in one outage, one replay across them: once the line at hw was
+    replayed, a line above the clock and within the times read before was not
+    read (the first step's lines). It comes once, and hw stays."""
+    plan = planner()
+    underway(plan)
+    old = [entry("a", BASE), entry("b", BASE + S)]
+    screen(plan, *old, at=1.0)
+    clock = BASE // S - 20
+    gap, _request = connect(plan, clock, at=5.0)
+    assert gap is not None
+    middle = [entry("m0", BASE - S), entry("m1", BASE + S // 2)]
+    near = entry("z", clock * S)
+
+    assert screen(plan, *old, *middle, near, at=5.1) == [
+        "deduplicated",
+        "deduplicated",
+        "new",
+        "new",
+        "new",
+    ]
+
+    assert plan.cursor == clock * S
+    assert plan.take() == []
+    connect(plan, clock + 1, at=5.2)
+    assert screen(plan, *old, *middle, near, at=5.3) == ["deduplicated"] * 5
+
+
+def test_line_above_the_read_ones_ends_their_replay() -> None:
+    """The ring lost the lines at hw, but a line above every line read shows the
+    replay is past them: an unmatched line among their times, after it, was not
+    read. The re-anchor's below_cursor rule ends with it too."""
+    plan = planner()
+    underway(plan)
+    screen(plan, entry("a0", BASE - S), entry("a", BASE), at=1.0)
+    clock = CLOCK - 3600
+    _gap, request = connect(plan, clock, at=5.0)
+    assert request is not None
+    above = entry("u", BASE + S)
+    among = entry("m", BASE - S // 2)
+    below = entry("n", request - S)
+
+    assert screen(plan, above, among, below, at=5.1) == ["new", "new", "new"]
+
+
+def test_line_below_every_line_read_goes_on() -> None:
+    """A second step whose clock read cannot show it (the clock is above the new
+    hw), and a ring that lost the lines read: a line above the clock and below
+    every line read before the first step was never read. It goes on, and the
+    ring check reports the hole. Taking it for an old line lost it silently."""
+    plan = planner()
+    underway(plan)
+    screen(plan, entry("a", BASE), at=1.0)
+    clock = CLOCK - 3600
+    connect(plan, clock, at=5.0)
+    screen(plan, entry("n", clock * S), at=5.1)
+    plan.take()
+    connect(plan, clock + 10, at=15.0)
+    line = entry("u", (clock + 40) * S)
+
+    assert screen(plan, line, at=15.1) == ["new"]
+
+    assert gaps(plan) == [
+        Gap(moment(clock * S), line.timestamp, None, "ring_rotated"),
+    ]
+    assert plan.cursor == (clock + 40) * S
+
+
+def test_line_below_the_start_stays_dropped_after_a_step() -> None:
+    """With a start position the ring holds older lines that were never read and
+    are not the capture's: a re-anchor's request can reach them, and they are
+    dropped like old lines, not delivered as lines below every line read."""
+    plan = planner(moment(BASE))
+    connect(plan, BASE // S, at=0.0)
+    screen(plan, entry("a", BASE + 2 * S), at=1.0)
+    plan.take()
+    clock = BASE // S - 3600
+    gap, request = connect(plan, clock, at=5.0)
+    assert gap is not None
+    assert request is not None
+
+    assert screen(plan, entry("before", BASE - 60 * S), at=5.1) == ["deduplicated"]
+    assert plan.cursor == BASE + 2 * S
+
+
+def test_times_read_stay_known_after_the_old_windows_went() -> None:
+    """hw passing the old lines frees their windows, but a later step back makes
+    requests reach them again: they are still old lines, not new ones below
+    every line read."""
+    plan = planner()
+    underway(plan)
+    first = entry("a0", BASE - 20 * S)  # below every line of the next era
+    screen(plan, first, entry("a", BASE), at=1.0)
+    screen(plan, entry("b", BASE - 10 * S), at=2.0)
+    screen(plan, entry("c", BASE + 10 * S), at=3.0)
+    assert plan._old is None  # hw passed the old window
+    screen(plan, entry("d", BASE - 3600 * S), at=4.0)
+    assert [gap.reason for gap in gaps(plan)] == ["clock_moved_back"] * 2
+
+    gap, _request = connect(plan, (BASE - 3600 * S) // S + 1, at=5.0)
+
+    assert gap is None
+    assert screen(plan, first, at=5.1) == ["deduplicated"]
+    assert plan.take() == []
+
+
+@pytest.mark.parametrize("case", ["kept", "lost"])
+def test_step_from_before_the_capture_checks_the_ring(case: str) -> None:
+    """A silent re-anchor has no Gap to mark the point: when the ring lost the
+    lines at hw before the first line that goes on, Gap(ring_rotated) reports
+    the hole, and S stays. No line of the new clock was read, so none below the
+    request is dropped. With the lines at hw there, nothing is reported."""
+    plan = planner()
+    connect(plan, at=0.0)
+    start = plan._start
+    far = BASE + 3600 * S
+    read = [entry(f"o{i}", far + i) for i in range(3)]
+    screen(plan, *read, at=0.5)
+    gap, request = connect(plan, CLOCK + 1, at=1.0)
+    assert gap is None
+    assert request is not None
+    below = entry("low", request - S)
+    replay = read if case == "kept" else []
+
+    verdicts = screen(plan, *replay, below, entry("n", CLOCK * S), at=1.1)
+
+    assert verdicts == [*["deduplicated"] * len(replay), "new", "new"]
+    assert plan._start == start
+    if case == "kept":
+        assert plan.take() == []
+    else:
+        assert gaps(plan) == [
+            Gap(moment(far + 2), below.timestamp, None, "ring_rotated")
+        ]
+
+
+def test_repeated_attempt_that_lost_the_delivered_lines_reports_it() -> None:
+    """An attempt delivered lines logged before the step, then the ring rotated
+    in the next outage: the lines between the last one delivered and the first
+    line of the next replay lie behind the step's Gap, so their loss gets its
+    own Gap, once."""
+    plan = planner()
+    underway(plan)
+    old = [entry("a", BASE), entry("b", BASE + S // 2)]
+    screen(plan, *old, at=1.0)
+    clock = CLOCK - 3600
+    gap, _request = connect(plan, clock, at=5.0)
+    assert gap is not None
+    unread = entry("u", BASE + S)
+    assert screen(plan, *old, unread, at=5.1)[-1] == "new"
+
+    gap, _request = connect(plan, clock + 1, at=6.0)
+
+    assert gap is None
+    after = [entry("r0", clock * S), entry("r1", clock * S + 1)]
+    assert screen(plan, *after, at=6.1) == ["new", "new"]
+    assert gaps(plan) == [
+        Gap(unread.timestamp, after[0].timestamp, None, "ring_rotated")
+    ]
+
+
+def test_resume_with_hw_behind_delivered_lines_checks_the_ring() -> None:
+    """The clock read is back within reach of hw, but no line of the new clock came
+    yet, so hw lies behind the lines delivered from before the step: a line above
+    them with the lines at hw gone is the first line of the ring check."""
+    plan = planner()
+    underway(plan)
+    first = entry("a", BASE)
+    screen(plan, first, at=1.0)
+    gap, _request = connect(plan, BASE // S - 50, at=5.0)
+    assert gap is not None
+    assert screen(plan, first, entry("u", BASE + 100 * S), at=5.1) == [
+        "deduplicated",
+        "new",
+    ]
+    gap, _request = connect(plan, BASE // S - 1, at=55.0)
+    assert gap is None
+    line = entry("v", BASE + 150 * S)
+
+    assert screen(plan, line, at=55.1) == ["new"]
+
+    assert gaps(plan) == [Gap(first.timestamp, line.timestamp, None, "ring_rotated")]
+
+
+def test_delivered_lines_are_no_bound_for_dropping_live_ones() -> None:
+    """The same resume once the replay proved old lines, and live lines stamped
+    below those delivered from before the step: only a line read before the step
+    is dropped by its time. The first line above them is the ring check."""
+    plan = planner()
+    underway(plan)
+    first = entry("a", BASE)
+    screen(plan, first, at=1.0)
+    gap, _request = connect(plan, BASE // S - 60, at=5.0)
+    assert gap is not None
+    unread = entry("u", BASE + 20 * S)
+    assert screen(plan, first, unread, at=5.1) == ["deduplicated", "new"]
+    assert connect(plan, BASE // S - 1, at=65.0)[0] is None
+    below = entry("r", BASE - S - S // 2)
+    line = entry("v", BASE + S // 2)
+
+    assert screen(plan, below, line, at=65.1) == ["deduplicated", "new"]
+
+    assert gaps(plan) == [Gap(first.timestamp, line.timestamp, None, "ring_rotated")]
+    assert plan.cursor == line.timestamp.timestamp() * S
+    assert screen(plan, entry("w", BASE + S), at=65.2) == ["new"]
+
+
+def test_delivered_lines_the_caps_evicted_leave_the_request_at_hw() -> None:
+    """They lie above hw, so a request above them would be above hw: the resume
+    could not check the ring, and the live lines below it would go as
+    below_cursor with no Gap."""
+    plan = planner(max_lines=4)
+    underway(plan)
+    first = entry("a", BASE)
+    screen(plan, first, at=1.0)
+    gap, _request = connect(plan, BASE // S - 60, at=5.0)
+    assert gap is not None
+    unread = [entry(f"u{i}", BASE + (i + 1) * S) for i in range(10)]
+    assert screen(plan, first, *unread, at=5.1) == ["deduplicated", *["new"] * 10]
+
+    gap, request = connect(plan, BASE // S - 1, at=65.0)
+
+    assert (gap, request) == (None, BASE - 2 * S)
+    line = entry("v", BASE + S // 2)
+    assert screen(plan, line, at=65.1) == ["new"]
+    assert gaps(plan) == [Gap(first.timestamp, line.timestamp, None, "ring_rotated")]
+
+
+def test_delivered_lines_the_caps_evicted_come_again_at_the_resume() -> None:
+    """The documented limit (design A.25): the old window no longer holds them,
+    and the clock can show their times, so they are not dropped by time."""
+    plan = planner(max_lines=4)
+    underway(plan)
+    first = entry("a", BASE)
+    screen(plan, first, at=1.0)
+    gap, _request = connect(plan, BASE // S - 60, at=5.0)
+    assert gap is not None
+    unread = [entry(f"u{i}", BASE + (i + 1) * S // 10) for i in range(10)]
+    screen(plan, first, *unread, at=5.1)
+    connect(plan, BASE // S - 1, at=65.0)
+
+    verdicts = screen(plan, first, *unread, at=65.1)
+
+    assert verdicts == [
+        "deduplicated",
+        *["new"] * 6,
+        *["deduplicated"] * 4,
+    ]
+    assert gaps(plan) == []
+
+
+def test_unread_lines_after_a_silent_reanchor_report_the_hole_once() -> None:
+    """Several lines go on after the lines at hw were lost: one Gap, at the first."""
+    plan = planner()
+    connect(plan, at=0.0)
+    far = BASE + 3600 * S
+    screen(plan, entry("o", far), at=0.5)
+    gap, _request = connect(plan, CLOCK + 1, at=1.0)
+    assert gap is None
+    unread = [entry(f"u{i}", far + (i + 1) * S) for i in range(3)]
+
+    assert screen(plan, *unread, at=1.1) == ["new"] * 3
+
+    assert gaps(plan) == [Gap(moment(far), unread[0].timestamp, None, "ring_rotated")]
+
+
+def test_unread_lines_stay_matched_once_the_clock_passed_the_old_hw() -> None:
+    """A line logged before the step is delivered once, also when a later clock
+    read passes the old hw and clears the ceiling: the replay matches it."""
+    plan = planner()
+    underway(plan)
+    old = entry("a", BASE)
+    screen(plan, old, at=1.0)
+    unread = [entry("u1", BASE + S // 10), entry("u2", BASE + S // 10)]
+    gap, _request = connect(plan, BASE // S - 4, at=2.0)
+    assert gap is not None
+    new = entry("n", BASE - 4 * S + S // 2)
+    assert screen(plan, old, *unread, new, at=2.1) == [
+        "deduplicated",
+        "new",
+        "new",
+        "new",
+    ]
+
+    gap, _request = connect(plan, BASE // S + 1, at=7.0)
+
+    assert gap is None
+    assert plan._ceiling is None
+    later = entry("p", BASE + S + 1)
+    assert screen(plan, old, *unread, new, later, at=7.1) == [
+        *["deduplicated"] * 4,
+        "new",
+    ]
+    assert plan.take() == []
+
+
+def test_unread_lines_at_different_times_are_dropped_by_later_replays() -> None:
+    """Every pre-step line delivered is a replay for later connections, also below
+    the highest one delivered, over two reconnects after the step."""
+    plan = planner()
+    connect(plan, at=0.0)
+    old = entry("a", BASE + 2 * S)
+    screen(plan, old, at=3.0)
+    unread = [entry("u1", BASE + 3 * S), entry("u2", BASE + 3 * S + 10)]
+    clock = CLOCK - 3600
+    gap, _request = connect(plan, clock, at=5.0)
+    assert gap is not None
+    assert screen(plan, old, *unread, at=5.1) == ["deduplicated", "new", "new"]
+
+    connect(plan, clock + 1, at=6.0)
+    assert screen(plan, old, *unread, at=6.1) == ["deduplicated"] * 3
+    connect(plan, clock + 2, at=7.0)
+    assert screen(plan, old, *unread, at=7.1) == ["deduplicated"] * 3
+
+
+def test_unread_line_below_the_highest_delivered_comes_once() -> None:
+    """A connection ended after the higher of two lines logged before the step
+    (out of time order): the next replay still delivers the lower one, which it
+    was never handed before."""
+    plan = planner()
+    connect(plan, at=0.0)
+    old = entry("a", BASE + 2 * S)
+    screen(plan, old, at=3.0)
+    high, low = entry("u1", BASE + 3 * S + 10), entry("u2", BASE + 3 * S)
+    clock = CLOCK - 3600
+    connect(plan, clock, at=5.0)
+    assert screen(plan, old, high, at=5.1) == ["deduplicated", "new"]
+
+    connect(plan, clock + 1, at=6.0)
+
+    assert screen(plan, old, high, low, at=6.1) == [
+        "deduplicated",
+        "deduplicated",
+        "new",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("since", "hops"),
+    [
+        ("backlog", "two_back"),
+        ("backlog", "back_forward_back"),
+        ("datetime", "two_back"),
+        ("datetime", "back_forward_back"),
+    ],
+)
+def test_steps_before_the_capture_lose_no_line(since: str, hops: str) -> None:
+    """A connection that reads across two steps from before the capture crosses
+    the first in its own lines, so what follows is no replay: the middle lines
+    are not old ones, however far above the clock (nothing lost, no Gap)."""
+    far = [entry(f"e{i}", BASE + 7200 * S + i) for i in range(2)]
+    middle = [entry(f"m{i}", BASE + 3600 * S + i) for i in range(3)]
+    if hops == "back_forward_back":
+        middle += [entry(f"h{i}", BASE + 4200 * S + i) for i in range(2)]
+    near = [entry(f"n{i}", CLOCK * S + i) for i in range(2)]
+    plan = planner("backlog" if since == "backlog" else moment(BASE - S))
+    connect(plan, at=0.0)
+    start = plan._start
+
+    verdicts = screen(plan, *far, *middle, *near, at=0.1)
+
+    assert verdicts == ["new"] * (len(far) + len(middle) + 2)
+    assert plan.take() == []
+    assert plan._start == start
+    assert plan.cursor == CLOCK * S + 1
+    gap, _request = connect(plan, CLOCK + 1, at=1.0)
+    assert gap is None
+    replay = screen(plan, *far, *middle, *near, at=1.1)
+    assert replay == ["deduplicated"] * len(replay)
+    assert plan.take() == []
+
+
+@pytest.mark.parametrize("sizes", [(3, 20), (3600, 3600)], ids=["small", "large"])
+def test_two_steps_in_one_outage_lose_no_line(sizes: tuple[int, int]) -> None:
+    """One replay reads across two steps back: the lines between them are never
+    old lines, whichever times they carry."""
+    first, second = sizes
+    plan = planner()
+    underway(plan)
+    old = [entry("a", BASE), entry("b", BASE + S // 2)]
+    screen(plan, *old, at=1.0)
+    unread = entry("u", BASE + S)
+    middle = [entry(f"m{i}", BASE + S - first * S + i * S // 10) for i in range(30)]
+    clock = (micros(middle[-1].timestamp) - second * S) // S
+    near = entry("z", clock * S + 1)
+    gap, _request = connect(plan, clock, at=5.0)
+    assert gap is not None
+
+    verdicts = screen(plan, *old, unread, *middle, near, at=5.1)
+
+    assert verdicts == [*["deduplicated"] * 2, *["new"] * 32]
+
+
+def test_old_line_ahead_of_the_line_at_hw_stays_dropped() -> None:
+    """The control of the rules above: before the line at hw is replayed, an
+    unmatched line up to the highest time read is an old one, also after a line
+    of the new clock (a ring in time order)."""
+    plan = planner()
+    underway(plan)
+    read = [entry("a0", BASE - 3 * S), entry("a", BASE), entry("b", BASE + S)]
+    screen(plan, *read, at=1.0)
+    clock = CLOCK - 3600
+    connect(plan, clock, at=5.0)
+
+    verdicts = screen(plan, entry("n", clock * S), read[0], read[1], read[2], at=5.1)
+
+    assert verdicts == ["new", "deduplicated", "deduplicated", "deduplicated"]
+    assert plan.take() == []
+
+
+# -- bounds ----------------------------------------------------------------------------
+
+
+def test_old_windows_stay_within_the_caps_over_many_steps() -> None:
+    """One window per step would grow without bound while the clock stays below
+    the old top (a harness that resets the date before each test): all of them
+    together stay within the caps (design 5.10), the newest step's window whole,
+    and a later replay still drops the rest by time."""
+    plan = planner(max_lines=100)
+    underway(plan)
+    host = 0.0
+    first = entry("first", BASE + 3 * S)
+    screen(plan, first, at=host)
+    for step in range(30):
+        stepped = BASE - step * 3600 * S
+        lines = [entry(f"s{step}-{i}", stepped + i) for i in range(100)]
+        host += 1.0
+        screen(plan, *lines, at=host)
+        assert plan._old is not None
+        assert sum(plan._old.values()) <= 101
+    plan.take()
+    gap, _request = connect(plan, BASE // S - 29 * 3600 + 1, at=host + 1)
+    assert gap is None
+    assert plan._old is not None
+    newest = BASE - 28 * 3600 * S + 99
+    assert (newest, entry("s28-99", newest).raw) in plan._old
+    assert (BASE + 3 * S, first.raw) not in plan._old
+    assert screen(plan, first, at=host + 1.1) == ["deduplicated"]
+
+
+@pytest.mark.parametrize("cap", ["lines", "bytes"])
+def test_old_windows_stay_within_the_caps_with_lines_stored_late(cap: str) -> None:
+    """Lines stored later than the step bound recurring faster than the overlap
+    keep hw near the old windows, so they are never freed by time: the caps hold
+    (with the window's own caps, about twice them in all)."""
+    plan = (
+        planner(max_lines=500)
+        if cap == "lines"
+        else planner(max_bytes=500 * len(entry("m0", BASE).raw))
+    )
+    underway(plan)
+    largest = 0
+    for k in range(10_000):
+        ts = BASE + k * 1000
+        late = k % 1000 == 999
+        line = entry(f"m{k}", ts - 3 * S if late else ts)
+        plan.screen(line, len(line.raw) + 1, k / 1000)
+        if late:
+            assert plan._old is not None
+            largest = max(largest, sum(plan._old.values()))
+    assert len([g for g in gaps(plan) if g.reason == "clock_moved_back"]) == 10
+    assert 400 <= largest <= 501
+    assert plan._old_bytes == sum(item[2] for item in plan._old_lines)
+
+
+def test_old_window_keeps_a_line_at_hw_over_the_byte_cap() -> None:
+    """Like the window, the old window keeps the lines at the hw of the step: a
+    replay is still told by them."""
+    plan = planner(max_bytes=40)
+    underway(plan)
+    line = entry("a", BASE)
+    screen(plan, line, at=1.0)
+    clock = CLOCK - 3600
+    connect(plan, clock, at=5.0)
+
+    assert plan._old == {(BASE, line.raw): 1}
+    assert screen(plan, line, at=5.1) == ["deduplicated"]
+
+
+def test_caps_bound_a_run_of_unparsed_lines() -> None:
+    """Unparsed lines inherit hw, which the caps never evict, so a long run of
+    them would not be bounded (design 5.10): over a cap they are not windowed,
+    one INFO says so, and the ring check does not count them. A replay of one
+    can then come again (documented)."""
+    plan = planner(max_lines=100, max_bytes=20_000)
+    connect(plan)
+    parsed = entry("a", BASE)
+    screen(plan, parsed)
+    run = [entry(f"garbage{k}", 0, parsed=False) for k in range(5000)]
+
+    assert screen(plan, *run) == ["new"] * 5000
+
+    assert plan.window_lines == 100
+    assert plan.window_bytes <= 20_000
+    assert [isinstance(item, str) for item in plan.take()] == [True]
+    connect(plan)
+    assert plan._phase is not None
+    assert plan._phase.at_position == 100
+    verdicts = screen(plan, parsed, *run[:99], run[100], entry("b", BASE + 1))
+    assert verdicts == [*["deduplicated"] * 100, "new", "new"]
+    assert gaps(plan) == []
+
+
+def test_unparsed_line_alone_at_hw_stays_over_the_caps() -> None:
+    """The first new line after a re-anchor can be an unparsed one that inherits a
+    replayed line's time, larger than the byte cap: hw needs a line in the deque,
+    so it stays, and the lines after it, below it or above it, go on."""
+    plan = planner(max_bytes=200)
+    connect(plan, at=0.0)
+    replayed = entry("y", BASE + 8 * S)
+    screen(plan, entry("first", BASE + 2 * S), at=4.0)
+    screen(plan, replayed, entry("a", BASE + 10 * S), at=5.0)
+    assert connect(plan, BASE // S + 7, at=5.1)[0] is None
+    assert screen(plan, replayed, at=5.2) == ["deduplicated"]
+    hw = BASE + 8 * S
+
+    assert screen(plan, entry("x" * 500, 0, parsed=False), at=5.3) == ["new"]
+
+    assert (plan.cursor, plan.window_lines) == (hw, 1)
+    assert screen(plan, entry("below", hw - 10), at=5.4) == ["new"]
+    assert plan.cursor == hw
+    assert screen(plan, entry("above", hw + 10), at=5.5) == ["new"]
+    assert plan.cursor == hw + 10
+    assert plan.window_bytes <= 200
+
+
+def test_parsed_lines_at_hw_stay_over_the_caps() -> None:
+    """The control: lines stamped hw that have their own time stay, as before."""
+    plan = planner(max_lines=2)
+    connect(plan)
+    lines = [entry(f"x{i}", BASE) for i in range(5)]
+
+    screen(plan, *lines)
+
+    assert plan.window_lines == 5
+
+
+@pytest.mark.parametrize(
+    ("case", "text"),
+    [("lost", "no header at all"), ("first", "no header at all")],
+    ids=["left_the_overlap", "opened_the_connection"],
+)
+def test_unparsed_line_outside_the_window_comes_again(case: str, text: str) -> None:
+    """The documented limit (design A.25): an unparsed line whose inherited time
+    left the overlap, or that opened a connection, is not in the window at the
+    resume, and logd returns it by its own time."""
+    plan = planner()
+    connect(plan)
+    garbage = entry(text, 0, parsed=False)
+    if case == "lost":
+        screen(plan, entry("p1", BASE - 10 * S), garbage, entry("p2", BASE))
+    else:
+        screen(plan, garbage, entry("p2", BASE))
+    connect(plan)
+
+    assert screen(plan, garbage, entry("p2", BASE)) == ["new", "deduplicated"]
+    assert plan.take() == []
+
+
+# -- what is reported ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("host", "read", "reported"),
+    [(5.5, 5, False), (100.0, 50, True), (100.0, 98, False), (100.0, 97, True)],
+    ids=["whole_seconds", "fell", "bound", "below_bound"],
+)
+def test_clock_fell_since_the_first_read(
+    host: float, read: int, *, reported: bool
+) -> None:
+    """The line at hw predates the capture, so a clock read below it is silent
+    unless it lies below N0 + elapsed - max(overlap, 1 s) (user decision, design
+    A.25): the margin keeps a whole-second clock quiet, the elapsed time counts."""
+    plan = planner()
+    connect(plan, at=0.0)
+    screen(plan, entry("old", BASE + 3600 * S), at=0.5)
+
+    gap, _request = connect(plan, CLOCK + read, at=host)
+
+    assert (gap is not None) is reported
+    assert plan._step_reported is reported
+
+
+@pytest.mark.parametrize(
+    ("read", "reported"),
+    [(35_991, False), (35_990, True)],
+    ids=["within_200ppm", "below_it"],
+)
+def test_clock_fell_allows_for_a_slow_device_clock(
+    read: int, *, reported: bool
+) -> None:
+    """Ten hours on: 200 ppm of them (7.2 s) on top of the bound of 2 s. A device
+    clock that loses that little shows no step back since the first read."""
+    plan = planner()
+    connect(plan, at=0.0)
+    screen(plan, entry("old", BASE + 86_400 * S), at=0.5)
+
+    gap, _request = connect(plan, CLOCK + read, at=36_000.0)
+
+    assert (gap is not None) is reported
+
+
+@pytest.mark.parametrize(
+    ("gain", "reported"),
+    [(1.5, True), (2.2, True), (3.0, True), (8.0, False)],
+    ids=["69ppm", "102ppm", "139ppm", "370ppm"],
+)
+def test_drift_leaves_a_live_step_reported(gain: float, *, reported: bool) -> None:
+    """A device clock that gains on the host over six hours: up to 200 ppm its
+    lines are still the capture's, so a live step gets its Gap. Above that, a
+    line looks logged before the first clock read (the cost in design A.25)."""
+    plan = planner()
+    connect(plan, BASE // S, at=0.0)
+    ts = BASE
+    for k in range(1, 217):
+        ts = BASE + k * 100 * S + round(gain * S * k / 216)
+        screen(plan, entry(f"x{k}", ts), at=k * 100.0)
+    plan.take()
+
+    assert screen(plan, entry("s", ts - 3600 * S), at=21601.0) == ["new"]
+
+    assert bool(gaps(plan)) is reported
+
+
+def test_chatty_notice_on_the_far_side_of_a_step_is_backlog() -> None:
+    """A notice above every time the first clock read could show, with no step
+    reported, was logged before the capture across a step from before it: not a
+    loss of this capture (user decision, design A.25: S stays)."""
+    plan = planner()
+    connect(plan, at=0.0)
+    far = BASE + 3600 * S
+
+    assert screen(plan, notice(2, far), entry("near", CLOCK * S), at=0.1) == [
+        "new",
+        "new",
+    ]
+
+    assert (plan.backlog_pruned, plan.device_lost) == (2, 0)
+    assert plan.take() == []
+
+
+def test_chatty_notice_above_the_clock_after_a_reported_step_is_a_loss() -> None:
+    """Once a step during the capture was reported, the rule is off."""
+    plan = planner()
+    connect(plan, at=0.0)
+    screen(plan, entry("a", CLOCK * S + S), at=2.0)
+    assert connect(plan, CLOCK - 3600, at=3.0)[0] is not None
+    screen(plan, entry("a", CLOCK * S + S), entry("n", (CLOCK - 3600) * S), at=3.1)
+
+    plan.take()
+
+    screen(plan, notice(2, (CLOCK + 3600) * S), at=3.2)
+
+    assert (plan.backlog_pruned, plan.device_lost) == (0, 2)
+    assert [gap.reason for gap in gaps(plan)] == ["device_reported"]
+
+
+def test_chatty_notice_below_since_is_backlog_too() -> None:
+    """With since=<datetime>, a notice the device returns below -T is dropped
+    (below_cursor) and still counts as backlog pruning, as with "backlog"."""
+    plan = planner(moment(BASE))
+    connect(plan)
+
+    assert screen(plan, notice(7, BASE - 5 * S), entry("a", BASE)) == [
+        "below_cursor",
+        "new",
+    ]
+
+    assert (plan.backlog_pruned, plan.device_lost) == (7, 0)
+    assert plan.take() == []
+
+
+def test_stepped_replay_with_proof_drops_old_lines_above_the_clock_read() -> None:
+    """A line more than 1 s below the new hw proves the replay is in the old lines
+    (the device's late lines were about 86 ms late), so the unmatched old lines
+    from N + 1 s up are dropped too, not delivered again."""
+    plan = planner()
+    connect(plan, BASE // S - 5, at=-5.0)
+    old = [entry(f"o{i}", BASE + i * S) for i in range(121)]
+    screen(plan, *old, at=120.5)
+    new = [entry("n1", BASE + 5 * S), entry("n2", BASE + 8 * S + S // 2)]
+    screen(plan, *new, at=121.0)
+    assert [gap.reason for gap in gaps(plan)] == ["clock_moved_back"]
+
+    gap, request = connect(plan, BASE // S + 9, at=124.0)  # above the new hw
+
+    assert gap is None
+    assert request == BASE + 6 * S + S // 2
+    assert screen(plan, *old[7:15], at=124.1) == ["deduplicated"] * 8
+    assert plan.cursor == BASE + 8 * S + S // 2
+
+
 def test_small_clock_step_is_absorbed_by_the_overlap() -> None:
     plan = planner()
     connect(plan)
@@ -1507,13 +2470,14 @@ class _Reader:
     # later copies can match their count (see `_explained`).
     at_positions: dict[str, int] = field(default_factory=dict)
     # Every clock_moved_back Gap: when it came (in `events`), its before and
-    # after, the old window the planner kept at that step, and whether it was
-    # seen live; and when each text was first delivered. Design 5.6's
+    # after, the window read before that step (see `_window`), and whether it
+    # was seen live; and when each text was first delivered. Design 5.6's
     # exception (see `_repeated`).
     steps: list[tuple[int, int, int, frozenset[tuple[int, str]], bool]] = field(
         default_factory=list
     )
     first_delivered: dict[str, int] = field(default_factory=dict)
+    read_lines: list[tuple[int, str]] = field(default_factory=list)
     events: int = 0
     repeated: int = 0  # deliveries the exception explains
     # The holes a Gap reports, in arrival order: from the highest line
@@ -1564,6 +2528,7 @@ class _Reader:
             self.highest = max(self.highest, item.order)
             self.delivered[item.entry.raw] += 1
             self.first_delivered.setdefault(item.entry.raw, self.events)
+            self.read_lines.append((item.ts, item.entry.raw))
             self.events += 1
         found = gaps(self.plan)
         if any(gap.reason == "ring_rotated" for gap in found):
@@ -1575,12 +2540,19 @@ class _Reader:
             if gap.reason == "clock_moved_back":
                 assert gap.after is not None
                 assert gap.before is not None
-                kept = frozenset(getattr(self.plan, "_old", None) or ())
+                after = micros(gap.after)
                 self.steps.append(
-                    (self.events, micros(gap.before), micros(gap.after), kept, live)
+                    (self.events, micros(gap.before), after, self._window(after), live)
                 )
             self.events += 1
         self.reported += found
+
+    def _window(self, top: int) -> frozenset[tuple[int, str]]:
+        """What the resume window holds of the lines read, when ``top`` is hw: those
+        within the overlap, at most the cap on lines, the latest ones."""
+        low = top - self.plan._overlap
+        lines = [key for key in self.read_lines if low <= key[0] <= top]
+        return frozenset(lines[-self.plan._max_lines :])
 
     def check(self) -> None:
         """No duplicate but design 5.6's exception; every line not delivered
@@ -1624,9 +2596,9 @@ class _Reader:
 
     def _repeated(self, raw: str, ts: int) -> bool:
         """Design 5.6's one exception to answer 4: a line read before a clock
-        step back, no longer in the window then (the old window the planner
-        kept), and stamped in the re-anchored range (from the Gap's before to
-        its after) can be delivered again."""
+        step back, no longer in the window then (`_window`, modelled here, not
+        read from the planner), and stamped in the re-anchored range (from the
+        Gap's before to its after) can be delivered again."""
         first = self.first_delivered[raw]
         return any(
             when > first and before <= ts <= after and (ts, raw) not in kept

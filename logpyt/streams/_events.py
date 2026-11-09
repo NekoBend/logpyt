@@ -48,8 +48,9 @@ class StateChange:
         new: The state after it.
         connection: 1-based number of the adb connection the change belongs to.
         error: The cause of a change to ``RECONNECTING`` (None for a stall
-            resume), or the terminal outcome on a change to ``FAILED``; None
-            otherwise. It has no default, so every producer states it.
+            resume and for an end logd caused, design A.6), or the terminal
+            outcome on a change to ``FAILED``; None otherwise. It has no
+            default, so every producer states it.
 
     When more than 256 events wait for a slow consumer, consecutive changes
     coalesce into one (``StreamStats.events_coalesced`` counts the merges):
@@ -86,8 +87,14 @@ class Gap:
     be missing or, if read before the step, delivered again. A step from
     before the capture that the device's ring still holds gives no Gap,
     because nothing was lost (design A.25). A step during the capture can go
-    unreported too when no line stamped from one second after the first
-    clock read on was read before it, and the next clock read does not show it.
+    unreported too when no line stamped from one second after the first clock
+    read on was read before it, and the next clock read does not show it.
+
+    ``"ring_rotated"``: ``before`` lies above ``after``, unless the hole crosses
+    a clock step, of any kind (the ring rotated during an outage right after
+    the step, before a line of the new clock was read). ``before`` can then lie
+    below ``after``: the lost lines were logged after the ``after`` line and
+    ahead of the ``before`` line, and their times need not lie between.
 
     A Gap found while a connection reads (a chatty notice's
     ``"device_reported"``, or a ``"clock_moved_back"`` seen in a line) is

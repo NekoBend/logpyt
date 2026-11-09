@@ -18,6 +18,7 @@ from __future__ import annotations
 import bisect
 import contextlib
 import dataclasses
+import itertools
 import os
 import re
 import secrets
@@ -55,7 +56,7 @@ PERIOD = 0.01  # the writer's pause between seq lines (10 ms)
 # Seq lines per pause in the overwrite gate, per level. Fast enough to fill the
 # outbox in seconds and wrap the ring within 30 s (9.4), slow enough to lose
 # nothing on the device. API 24's ring held about 11 000 writer lines: about 870
-# lines/s. API 36's compresses and held over 200 000: about 8000 lines/s.
+# lines/s. API 36's compresses and held over 200 000: about 9400 lines/s.
 OVERWRITE_BATCH = {24: 10, 36: 160}
 WAIT = 60.0  # bound of every wait for the device or the stream
 # Below the watchdog of the gate tests (their marker), which exits pytest
@@ -63,6 +64,8 @@ WAIT = 60.0  # bound of every wait for the device or the stream
 SLACK = 300.0
 
 _LINE = re.compile(r"^(seq|burst|end)=([0-9a-f]{8})-(\d+)$")
+# The writer's uid: the lines of logwrapper's shell (the module docs).
+_WRITER_NOTICE = re.compile(r"uid=2000\b.* expire ")
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _MICROSECOND = timedelta(microseconds=1)
 
@@ -147,11 +150,14 @@ class Report:
     incomplete_bursts: int
     uncovered: list[str]
     collided_bursts: int
+    # Whether ``count`` was the writer's own: without its end line (the run
+    # ended first) only the delivered prefix was judged.
+    count_known: bool = True
 
     def summary(self) -> dict[str, object]:
         return {
             "failures": self.failures,
-            "missing_seqs": self.missing_seqs,
+            "missing_seqs": self.missing_seqs if self.count_known else None,
             "incomplete_bursts": self.incomplete_bursts,
             "collided_bursts": self.collided_bursts,
         }
@@ -409,7 +415,7 @@ def run_resume_gate(
             adb_path=bench.adb_path,
             serial=bench.serial,
             since="now",
-            reconnect=Reconnect(delay=0.5, max_delay=5.0, stable_after=5.0),
+            reconnect=Reconnect(),
         ),
         on_item=capture.on_item,
         on_event=capture.on_event,
@@ -443,10 +449,18 @@ def run_resume_gate(
 
 
 def run_overwrite_gate(
-    bench: Bench, stall: float, *, stall_timeout: float | None, batch: int = 10
+    bench: Bench,
+    stall: float,
+    *,
+    stall_timeout: float | None,
+    batch: int = 10,
+    tail: float = 10.0,
+    buffer_entries: int = 10_000,  # StreamConfig's default
 ) -> tuple[Capture, Report, LogStream[LogEntry]]:
     """The overwrite gate: a writer fast enough to wrap the ring within 30 s,
-    and a consumer that stalls for ``stall`` seconds, then drains (9.4)."""
+    and a consumer that stalls for ``stall`` seconds, then drains (9.4); the
+    writer runs on for ``tail`` seconds. ``buffer_entries``: a smaller outbox,
+    for a dry run on a small ring."""
     rid = secrets.token_hex(4)
     capture = Capture(rid, stall=stall)
     stream = LogStream(
@@ -455,6 +469,7 @@ def run_overwrite_gate(
             serial=bench.serial,
             since="now",
             stall_timeout=stall_timeout,
+            buffer_entries=buffer_entries,
         ),
         on_item=capture.on_item,
         on_event=capture.on_event,
@@ -465,7 +480,7 @@ def run_overwrite_gate(
         bench.start_writer(rid, count=50_000_000, burst=0, pause=True, batch=batch)
         wait_until(capture.stalled.is_set, timeout=WAIT)
         wait_until(capture.resumed.is_set, timeout=stall + WAIT)
-        _pace_plain(time.monotonic() + 10)  # the writer runs on past the stall
+        _pace_plain(time.monotonic() + tail)  # the writer runs on past the stall
         bench.stop_writer(rid)
         if stream.state not in {StreamState.FAILED, StreamState.STOPPED}:
             wait_until(
@@ -478,21 +493,26 @@ def run_overwrite_gate(
         capture.abort.set()
         _end(bench, rid, stream, 4 * WAIT)
     count = capture.ended()
+    known = count is not None
     if count is None:  # the run ended first (stall_timeout=None): judge what came
         count = max((s.n + 1 for s in capture.lines if s.kind == "seq"), default=0)
     report = check_sequence(capture.lines, capture.gaps, count=count, burst=0)
+    report.count_known = known
     return capture, report, stream
 
 
 def notice_times(dump: Sequence[str], rid: str, live: dict[int, int]) -> list[str]:
-    """For each chatty notice among the writer's lines in ``dump``: ``newest``,
-    ``oldest`` or ``other``, by its time against the times of the lines it
-    replaced (``live``: seq -> time, read live before the pruning).
+    """For each hole in the writer's lines in ``dump`` that holds chatty notices
+    of its uid: ``newest``, ``oldest`` or ``other``, by the time of the hole's
+    last notice against the times of the lines replaced (``live``: seq -> time,
+    read live before the pruning). Several notices of one hole must ascend, or
+    the hole is ``other``.
 
-    A notice stands where its lines stood (FINDINGS.md check 6); the lines it
-    replaced are the writer's seqs read live between its neighbours in the
-    dump that the dump no longer holds. A notice without such lines (it
-    replaced only lines of other processes of the uid) is left out.
+    A notice stands where its lines stood (FINDINGS.md check 6); the lines
+    replaced are the writer's seqs read live between the hole's neighbours in
+    the dump that the dump no longer holds. A hole without such lines (the
+    notices replaced only lines of other processes of the uid) is left out, and
+    so are other uids' notices: their lines are not the writer's.
     """
     parser = ThreadTimeLogParser()
     context = ParseContext()
@@ -504,25 +524,27 @@ def notice_times(dump: Sequence[str], rid: str, live: dict[int, int]) -> list[st
         found = _LINE.match(entry.message.rstrip(" "))
         if found is not None and found.group(2) == rid and found.group(1) == "seq":
             order.append(("seq", int(found.group(3))))
-        elif entry.tag == "chatty" and " expire " in entry.message:
+        elif entry.tag == "chatty" and _WRITER_NOTICE.match(entry.message):
             order.append(("notice", _us(entry.timestamp)))
     dumped = {n for kind, n in order if kind == "seq"}
     verdicts: list[str] = []
-    for i, (kind, ts) in enumerate(order):
-        if kind != "notice":
-            continue
-        before = next((n for k, n in reversed(order[:i]) if k == "seq"), None)
-        after = next((n for k, n in order[i + 1 :] if k == "seq"), None)
-        if before is None or after is None:
+    seqs = [i for i, (kind, _) in enumerate(order) if kind == "seq"]
+    for before, after in itertools.pairwise(seqs):
+        times = [ts for _, ts in order[before + 1 : after]]
+        if not times:
             continue
         replaced = [
-            live[n] for n in range(before + 1, after) if n in live and n not in dumped
+            live[n]
+            for n in range(order[before][1] + 1, order[after][1])
+            if n in live and n not in dumped
         ]
         if not replaced:
             continue
-        if ts >= max(replaced):
+        if times != sorted(times):
+            verdicts.append("other")
+        elif times[-1] >= max(replaced):
             verdicts.append("newest")
-        elif ts <= min(replaced):
+        elif times[-1] <= min(replaced):
             verdicts.append("oldest")
         else:
             verdicts.append("other")

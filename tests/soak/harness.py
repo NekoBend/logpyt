@@ -8,11 +8,12 @@ on an event loop in a helper thread) against the fake adb's simulated device
   system uid) and a few ``app=N`` lines (tag ``App``) from the uid of a
   watched package; the stream's ``where`` is ``Tag("Soak") | Package(PKG)``,
   so the app lines take the uid lookup;
-- every adb logcat runs a scripted behaviour, in turn: exit 0, exit 1 (an
-  ``Unexpected EOF`` after backpressure is A.6's resume), a stderr burst then
-  exit 255, a hang after its output (``read_timeout``), a kill (-9), and an
-  adb that waits without output as for an absent device (``connect_timeout``,
-  then the state check fails);
+- every adb logcat runs a scripted behaviour, in turn: exit 0, a plain exit 1
+  (the director releases it after any stall has ended, so it is an ordinary
+  end; A.6's resume is ``test_logd_drop_after_backpressure_resumes``), a stderr
+  burst then exit 255, a hang after its output (``read_timeout``), a kill (-9),
+  and an adb that waits without output as for an absent device
+  (``connect_timeout``, then the state check fails);
 - a director thread, every ``Plan.pace`` seconds, ends the live connection
   the way its run says; or steps the device clock back, in turn by less than
   ``resume_overlap`` (absorbed by the overlap) and, while a connection
@@ -20,9 +21,9 @@ on an event loop in a helper thread) against the fake adb's simulated device
   ``Gap(clock_moved_back)`` each; the old lines' later replays are dropped,
   so the "no duplicate" criterion holds without design 5.6's exception);
   changes the package's uid (a reinstall: the next lookup answers the new
-  uid); or stalls the consumer: briefly (a stall resume whose ring still
-  holds hw) or long enough for the ring to overwrite hw (the resume reports
-  ``Gap(ring_rotated)``);
+  uid, and the new uid's lines must arrive); or stalls the consumer: briefly
+  (a stall resume whose ring still holds hw) or long enough for the ring to
+  overwrite hw (the resume reports ``Gap(ring_rotated)``);
 - a sampler records, every ``Plan.sample_every`` seconds: ``tracemalloc``
   (all traced memory, and the part allocated in ``logpyt``), RSS and open fds
   (Linux), threads, asyncio tasks, live fake-adb children, and the stream's
@@ -106,6 +107,10 @@ ACTIONS = (
 )
 # Design 5.6 COMMAND_TIMEOUT: the one-shot runner's bound.
 COMMAND_TIMEOUT = 5.0
+# App lines of the last uid that must have been written (10 s of them, at the
+# plan's rate) before one of them must have arrived: the lookup and a stall
+# can take that long.
+LAST_UID_LINES = 50
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _MICROSECOND = timedelta(microseconds=1)
 
@@ -225,6 +230,13 @@ class Writer:
                     next_app += self.plan.app_every
             due += tick
             self.stop.wait(max(0.0, due - time.monotonic()))
+        # The log ends with a seq line: `_Soak.run` waits for the last seq, and
+        # a tick's app line follows its seqs, so the stop could cut it off.
+        with self.quiet:
+            self.fake.device_log(
+                f"seq={self.seqs}", tag=SEQ_TAG, uid=SYSTEM_UID, pid=2000
+            )
+            self.seqs += 1
 
 
 # -- the consumer ------------------------------------------------------------------
@@ -583,6 +595,7 @@ class Director:
         self.done: dict[str, int] = {}
         self.released: set[int] = set()  # the logcat runs whose cut was released
         self.jump = False  # whether the next clock step is a jump
+        self.last_uid_from = 0  # the first app line of the current uid
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self._run, name="soak: director")
 
@@ -603,6 +616,7 @@ class Director:
         if action == "clock_back":
             return self._clock_back()
         if action == "reinstall":
+            self.last_uid_from = self.writer.apps
             self.writer.app_uid += 1
             answer = out(dumpsys_package(PKG, self.writer.app_uid))
             self.fake.dumpsys(PKG, run(answer))
@@ -664,6 +678,8 @@ class Result:
     state_checks: int = 0  # adb get-state (the absent device's)
     uncovered: list[int] = dataclasses.field(default_factory=list)
     app_missing: int = 0
+    app_outside: int = 0  # missing app lines outside every Gap
+    app_last_uid_from: int = 0
     failures: list[str] = dataclasses.field(default_factory=list)
 
     def summary(self) -> dict[str, object]:
@@ -684,6 +700,7 @@ class Result:
             "app_lines": {
                 "written": self.app_written,
                 "missing": self.app_missing,
+                "missing_outside_gaps": self.app_outside,
                 "duplicates": self.consumer.app_duplicates,
             },
             "gaps": reasons,
@@ -818,6 +835,7 @@ class _Soak:
             stats=stream.stats,
             written=self.writer.seqs,
             app_written=self.writer.apps,
+            app_last_uid_from=self.director.last_uid_from,
         )
         if self.tail is not None:
             result.failures.append(self.tail)
@@ -847,10 +865,9 @@ def run_soak(fake: FakeAdb, plan: Plan, driver: str) -> Result:
     return result
 
 
-def _stamps(fake: FakeAdb, count: int) -> array.array[int]:
-    """The device time of every seq line, by number."""
+def _stamps(fake: FakeAdb, count: int, marker: str) -> array.array[int]:
+    """The device time of every line after ``marker``, by number."""
     stamps = array.array("q", bytes(8 * count))
-    marker = f" {SEQ_TAG}: seq="
     for micros, line in fake.device_entries():
         at = line.find(marker)
         if at >= 0:
@@ -950,8 +967,33 @@ def _judge_counts(
         )
 
 
+def _outside_gaps(
+    missing: list[int], stamps: array.array[int], gaps: list[tuple[int, int, str]]
+) -> list[int]:
+    """The numbers in ``missing`` whose device time lies in no reported Gap.
+
+    A span with ``before`` below ``after`` covers no time. A ``clock_moved_back``
+    Gap only marks a point; a ``ring_rotated`` one comes reversed when the ring
+    lost a line delivered ahead of a repeated re-anchor (`ResumePlanner._hole`),
+    which this soak cannot reach: a jump (with a small step and the clock's whole
+    seconds) re-anchors a resume only within 4 s of the line at hw, and the ring
+    holds 6 s.
+    """
+    spans = sorted((a, b) for a, b, _ in gaps)
+    starts = [a for a, _ in spans]
+    return [
+        n
+        for n in missing
+        if not any(
+            b >= stamps[n] for _, b in spans[: bisect.bisect_right(starts, stamps[n])]
+        )
+    ]
+
+
 def _judge_sequence(result: Result, fake: FakeAdb) -> None:
-    """No seq delivered twice; every missing seq inside a reported Gap."""
+    """No seq delivered twice; every missing seq inside a reported Gap; the same
+    for the app lines, where a line that went on without its package also
+    explains itself (``stats.unattributed``), and a line of the last uid came."""
     consumer = result.consumer
     if consumer.duplicates:
         result.failures.append(
@@ -962,22 +1004,32 @@ def _judge_sequence(result: Result, fake: FakeAdb) -> None:
     missing = [n for n in range(result.written) if n >= len(seen) or not seen[n]]
     result.missing = len(missing)
     if missing:
-        stamps = _stamps(fake, result.written)
-        spans = sorted((a, b) for a, b, _ in consumer.gaps)
-        starts = [a for a, _ in spans]
-        for n in missing:
-            ts = stamps[n]
-            at = bisect.bisect_right(starts, ts)
-            if not any(b >= ts for _, b in spans[:at]):
-                result.uncovered.append(n)
+        stamps = _stamps(fake, result.written, f" {SEQ_TAG}: seq=")
+        result.uncovered = _outside_gaps(missing, stamps, consumer.gaps)
         if result.uncovered:
             result.failures.append(
                 f"{len(result.uncovered)} missing seqs outside every Gap, "
                 f"first {result.uncovered[:10]}"
             )
+    _judge_apps(result, fake)
+
+
+def _judge_apps(result: Result, fake: FakeAdb) -> None:
+    """The app lines of the reinstall scenario (design 9.1)."""
+    consumer = result.consumer
     apps = consumer.apps
-    result.app_missing = sum(
-        1 for n in range(result.app_written) if n >= len(apps) or not apps[n]
-    )
+    missing = [n for n in range(result.app_written) if n >= len(apps) or not apps[n]]
+    result.app_missing = len(missing)
     if consumer.app_duplicates:
         result.failures.append(f"{consumer.app_duplicates} app lines delivered twice")
+    if missing:
+        stamps = _stamps(fake, result.app_written, f" {APP_TAG}: app=")
+        result.app_outside = len(_outside_gaps(missing, stamps, consumer.gaps))
+        if result.app_outside > result.stats.unattributed:
+            result.failures.append(
+                f"{result.app_outside} missing app lines outside every Gap, "
+                f"{result.stats.unattributed} unattributed"
+            )
+    first = result.app_last_uid_from
+    if result.app_written - first >= LAST_UID_LINES and not any(apps[first:]):
+        result.failures.append("no app line of the last uid arrived")

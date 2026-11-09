@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -36,6 +37,7 @@ from tests.conftest import (
     FakeAdb,
     clock,
     expire_notice,
+    out,
     run,
     stream,
     wait,
@@ -48,6 +50,7 @@ if TYPE_CHECKING:
 S = StreamState
 US = 1_000_000
 OVERLAP = 2 * US  # the default resume_overlap
+PAST_THE_SLACK = 1.3  # host seconds: past 1 s after a clock read (design A.25)
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _MICROSECOND = timedelta(microseconds=1)
 
@@ -508,6 +511,405 @@ def test_step_from_before_the_capture_gives_no_gap(
     _assert_conserved(stream_)
 
 
+def _reanchored(driver: Driver, fake: FakeAdb, records: list[object]) -> Any:  # noqa: ANN401
+    """A running stream re-anchored at a step back of an hour during an outage,
+    whose second connection has delivered one line of the new clock; its end
+    is the signal ``cut2``. The first read's second lies behind line b."""
+    fake.device()
+    fake.date(run(clock()), run(wait("stepped"), clock()), run(clock()))
+    fake.logcat(
+        run(stream(until="cut"), exit_code=255),
+        run(stream(until="cut2"), exit_code=255),
+        run(stream()),
+    )
+    fake.device_log("a")
+    stream_ = _open(driver, records)
+    driver.start(stream_)
+    _read(records, 1)
+    fake.device_log("b", at=fake.device_now() + US)
+    _read(records, 2)
+    fake.release("cut")
+    wait_until(lambda: len(fake.calls("date")) >= 2, timeout=TIMEOUT)
+    fake.step_clock(-3600)
+    fake.release("stepped")
+    _logcat_calls(fake, 2)
+    fake.device_log("c")
+    _read(records, 3)
+    return stream_
+
+
+def test_forward_step_below_the_old_hw_loses_nothing(
+    driver: Driver, fake_adb: FakeAdb
+) -> None:
+    """A device with a wrong clock that then syncs (design 5.6), past the first
+    new line and 1 s after the clock read, to a time below the lines read before:
+    the lines are new, not old ones (design A.25)."""
+    records: list[object] = []
+    stream_ = _reanchored(driver, fake_adb, records)
+    time.sleep(PAST_THE_SLACK)  # no line nor event marks this: host time only
+    fake_adb.step_clock(1800)
+    fake_adb.device_log("f1", "f2", "f3")
+    _read(records, 6)
+    driver.stop(stream_)
+    driver.join(stream_)
+
+    assert _messages(records) == ["a", "b", "c", "f1", "f2", "f3"]
+    assert [gap.reason for gap in _gaps(records)] == ["clock_moved_back"]
+    assert stream_.stats.deduplicated == 2
+    _assert_conserved(stream_)
+
+
+def test_forward_step_past_the_old_hw_comes_once(
+    driver: Driver, fake_adb: FakeAdb
+) -> None:
+    """The same to true time, past the lines read before, then a reconnect: the
+    lines after the sync are read again by the replay and dropped."""
+    records: list[object] = []
+    stream_ = _reanchored(driver, fake_adb, records)
+    time.sleep(PAST_THE_SLACK)  # no line nor event marks this: host time only
+    fake_adb.step_clock(3600 + 2)
+    fake_adb.device_log("f1", "f2", "f3")
+    _read(records, 6)
+    fake_adb.release("cut2")
+    _logcat_calls(fake_adb, 3)
+    fake_adb.device_log("end")
+    wait_until(lambda: "end" in _messages(records), timeout=TIMEOUT)
+    driver.stop(stream_)
+    driver.join(stream_)
+
+    assert _messages(records) == ["a", "b", "c", "f1", "f2", "f3", "end"]
+    assert [gap.reason for gap in _gaps(records)] == ["clock_moved_back"]
+    assert stream_.stats.reconnects == 2
+    _assert_conserved(stream_)
+
+
+def test_forward_step_right_after_the_clock_read_loses_nothing(
+    driver: Driver, fake_adb: FakeAdb
+) -> None:
+    """Within 1 s of the clock read: the lines read before were replayed, so these
+    go on as lines from before the step, and later replays match them."""
+    records: list[object] = []
+    stream_ = _reanchored(driver, fake_adb, records)
+    fake_adb.step_clock(1800)
+    fake_adb.device_log("f1", "f2")
+    _read(records, 5)
+    fake_adb.release("cut2")
+    _logcat_calls(fake_adb, 3)
+    fake_adb.device_log("end")
+    wait_until(lambda: "end" in _messages(records), timeout=TIMEOUT)
+    driver.stop(stream_)
+    driver.join(stream_)
+
+    assert _messages(records) == ["a", "b", "c", "f1", "f2", "end"]
+    assert [gap.reason for gap in _gaps(records)] == ["clock_moved_back"]
+    _assert_conserved(stream_)
+
+
+@pytest.mark.parametrize("count", [3, 3000], ids=["few", "many"])
+def test_forward_step_ahead_of_any_new_line_comes_once(
+    driver: Driver, fake_adb: FakeAdb, count: int
+) -> None:
+    """The clock syncs before the re-anchored connection read a line of the new
+    clock: its lines come once, and the next reconnect drops them as replays,
+    however many (within the caps) came."""
+    fake_adb.device(ring=100_000)
+    fake_adb.logcat(
+        run(stream(until="cut"), exit_code=255),
+        run(wait("go"), stream(until="cut2"), exit_code=255),
+        run(stream()),
+    )
+    fake_adb.device_log("a")
+    fake_adb.device_log("b")
+    records: list[object] = []
+    stream_ = _open(driver, records)
+    driver.start(stream_)
+    _read(records, 2)
+    fake_adb.step_clock(-3600)
+    fake_adb.release("cut")
+    _logcat_calls(fake_adb, 2)
+    fake_adb.step_clock(3600 + 2)
+    fake_adb.release("go")
+    forward = [f"f{i}" for i in range(count)]
+    fake_adb.device_log(*forward)
+    _read(records, 2 + count)
+    fake_adb.release("cut2")
+    _logcat_calls(fake_adb, 3)
+    fake_adb.device_log("end")
+    wait_until(lambda: "end" in _messages(records), timeout=TIMEOUT)
+    driver.stop(stream_)
+    driver.join(stream_)
+
+    assert _messages(records) == ["a", "b", *forward, "end"]
+    assert [gap.reason for gap in _gaps(records)] == ["clock_moved_back"]
+    _assert_conserved(stream_)
+
+
+def test_flush_after_a_forward_step_reads_its_marker(
+    driver: Driver, fake_adb: FakeAdb
+) -> None:
+    """A forward step that stays below the old hw used to drop every later line
+    as an old one, the flush marker included: the flush then took its whole
+    bound and the capture reported flush_timeout."""
+    records: list[object] = []
+    stream_ = _reanchored(driver, fake_adb, records)
+    time.sleep(PAST_THE_SLACK)  # no line nor event marks this: host time only
+    fake_adb.step_clock(1800)
+    fake_adb.device_log("f1")
+    _read(records, 4)
+    driver.stop(stream_, flush=TIMEOUT)
+    driver.join(stream_)
+
+    assert _messages(records) == ["a", "b", "c", "f1"]
+    assert not stream_.stats.flush_timeout
+    assert "flush_timeout" not in stream_.stats.incomplete
+    _assert_conserved(stream_)
+
+
+def test_two_steps_from_before_the_capture_lose_no_line(
+    driver: Driver, fake_adb: FakeAdb
+) -> None:
+    """One connection reads across two steps from before the capture: the lines
+    between them are not old lines (they come once), no Gap, and the capture is
+    complete (user decision, design A.25)."""
+    fake_adb.device()
+    fake_adb.logcat(run(stream()))
+    t = fake_adb.device_now()
+    fake_adb.device_log("far", at=t + 7200 * US)
+    middle = [f"m{i}" for i in range(5)]
+    for i, message in enumerate(middle):
+        fake_adb.device_log(message, at=t + 3600 * US + i)
+    fake_adb.device_log("near", at=t - 2 * US)
+    records: list[object] = []
+    stream_ = _open(driver, records)
+    driver.start(stream_)
+    _read(records, 7)
+    driver.stop(stream_)
+    driver.join(stream_)
+
+    assert _messages(records) == ["far", *middle, "near"]
+    assert _gaps(records) == []
+    assert stream_.stats.deduplicated == 0
+    assert stream_.stats.complete
+
+
+def test_step_from_before_the_capture_and_a_rotated_ring_report_a_gap(
+    driver: Driver, fake_adb: FakeAdb
+) -> None:
+    """A connection that read part of the far side of such a step, and a ring that
+    rotates in the outage: the lines lost need a Gap, though the step itself
+    has none, and the capture is incomplete (design 5.6, A.25)."""
+    fake_adb.device(ring=8)
+    fake_adb.date(run(clock()), run(wait("logged"), clock()))
+    fake_adb.logcat(run(stream(lines=3), exit_code=255), run(stream()))
+    t = fake_adb.device_now()
+    for i in range(6):
+        fake_adb.device_log(f"old{i}", at=t + 3600 * US + i)
+    fake_adb.device_log("near", at=t - 2 * US)
+    records: list[object] = []
+    stream_ = _open(driver, records)
+    driver.start(stream_)
+    _read(records, 3)
+    wait_until(lambda: len(fake_adb.calls("date")) >= 2, timeout=TIMEOUT)
+    new = [f"new{i}" for i in range(20)]
+    fake_adb.device_log(*new)  # the ring of 8 keeps new12..new19
+    fake_adb.release("logged")
+    wait_until(lambda: "new19" in _messages(records), timeout=TIMEOUT)
+    driver.stop(stream_)
+    driver.join(stream_)
+
+    assert _messages(records) == ["old0", "old1", "old2", *new[12:]]
+    (gap,) = _gaps(records)
+    assert gap.reason == "ring_rotated"
+    assert gap.after is not None
+    assert _us(gap.after) == t + 3600 * US + 2
+    assert "gap" in stream_.stats.incomplete
+
+
+def test_chatty_notice_across_a_step_from_before_the_capture_is_backlog(
+    driver: Driver, fake_adb: FakeAdb
+) -> None:
+    """A notice on the far side of such a step is backlog pruning: nothing was lost
+    in the capture, so it stays complete (design A.25)."""
+    fake_adb.device()
+    fake_adb.logcat(run(stream()))
+    t = fake_adb.device_now()
+    fake_adb.device_log("old", at=t + 3600 * US)
+    fake_adb.device_log(expire_notice(2), tag="chatty", at=t + 3600 * US + 1)
+    fake_adb.device_log("near", at=t - 2 * US)
+    records: list[object] = []
+    stream_ = _open(driver, records)
+    driver.start(stream_)
+    _read(records, 3)
+    driver.stop(stream_)
+    driver.join(stream_)
+
+    stats = stream_.stats
+    assert (stats.backlog_pruned, stats.device_lost) == (2, 0)
+    assert _gaps(records) == []
+    assert stats.complete
+
+
+def test_second_step_before_any_new_line_is_reported_and_loses_nothing(
+    driver: Driver, fake_adb: FakeAdb
+) -> None:
+    """A second step before the re-anchored stream read a line of the new clock:
+    the attempt's clock read shows it, and the lines between the steps are
+    delivered, not dropped as old ones."""
+    fake_adb.device()
+    fake_adb.date(
+        run(clock()),
+        run(wait("first"), clock()),
+        run(wait("second"), clock()),
+        run(clock()),
+    )
+    fake_adb.logcat(
+        run(stream(until="cut"), exit_code=255), run(exit_code=255), run(stream())
+    )
+    fake_adb.device_log("a")
+    records: list[object] = []
+    stream_ = _open(driver, records)
+    driver.start(stream_)
+    _read(records, 1)
+    fake_adb.device_log("b", at=fake_adb.device_now() + US)
+    _read(records, 2)
+    fake_adb.release("cut")
+    wait_until(lambda: len(fake_adb.calls("date")) >= 2, timeout=TIMEOUT)
+    fake_adb.step_clock(-3600)
+    fake_adb.device_log("m1", "m2")
+    fake_adb.release("first")
+    wait_until(lambda: len(fake_adb.calls("date")) >= 3, timeout=TIMEOUT)
+    fake_adb.step_clock(-3600)
+    fake_adb.device_log("z")
+    fake_adb.release("second")
+    _read(records, 5)
+    driver.stop(stream_)
+    driver.join(stream_)
+
+    assert _messages(records) == ["a", "b", "m1", "m2", "z"]
+    reasons = [gap.reason for gap in _gaps(records)]
+    assert set(reasons) == {"clock_moved_back"}
+    assert len(reasons) >= 2
+    _assert_conserved(stream_)
+
+
+def test_repeated_reanchor_reports_what_the_ring_rotated_away(
+    driver: Driver, fake_adb: FakeAdb
+) -> None:
+    """An attempt delivered lines logged before the step, and the ring rotates
+    before the next attempt: the lines lost behind them get a Gap of their own."""
+    fake_adb.device(ring=12)
+    fake_adb.date(run(clock()), run(wait("first"), clock()), run(wait("next"), clock()))
+    fake_adb.logcat(
+        run(stream(until="cut"), exit_code=255),
+        run(stream(lines=5), exit_code=255),
+        run(stream()),
+    )
+    fake_adb.device_log("a")
+    records: list[object] = []
+    stream_ = _open(driver, records)
+    driver.start(stream_)
+    _read(records, 1)
+    fake_adb.device_log("b", at=fake_adb.device_now() + US)
+    _read(records, 2)
+    fake_adb.release("cut")
+    wait_until(lambda: len(fake_adb.calls("date")) >= 2, timeout=TIMEOUT)
+    top = fake_adb.device_now() + 3 * US
+    for i in range(4):
+        fake_adb.device_log(f"u{i}", at=top + i)
+    fake_adb.step_clock(-3600)
+    fake_adb.release("first")
+    _read(records, 5)  # the replay of a and b, then u0, u1 and u2
+    wait_until(lambda: len(fake_adb.calls("date")) >= 3, timeout=TIMEOUT)
+    rotated = [f"r{i}" for i in range(30)]
+    fake_adb.device_log(*rotated)
+    fake_adb.release("next")
+    wait_until(lambda: "r29" in _messages(records), timeout=TIMEOUT)
+    driver.stop(stream_)
+    driver.join(stream_)
+
+    assert _messages(records) == ["a", "b", "u0", "u1", "u2", *rotated[18:]]
+    assert [gap.reason for gap in _gaps(records)] == [
+        "clock_moved_back",
+        "ring_rotated",
+    ]
+    (*_, gap) = _gaps(records)
+    assert gap.after is not None
+    assert _us(gap.after) == top + 2
+    _assert_conserved(stream_)
+
+
+def test_line_before_the_step_stays_once_after_the_clock_passed_the_old_hw(
+    driver: Driver, fake_adb: FakeAdb
+) -> None:
+    """A line logged before the step is delivered once, also by the replay of a
+    resume whose clock read has passed the old hw: no second delivery, no Gap."""
+    fake_adb.device()
+    fake_adb.date(
+        run(clock()), run(wait("stepped"), clock()), run(wait("later"), clock())
+    )
+    fake_adb.logcat(
+        run(stream(until="cut"), exit_code=255),
+        run(stream(until="cut2"), exit_code=255),
+        run(stream()),
+    )
+    fake_adb.device_log("a")
+    records: list[object] = []
+    stream_ = _open(driver, records)
+    driver.start(stream_)
+    _read(records, 1)
+    time.sleep(1.2)  # past the first read's second: the capture's
+    fake_adb.device_log("b")
+    _read(records, 2)
+    fake_adb.release("cut")
+    wait_until(lambda: len(fake_adb.calls("date")) >= 2, timeout=TIMEOUT)
+    fake_adb.device_log("unread")
+    fake_adb.step_clock(-3)
+    top = fake_adb.device_entries()[-1][0]
+    fake_adb.release("stepped")
+    _logcat_calls(fake_adb, 2)
+    fake_adb.device_log("new")
+    _read(records, 4)
+    fake_adb.release("cut2")
+    wait_until(lambda: len(fake_adb.calls("date")) >= 3, timeout=TIMEOUT)
+    wait_until(lambda: fake_adb.device_now() > top + 1_100_000, timeout=TIMEOUT)
+    fake_adb.release("later")
+    _logcat_calls(fake_adb, 3)
+    fake_adb.device_log("end")
+    wait_until(lambda: "end" in _messages(records), timeout=TIMEOUT)
+    driver.stop(stream_)
+    driver.join(stream_)
+
+    assert _messages(records) == ["a", "b", "unread", "new", "end"]
+    assert [gap.reason for gap in _gaps(records)] == ["clock_moved_back"]
+    _assert_conserved(stream_)
+
+
+def test_request_near_the_epoch_is_a_valid_T(  # noqa: N802
+    driver: Driver, fake_adb: FakeAdb
+) -> None:
+    """A device that boots with its clock at the epoch: the re-anchor's request
+    stays at 0 (a negative -T is refused, by the fake and, from memory, by logcat),
+    so the stream goes on reading."""
+    fake_adb.device()
+    fake_adb.logcat(run(stream(until="cut"), exit_code=255), run(stream()))
+    fake_adb.device_log("a")
+    records: list[object] = []
+    stream_ = _open(driver, records)
+    driver.start(stream_)
+    _read(records, 1)
+    time.sleep(1.2)  # the outage is above the clock
+    fake_adb.device_clock(US)
+    fake_adb.release("cut")
+    resumed = _logcat_calls(fake_adb, 2)[1]
+    fake_adb.device_log("b")
+    _read(records, 2)
+    driver.stop(stream_)
+    driver.join(stream_)
+
+    assert resumed["args"][resumed["args"].index("-T") + 1] == "0.000000"
+    assert _messages(records) == ["a", "b"]
+
+
 def test_late_line_after_the_replayed_window_is_below_cursor(
     driver: Driver, fake_adb: FakeAdb
 ) -> None:
@@ -654,6 +1056,76 @@ def test_stalled_reader_is_resumed_and_overwrite_reported(
     assert (stats.stall_resumes, stats.reconnects, stats.gaps) == (1, 1, 1)
     assert stats.backpressure_seconds > 0
     assert stream_.outcome is None
+    _assert_conserved(stream_)
+
+
+def test_stall_under_a_flood_with_the_ring_intact_loses_nothing(
+    driver: Driver, fake_adb: FakeAdb
+) -> None:
+    """adb blocked in a write when the stall kills it: the pipe can hold part of a
+    line. The replay returns the whole line, so a cut one is no entry and no Gap,
+    and the capture stays complete (design 4.4, A.25). The ring holds everything:
+    nothing was lost."""
+    fake_adb.device(ring=100_000)
+    payload = "x" * 500
+    count = 8000
+    release = threading.Event()
+    records: list[object] = []
+
+    def on_item(entry: LogEntry) -> None:
+        release.wait(TIMEOUT)
+        records.append(entry)
+
+    stream_ = driver.open(
+        config(buffer_entries=50, stall_timeout=0.3),
+        on_item=on_item,
+        on_event=records.append,
+    )
+    try:
+        driver.start(stream_)
+        fake_adb.device_log(*[f"{i} {payload}" for i in range(count)])
+        wait_until(lambda: stream_.stats.stall_resumes == 1, timeout=TIMEOUT)
+        wait_until(lambda: not fake_adb.live_children("logcat"), timeout=TIMEOUT)
+    finally:
+        release.set()
+    wait_until(lambda: len(_entries(records)) >= count, timeout=TIMEOUT)
+    fake_adb.device_log(f"{count} end")
+    _read(records, count + 1)
+    driver.stop(stream_)
+    driver.join(stream_)
+
+    assert [_seq(e) for e in _entries(records)] == list(range(count + 1))
+    assert all(entry.parsed for entry in _entries(records))
+    assert _gaps(records) == []
+    assert stream_.stats.complete
+    _assert_conserved(stream_)
+
+
+def test_cut_line_of_a_disconnect_comes_whole_from_the_replay(
+    driver: Driver, fake_adb: FakeAdb
+) -> None:
+    """The same at any end the run resumes from, deterministically: adb dies in the
+    middle of a line, in its message or in its header."""
+    fake_adb.device()
+    t = fake_adb.device_now() - US
+    (first,) = fake_adb.device_log("whole", at=t)
+    (second,) = fake_adb.device_log("this-message-gets-cut", at=t + 1)
+    (third,) = fake_adb.device_log("this-header-gets-cut", at=t + 2)
+    fake_adb.logcat(
+        run(out(f"{first}\n{second[:-5]}"), exit_code=255),
+        run(out(f"{first}\n{second}\n{third[:15]}"), exit_code=255),
+        run(stream()),
+    )
+    records: list[object] = []
+    stream_ = _open(driver, records)
+    driver.start(stream_)
+    _read(records, 3)
+    driver.stop(stream_)
+    driver.join(stream_)
+
+    assert _messages(records) == ["whole", "this-message-gets-cut", third[-20:]]
+    assert _gaps(records) == []
+    assert stream_.stats.complete
     _assert_conserved(stream_)
 
 

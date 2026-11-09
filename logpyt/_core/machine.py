@@ -52,6 +52,10 @@ Facts the code relies on:
   ``undelivered``, counted in ``before_start``, ``deduplicated`` or
   ``below_cursor``, or still held for attribution or in an open group.
   `StreamCore.unaccounted_lines` is that balance; it is always 0.
+- The bytes after stdout's last LF wait for the end of the connection: a run
+  that resumes drops them and counts them in ``deduplicated`` (a kill can cut a
+  line, and the replay returns it whole), a run that ends there emits them
+  (design 5.5, A.25).
 - A stall resume (design 5.6) and an end that logd caused while the reader
   was behind (design A.6: an unbroken prefix, then EOF and status 1, while
   intake was closed or within ``stall_timeout`` of its reopening, intake
@@ -225,6 +229,8 @@ class _Connection:
     stalled: Literal["consumer", "attribution"] | None = None
     # Why the core ended it: a read timeout or a failed state check.
     cause: tuple[Literal["timeout", "device"], str] | None = None
+    # The bytes after stdout's last LF at its EOF (see `_partial_line`).
+    partial: list[FramedLine] = field(default_factory=list)
 
     @property
     def alive(self) -> bool:
@@ -551,9 +557,7 @@ class StreamCore:
                 self._check(
                     event, possible=conn.pid is not None and pipe not in conn.eof
                 )
-                self._lines_of(pipe, conn.framers[pipe].finish(), now)
-                conn.eof.add(pipe)
-                self._maybe_ended(conn, now)
+                self._pipe_ended(conn, pipe, now)
             case Exited(returncode=returncode):
                 self._check(event, possible=conn.alive)
                 conn.returncode = returncode
@@ -565,6 +569,19 @@ class StreamCore:
                 self._maybe_ended(conn, now)
             case _:
                 assert_never(event)
+
+    def _pipe_ended(self, conn: _Connection, pipe: Pipe, now: float) -> None:
+        """eof(c, pipe): what follows the pipe's last LF, and maybe the end of ``conn``.
+
+        Stdout's waits for the end of the connection (`_partial_line`).
+        """
+        last = conn.framers[pipe].finish()
+        if pipe == "stdout":
+            conn.partial = last
+        else:
+            self._lines_of(pipe, last, now)
+        conn.eof.add(pipe)
+        self._maybe_ended(conn, now)
 
     def _check(self, event: Event, *, possible: bool) -> None:
         """Fail on an event that cannot occur here (design 3.2, last paragraph)."""
@@ -965,6 +982,7 @@ class StreamCore:
         """The connection ended: exited and both pipes at EOF, or exit_drain expired."""
         conn = self._conn
         assert conn is not None  # noqa: S101  (only a live connection ends)
+        self._partial_line(conn, now)
         self._conn = None  # retired (G1)
         if self._state is not S.STOPPING:
             # Its held lines go before the change to RECONNECTING (design 3.6):
@@ -979,11 +997,7 @@ class StreamCore:
         if conn.stalled is not None:
             self._attempt_ended(None, stalled=conn.stalled, retry=True)
             return
-        if (
-            conn.returncode == LOGD_DROP_STATUS
-            and conn.cause is None
-            and self._behind(conn, now)
-        ):
+        if self._dropped_by_logd(conn, now):
             # Design A.6: logd ends a reader that falls behind its ring with
             # an unbroken prefix, then EOF and status 1 (API 24 and 36), before
             # the stall rule may fire; a disconnect ends with 143 or 255
@@ -993,6 +1007,45 @@ class StreamCore:
             self._attempt_ended(None, stalled="dropped", retry=True)
             return
         self._attempt_ended(self._end_cause(conn), stalled=None, retry=True)
+
+    def _partial_line(self, conn: _Connection, now: float) -> None:
+        """The bytes after stdout's last LF, once the connection ended (design A.25).
+
+        A kill or a disconnect can cut a line. If the run resumes, its replay
+        returns the whole line, so the cut one is dropped and counted, and it
+        never moves hw or enters the window. If the run ends here, it is the
+        partial last line of design 5.5, and goes on like any line.
+        """
+        partial, conn.partial = conn.partial, []
+        if not partial:
+            return
+        if self._state is S.STOPPING or not (
+            conn.stalled is not None
+            or self._dropped_by_logd(conn, now)
+            or self._attempts_left()
+        ):
+            self._lines_of("stdout", partial, now)
+            return
+        self._tally.lines += len(partial)
+        if conn.marker is None:
+            self._tally.deduplicated += len(partial)
+        else:
+            self._tally.before_start += len(partial)
+
+    def _dropped_by_logd(self, conn: _Connection, now: float) -> bool:
+        """Whether status 1 ended ``conn`` because logd dropped its reader (A.6)."""
+        return (
+            conn.returncode == LOGD_DROP_STATUS
+            and conn.cause is None
+            and self._behind(conn, now)
+        )
+
+    def _attempts_left(self) -> bool:
+        """Whether the reconnect policy allows another attempt."""
+        reconnect = self._config.reconnect
+        return reconnect is not None and (
+            reconnect.max_attempts is None or self._attempts < reconnect.max_attempts
+        )
 
     def _behind(self, conn: _Connection, now: float) -> bool:
         """Whether logd may have ended the reader of ``conn`` (design A.6).
@@ -1048,10 +1101,7 @@ class StreamCore:
         """
         number = self._number
         reconnect = self._config.reconnect
-        left = reconnect is not None and (
-            reconnect.max_attempts is None or self._attempts < reconnect.max_attempts
-        )
-        if stalled is not None or (retry and left):
+        if stalled is not None or (retry and self._attempts_left()):
             self._set_state(S.RECONNECTING, error=cause)
             if stalled is not None:
                 self._resume_on_intake = True
@@ -1264,17 +1314,15 @@ class StreamCore:
             # while a kill or a failure discards the rest (design A.20).
             self._before_start(conn, marker, line, now)
             return
-        if line.truncated:
-            self._tally.truncated += 1
         if self._dropping():
+            if line.truncated:
+                self._tally.truncated += 1
             self._drop(1, "kill()" if self._mode is Mode.KILL else "the run failed")
             return
         entry = conn.pipeline.entry(line)
         if entry is None:  # a buffer divider: logcat's own line
             self._tally.filtered += 1
             return
-        if not entry.parsed:
-            self._tally.unparsed += 1
         planner = self._planner
         verdict = planner.screen(entry, len(line.data) + 1, now)
         if planner.out:
@@ -1285,6 +1333,12 @@ class StreamCore:
         if verdict == "below_cursor":
             self._tally.below_cursor += 1
             return
+        # Only a line of the capture counts: a replay or a line below the
+        # request is neither new nor this run's to report.
+        if line.truncated:
+            self._tally.truncated += 1
+        if not entry.parsed:
+            self._tally.unparsed += 1
         token = self._flush_token
         if (
             token is not None

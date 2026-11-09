@@ -81,8 +81,9 @@ Device (design 5.6, PR-14). ``DEVICE = {"ring": N, "overrun": "eof" | "skip",
   entries, and the run goes on with its next step. When the ring has
   overwritten the entry a stream would write next while it still had entries
   to write (the reader fell behind: its writes block on a full pipe; a
-  reader that had written everything keeps up with any append, however
-  large), it behaves as API 24 and 36 did
+  reader that had written everything keeps up with an append, unless the
+  append is larger than both one write of a stream and the ring; one that has
+  not written yet has fallen behind nothing), it behaves as API 24 and 36 did
   (FINDINGS.md, check 5; design A.6): with ``overrun`` ``"eof"`` (the default)
   it writes ``logcat: Unexpected EOF!`` to stderr and exits 1 at once, after
   the unbroken prefix it wrote; with ``"skip"`` it goes on at the oldest entry
@@ -112,7 +113,8 @@ A child never outlives the test run by much: a ``wait`` step gives up after
 ``_WAIT_TIMEOUT`` (exit 98), and a hanging child exits once its parent is gone
 (POSIX: its parent pid is no longer ``--fake-parent``, for example after the
 hang watchdog ended pytest; exit 96) or after ``_HANG_LIMIT`` (exit 97), far
-beyond any per-test limit.
+beyond any per-test limit. A ``stream`` step counts as hanging once it has had
+nothing to write for that long (Windows has no other way to end an orphan).
 
 Only the standard library is used: this file runs in ``python -I``.
 """
@@ -559,8 +561,10 @@ class _Stream:
     def run(self) -> None:
         initial = self.log.total
         signalled = self.ready is None
+        idle_since = time.monotonic()
         while not self._ended():
-            behind = bool(self.pending)  # entries left before this poll
+            # Entries left before this poll, of a reader that has begun.
+            behind = bool(self.pending) and self.written > 0
             self.pending.extend(self.log.poll())
             if behind:
                 self._check_overrun()
@@ -570,8 +574,12 @@ class _Stream:
             if not self.pending:
                 if _orphaned(self.parent):
                     sys.exit(_EXIT_ORPHANED)
+                if time.monotonic() - idle_since > _HANG_LIMIT:
+                    sys.stderr.write("fake_adb: hang limit reached\n")
+                    sys.exit(_EXIT_HANG_LIMIT)
                 time.sleep(_POLL)
                 continue
+            idle_since = time.monotonic()
             self._write_chunk()
         self.log.close()
 
@@ -584,7 +592,10 @@ class _Stream:
         """The ring overwrote the entry we would write next (design A.6).
 
         Only a reader that is behind is checked: one that had written every
-        entry reads an append as it happens, as logd's caught-up readers do.
+        entry reads an append as it happens, as logd's caught-up readers do, and
+        one that wrote nothing yet has what the ring held when it started (a
+        request below the ring starts at its oldest entry, which the next append
+        overwrites). A device's reader that logd drops has printed a prefix.
         """
         oldest = self.log.total - self.capacity
         pending = self.pending
@@ -592,8 +603,8 @@ class _Stream:
             return
         if not self.skip:
             sys.stdout.buffer.flush()
-            sys.stderr.write(_OVERRUN_NOTICE)
-            sys.stderr.flush()
+            # Bytes: the text layer of stderr writes CR LF on Windows.
+            _write(sys.stderr.buffer, _OVERRUN_NOTICE.encode())
             sys.exit(_EXIT_OVERRUN)
         while pending and pending[0][0] < oldest:
             pending.popleft()

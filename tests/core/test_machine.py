@@ -803,14 +803,28 @@ def test_running_data() -> None:
 
 
 def test_running_eof() -> None:
-    """RUNNING eof(c, pipe): emit that framer's partial last line."""
+    """RUNNING eof(c, pipe): stdout's partial last line waits for the end of the
+    connection (design A.25); a run that ends there emits it."""
     harness = Harness.make().running()
     harness.stdout(line("whole") + line("cut")[:-1])
 
     harness.eof("stdout")
 
-    assert harness.messages() == ["first", "whole", "cut"]
+    assert harness.messages() == ["first", "whole"]
     assert harness.core.state is S.RUNNING
+    harness.eof("stderr")
+    harness.exited(0)
+    assert harness.messages() == ["first", "whole", "cut"]
+
+
+def test_running_eof_stderr() -> None:
+    """RUNNING eof(c, stderr): its partial last line is logged at once."""
+    harness = Harness.make().running()
+    harness.stderr(b"partial")
+
+    out = harness.eof("stderr")
+
+    assert [cmd.message for cmd in out if isinstance(cmd, Diagnostic)] == ["partial"]
 
 
 def test_running_exited() -> None:
