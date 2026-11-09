@@ -411,6 +411,92 @@ def test_old_lines_not_replayed_after_reanchor(
     _assert_conserved(stream_)
 
 
+def test_live_clock_step_then_caught_up_outage_reports_one_gap(
+    driver: Driver, fake_adb: FakeAdb
+) -> None:
+    """A clock step back seen live (design 5.6, A.25): Gap(clock_moved_back,
+    after=hw, before=<the first new line>) right before that line, which is
+    delivered, and a re-anchor at it. The outage that follows ends after the
+    device clock has passed the old lines again, so the resume's clock check
+    sees no step. Its -T lies in the new times, so logd returns the old lines
+    first (one of them older than the window), then the new ones read
+    before: none of them comes twice, and only the outage's lines are new.
+    """
+    fake_adb.device()
+    fake_adb.date(run(clock()), run(wait("caught-up"), clock()))
+    fake_adb.logcat(run(stream(until="cut"), exit_code=255), run(stream()))
+    t = fake_adb.device_now()
+    fake_adb.device_log("a0", at=t - 3 * US)  # outside the window at the step
+    fake_adb.device_log("a", at=t - US // 2)
+    fake_adb.device_log("b", at=t)
+    records: list[object] = []
+    stream_ = _open(driver, records)
+    driver.start(stream_)
+    _read(records, 3)
+    fake_adb.step_clock(-3600)
+    fake_adb.device_log("c1", "c2")
+    _read(records, 5)
+    fake_adb.release("cut")
+    wait_until(lambda: len(fake_adb.calls("date")) >= 2, timeout=TIMEOUT)
+    fake_adb.step_clock(3600 + 2)  # the clock has caught up: past b
+    fake_adb.device_log("o1", "o2")
+    fake_adb.release("caught-up")
+    resumed = _logcat_calls(fake_adb, 2)[1]
+    _read(records, 7)
+    fake_adb.device_log("end")
+    wait_until(lambda: "end" in _messages(records), timeout=TIMEOUT)
+    driver.stop(stream_)
+    driver.join(stream_)
+
+    assert _messages(records) == ["a0", "a", "b", "c1", "c2", "o1", "o2", "end"]
+    entries = _entries(records)
+    (gap,) = _gaps(records)
+    assert gap.reason == "clock_moved_back"
+    assert gap.lost is None
+    assert gap.after == entries[2].timestamp  # b
+    assert gap.before == entries[3].timestamp  # c1
+    assert records[records.index(gap) + 1] is entries[3]
+    assert _requested(resumed) == _us(entries[4].timestamp) - OVERLAP
+    stats = stream_.stats
+    # a0 (an old line), a and b (the old window), c1 and c2 (the new one).
+    assert (stats.reconnects, stats.deduplicated, stats.below_cursor) == (1, 5, 0)
+    assert stats.gaps == 1
+    _assert_conserved(stream_)
+    assert fake_adb.survivors() == []
+
+
+def test_late_line_after_the_replayed_window_is_below_cursor(
+    driver: Driver, fake_adb: FakeAdb
+) -> None:
+    """The replay's phase ends at the first line above hw (design A.25): a line
+    read before and stored 0.7 s late, which logd returns after the window's
+    last element, lies below the request (resume_overlap 0.5 s) and is
+    dropped as below_cursor, not delivered again. 0.7 s is inside the step
+    bound max(resume_overlap, 1 s): no Gap.
+    """
+    fake_adb.device()
+    fake_adb.logcat(run(stream(until="cut"), exit_code=255), run(stream()))
+    t = fake_adb.device_now() - US
+    fake_adb.device_log("a", at=t)
+    fake_adb.device_log("late", at=t - 700_000)
+    records: list[object] = []
+    stream_ = _open(driver, records, resume_overlap=0.5)
+    driver.start(stream_)
+    _read(records, 2)
+    fake_adb.release("cut")
+    resumed = _logcat_calls(fake_adb, 2)[1]
+    fake_adb.device_log("after")
+    wait_until(lambda: "after" in _messages(records), timeout=TIMEOUT)
+    driver.stop(stream_)
+    driver.join(stream_)
+
+    assert _messages(records) == ["a", "late", "after"]
+    assert _requested(resumed) == t - 500_000
+    stats = stream_.stats
+    assert (stats.deduplicated, stats.below_cursor, stats.gaps) == (1, 1, 0)
+    _assert_conserved(stream_)
+
+
 def test_chatty_notice_in_backlog_or_replay_not_counted(
     driver: Driver, fake_adb: FakeAdb
 ) -> None:
@@ -677,14 +763,15 @@ def test_line_below_request_is_below_cursor(driver: Driver, fake_adb: FakeAdb) -
     """logd returns entries stored after the first one at or above ``-T`` even
     when their time is lower (a line stored late, a clock step after boot):
     the resume drops them as below_cursor, not as replays (design 5.6 step
-    2, A.7).
+    2, A.7). The line is 1.5 s late, inside the step bound max(resume_overlap,
+    1 s): one stored later than that is taken for a clock step (A.25).
     """
     fake_adb.device()
     fake_adb.logcat(run(stream(until="cut"), exit_code=255), run(stream()))
-    t = fake_adb.device_now() - US
+    t = fake_adb.device_now() - 2 * US
     fake_adb.device_log("a", at=t)
-    fake_adb.device_log("late", at=t - 10 * US)
-    fake_adb.device_log("b", at=t + 1)
+    fake_adb.device_log("late", at=t - 1_500_000)
+    fake_adb.device_log("b", at=t + US)  # -T is t - 1 s
     records: list[object] = []
     stream_ = _open(driver, records)
     driver.start(stream_)

@@ -20,7 +20,8 @@ from logpyt.adb import _MARKER_TAG, _AdbResult
 from logpyt.config import Reconnect
 from logpyt.exceptions import AdbExitError
 from logpyt.filters import Package
-from logpyt.models import LogEntry
+from logpyt.groupers import GroupBy
+from logpyt.models import LogEntry, LogGroup
 from logpyt.streams._events import Gap, StateChange, StreamState
 from tests.core.harness import (
     APP,
@@ -159,6 +160,100 @@ def test_clock_step_back_reanchors_with_the_host_outage() -> None:
     harness.stdout(at("a", HW) + at("now", stepped * US) + at("old", HW - US))
     assert harness.messages() == ["a", "now"]
     assert harness.core.stats().deduplicated == 2
+
+
+def test_live_clock_step_back_reports_a_gap_before_the_line() -> None:
+    """A line stamped more than max(resume_overlap, 1 s) below hw on a live
+    connection is a clock step seen live: Gap(clock_moved_back) right before
+    it, the line delivered; the next resume requests the new times and drops
+    the replay of both eras (design 5.6, A.25)."""
+    harness = Harness.make(reconnect=Reconnect(delay=1.0)).running(at("a", HW))
+    stepped = HW - 3600 * US
+
+    harness.stdout(at("b", stepped))
+
+    gap = Gap(moment(HW), moment(stepped), lost=None, reason="clock_moved_back")
+    emitted = records(harness)
+    assert emitted.index(gap) == len(emitted) - 2  # right before "b"
+    assert isinstance(emitted[-1], LogEntry)
+    assert emitted[-1].message == "b"
+    stats = harness.core.stats()
+    assert stats.gaps == 1
+    assert stats.incomplete == ("gap",)
+    reconnect(harness, stepped // US + 5)
+    seconds, micro = divmod(stepped - 2 * US, US)
+    assert spawn_T(harness) == f"{seconds}.{micro:06d}"
+    harness.stdout(at("a", HW) + at("b", stepped) + at("c", stepped + US))
+    assert harness.messages() == ["a", "b", "c"]
+    stats = harness.core.stats()
+    assert (stats.gaps, stats.deduplicated, stats.below_cursor) == (1, 2, 0)
+    assert harness.core.unaccounted_lines() == 0
+
+
+@pytest.mark.parametrize("found", ["device_reported", "clock_moved_back"])
+def test_gap_found_mid_connection_precedes_the_open_group(found: str) -> None:
+    """With group_by, a Gap found mid-connection is emitted when the planner
+    finds it, and a group is delivered when it closes: the group that holds
+    the Gap's ``after`` line comes after the Gap (documented, design A.25)."""
+    harness = Harness.make(
+        reconnect=Reconnect(delay=1.0),
+        group_by=GroupBy(keys=("tag",), gap_ms=60_000.0, idle_flush_ms=None),
+    ).running(at("a", CLOCK * US))  # after S, the first clock read
+    t = CLOCK * US
+    line_ = chatty(3, t + 5) if found == "device_reported" else at("b", t - 3600 * US)
+
+    harness.stdout(line_)
+
+    emitted = records(harness)
+    (gap,) = [record for record in emitted if isinstance(record, Gap)]
+    assert gap.reason == found
+    assert gap.after == moment(CLOCK * US)  # the time of "a"
+    (group,) = [record for record in emitted if isinstance(record, LogGroup)]
+    assert [entry.message for entry in group] == ["a"]
+    assert emitted.index(gap) < emitted.index(group)
+
+
+@pytest.mark.parametrize("found", ["device_reported", "clock_moved_back"])
+def test_gap_found_mid_connection_precedes_held_lines(found: str) -> None:
+    """A line held for package attribution (``where`` with Package, design
+    5.8) is delivered when the lookup answers, but a Gap found meanwhile is
+    emitted when the planner finds it: the held line that holds the Gap's
+    ``after`` time comes after the Gap (documented on Gap)."""
+    harness = Harness.make(where=Package(APP), reconnect=Reconnect(delay=1.0))
+    harness.connecting_spawned()
+    t = CLOCK * US  # after S, the first clock read
+    harness.stdout(at("a", t))  # held while the first lookup runs
+    found_in = (
+        chatty(5, t + 10) if found == "device_reported" else at("b", t - 3600 * US)
+    )
+    harness.stdout(found_in)
+
+    harness.answer("lookup", LOOKUP_OK)
+
+    emitted = [r for r in records(harness) if isinstance(r, LogEntry | Gap)]
+    (gap,) = [r for r in emitted if isinstance(r, Gap)]
+    assert gap.reason == found
+    assert gap.after == moment(t)  # the time of "a"
+    first = next(r for r in emitted if isinstance(r, LogEntry))
+    assert first.message == "a"
+    assert emitted.index(gap) < emitted.index(first)
+
+
+def test_late_line_after_the_replay_is_below_cursor() -> None:
+    """The replay's phase ends at the first line above hw: a line read before,
+    stored late below the request and returned after the window's last
+    element, is not delivered again (resume_overlap 0.5 s: the line is 0.7 s
+    late, inside the 1 s step bound, outside the window)."""
+    harness = Harness.make(reconnect=Reconnect(delay=1.0), resume_overlap=0.5)
+    harness.running(at("a", HW) + at("late", HW - 700_000))
+    reconnect(harness)
+
+    harness.stdout(at("a", HW) + at("late", HW - 700_000) + at("b", HW + US))
+
+    assert harness.messages() == ["a", "late", "b"]
+    stats = harness.core.stats()
+    assert (stats.deduplicated, stats.below_cursor, stats.gaps) == (1, 1, 0)
+    assert harness.core.unaccounted_lines() == 0
 
 
 # -- chatty notices --------------------------------------------------------------------

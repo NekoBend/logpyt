@@ -14,11 +14,13 @@ on an event loop in a helper thread) against the fake adb's simulated device
   adb that waits without output as for an absent device (``connect_timeout``,
   then the state check fails);
 - a director thread, every ``Plan.pace`` seconds, ends the live connection
-  the way its run says, or steps the device clock back by less than
-  ``resume_overlap`` (absorbed by the overlap: the soak's "no duplicate"
-  criterion holds without the clock_moved_back exception of design 5.6),
+  the way its run says; or steps the device clock back, in turn by less than
+  ``resume_overlap`` (absorbed by the overlap) and, while a connection
+  streams, by more (``Plan.clock_jump``: a step seen live, design A.25, one
+  ``Gap(clock_moved_back)`` each; the old lines' later replays are dropped,
+  so the "no duplicate" criterion holds without design 5.6's exception);
   changes the package's uid (a reinstall: the next lookup answers the new
-  uid), or stalls the consumer: briefly (a stall resume whose ring still
+  uid); or stalls the consumer: briefly (a stall resume whose ring still
   holds hw) or long enough for the ring to overwrite hw (the resume reports
   ``Gap(ring_rotated)``);
 - a sampler records, every ``Plan.sample_every`` seconds: ``tracemalloc``
@@ -130,6 +132,9 @@ class Plan:
     short_stall: float = 2.5
     long_stall: float = 9.0
     clock_step: float = -0.5  # below resume_overlap - 1 s (the clock's resolution)
+    # Above max(resume_overlap, 1 s): a step seen live. Small enough that the
+    # resumes after it are past the old lines before the next long stall.
+    clock_jump: float = -4.0
     sample_every: float = 60.0
     warmup: float = 600.0
     window: float = 1800.0
@@ -576,6 +581,8 @@ class Director:
         self.consumer = consumer
         self.quiet = quiet
         self.done: dict[str, int] = {}
+        self.released: set[int] = set()  # the logcat runs whose cut was released
+        self.jump = False  # whether the next clock step is a jump
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self._run, name="soak: director")
 
@@ -594,8 +601,8 @@ class Director:
         if action == "end":
             return self._end()
         if action == "clock_back":
-            self.fake.step_clock(self.plan.clock_step)
-        elif action == "reinstall":
+            return self._clock_back()
+        if action == "reinstall":
             self.writer.app_uid += 1
             answer = out(dumpsys_package(PKG, self.writer.app_uid))
             self.fake.dumpsys(PKG, run(answer))
@@ -604,6 +611,21 @@ class Director:
         else:
             self.consumer.stall(self.plan.long_stall)
         return action
+
+    def _clock_back(self) -> str:
+        """Every other time, a jump back while an adb logcat streams, so the
+        stream reads the lines after it on that connection; else a small step."""
+        self.jump = not self.jump
+        live: list[SpawnedChild] = self.fake.live_children("logcat")
+        streaming = bool(live) and (
+            BEHAVIOURS[live[-1].index % len(BEHAVIOURS)] != "absent"
+            and live[-1].index not in self.released
+        )
+        if self.jump and streaming:
+            self.fake.step_clock(self.plan.clock_jump)
+            return "clock_jump"
+        self.fake.step_clock(self.plan.clock_step)
+        return "clock_back"
 
     def _end(self) -> str:
         live: list[SpawnedChild] = self.fake.live_children("logcat")
@@ -616,6 +638,7 @@ class Director:
                 child.popen.kill()
         elif behaviour != "absent":
             self.fake.release(f"c{child.index}")
+        self.released.add(child.index)
         return f"end: {behaviour}"
 
 
@@ -864,9 +887,20 @@ def judge(
         failures.append(f"{result.spawns} adb logcat spawns: not every behaviour ran")
     if not result.state_checks:
         failures.append("no state check ran (the absent device's adb logcat)")
-    for needed in ("stall_long", "stall_short", "clock_back", "reinstall"):
+    for needed in (
+        "stall_long",
+        "stall_short",
+        "clock_back",
+        "clock_jump",
+        "reinstall",
+    ):
         if not result.actions.get(needed):
             failures.append(f"the director never ran {needed}")
+    # Each jump is one step seen live; a small step is no Gap (design A.25).
+    jumps = result.actions.get("clock_jump", 0)
+    steps = sum(reason == "clock_moved_back" for _, _, reason in result.consumer.gaps)
+    if steps != jumps:
+        failures.append(f"{steps} Gap(clock_moved_back) for {jumps} clock jumps")
     # Every adb ending of 9.1 (the absent device's is the state check above).
     for behaviour in BEHAVIOURS:
         if behaviour != "absent" and not result.actions.get(f"end: {behaviour}"):
