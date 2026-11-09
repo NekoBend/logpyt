@@ -57,13 +57,20 @@ The connection's screen phase then drops a line below ``T_req``
 told apart; an unparsed line before any parsed one has no time and is
 matched by content alone), and a chatty notice at or below ``hw``
 (``deduplicated``, and proof that logd still holds the position). It ends at
-the first line above ``hw`` or once every element was matched; a line at
+the first line above ``hw``, not at the last match (design A.25): a line read
+before and stored late below ``T_req``, which the replay returns after the
+window's last element, is ``below_cursor`` and not delivered again. A line at
 ``hw`` neither replayed nor covered by such a notice then gives
-``Gap(ring_rotated)``. A connection that ends inside its phase leaves the
-window as it was, so the next resume screens the same way. With
-``since=<datetime>`` the first connection drops lines below the start until
-the first one at or above it (``below_cursor``): the device can return
-lines below ``-T`` (design A.7).
+``Gap(ring_rotated)``. Once the replay of the lines read is over (every line
+at ``hw`` replayed or covered, or every element), a line below ``hw -
+max(resume_overlap, 1 s)`` is a clock step seen live (below), not
+``below_cursor``: so after its replay a phase that sees no line above ``hw``
+drops as ``below_cursor`` only lines less than that bound below ``hw``. A
+replay that never finishes is the exception (see the limits below). A
+connection that ends inside its phase leaves the window as it was, so the
+next resume screens the same way. With ``since=<datetime>`` the first
+connection drops lines below the start until the first one at or above it
+(``below_cursor``): the device can return lines below ``-T`` (design A.7).
 
 The clock check of every resume compares the attempt's clock ``N`` (whole
 seconds: ``adb shell date +%s``) with ``hw``. The clock moved back when
@@ -74,8 +81,12 @@ every ``resume_overlap >= 1``). The resume then emits
 ``Gap(clock_moved_back)``, requests ``N - outage - resume_overlap`` (the
 outage measured host-monotonically from the last line read), and screens the
 replay against the old window (no ring check: the Gap marks the point) for
-the whole connection; its ``below_cursor`` rule ends at the first new line
-logged after the clock read. From then on, until the device clock passes the
+the whole connection; its ``below_cursor`` rule ends once the window read
+before the step was replayed, or at the first new line logged after the
+clock read (from ``N + 1 s`` on). A line below the request after that window is
+one the new clock stamped before it, which was never read: the outage counts
+from the last line read, so a reader that lagged behind the step requests
+too little. From then on, until the device clock passes the
 old ``hw``, a line stamped above every time the device clock can show
 (``N + 1 s`` plus the host time since the clock read, plus 1 s of slack) was
 logged before the step. At most the old ``hw``, it was read before: logd
@@ -86,7 +97,55 @@ read before (by time, and by content at the highest such time, so lines of
 one microsecond are told apart). Neither kind moves ``hw`` or the window:
 they restart at the first new line the device clock can have stamped.
 Without these rules every later reconnect would deliver the old lines again
-and re-anchor once more.
+and re-anchor once more. Once a re-anchored phase's new lines began, a line
+below the new ``hw - max(resume_overlap, 1 s)`` is a step seen live. The
+highest time the caps evicted from the old window bounds later requests too,
+once the new ``hw`` lies above it (a step whose clock did not move, such as
+a line stored late, keeps the old times).
+
+A step seen live (design A.25): a parsed line that the screen does not drop,
+read outside a replay of the lines read before (no phase, or its replay is
+over) and stamped below ``hw - max(resume_overlap, 1 s)``, is a clock step
+back: ``Gap(clock_moved_back, after=hw, before=<its time>)`` at once, the
+line is delivered, and the stream re-anchors there by the rules above: the
+window is kept as the old window, the old ``hw`` is the ceiling, ``S`` and
+the start floor drop to that line's time minus the overlap, and ``hw`` and
+the window restart at the line. Without it, a step during a connection
+followed by an outage that ends after the clock caught up would replay the
+lines read since the step with no Gap (the resume's clock check sees no
+step). A line stored that late is taken for a step too: the device's
+out-of-order lines recorded so far were about 86 ms late. So is a step from
+before the capture while the ring still holds it (a backlog or the first
+lines of a run read across it): the Gap is reported and the capture counts
+as incomplete although nothing was lost, until logd rotates the step out
+(user decision, design A.25: not told apart from a step during the capture).
+
+After a step (seen live or at a resume), until a request lies above the old
+``hw`` (the highest line read before it), a resume's ``-T`` lies below lines
+read before the step, and logd returns them first, from the first one at or
+above ``-T`` in arrival order, then the new ones. Such a stepped phase also
+matches the old windows (kept until then, by content). Until the replay
+reaches the new lines (a match of the new window, a line below the request,
+a notice at or below ``hw``, a line above the old ``hw``, or the ring check)
+it drops as an old line (``deduplicated``) a line that matches neither
+window and is stamped at most the old ``hw`` when:
+
+- it is stamped below the new ``hw``;
+- the replay showed an old line for sure: a match of an old window, a line
+  above every time the clock can show, or a line more than 1 s below the
+  new ``hw`` (the device's lines stored late were about 86 ms late);
+- or the device logged it before the clock read or within its second
+  (stamped below ``N + 1 s``), and the replay showed a line less than 1 s
+  below the new ``hw`` (an old one, a line stored late, or one after a second
+  small step) or the clock read was at or above the old ``hw`` (every line up
+  to the old ``hw`` was then logged before it).
+
+Logd returns no new line before the old ones it holds, so such a line can be
+a new one only when the ring lost every line read since the step; the ring
+check at the first line above the new ``hw`` that is not dropped then
+reports the hole. Any other line is new: the ring check runs on the first
+one above the new ``hw``, and the phase goes on matching both windows for
+its connection.
 
 Chatty notices (``uid=... expire N lines``, tag ``chatty``; FINDINGS.md
 check 6 confirms the text on API 24): below ``S`` (which a re-anchor lowers
@@ -111,13 +170,40 @@ each buffer on its own, so a line kept at ``hw`` does not prove that an
 unread line of another buffer is kept). After a re-anchor, when a
 connection ends inside the lines logged between the last read and the step,
 a later one drops as a replay an unread such line stamped below the highest
-one delivered (lines out of time order).
+one delivered (lines out of time order). After a step, when the first old
+line of a resume's replay has left the old window and nothing proves the
+old lines first (it is stamped above the new ``hw`` and not above every time
+the device clock can show, ``N + 2 s`` plus the host time since the clock
+read, and the clock read is below the old ``hw``), the old lines that left
+the window are delivered again (design 5.6's exception), the ring check on
+the first of them can report a ``Gap(ring_rotated)`` that lost nothing, and
+the new lines that follow can raise a second ``Gap(clock_moved_back)``. The
+same holds for the old lines stamped from ``N + 1 s`` up to that newest time
+when the only hint before them was a line less than 1 s below the new
+``hw``. When the ring lost every line read since the step during the outage,
+the replay's lines that the device logged before the clock read or within
+its second are dropped as old ones (``deduplicated``) if the first is stamped
+below the new ``hw`` (a line stored late, or one after a second small step),
+or at once when the clock read is at or above the old ``hw``; they were never
+read. The ``Gap(ring_rotated)`` at the first line after them reports the
+hole; those stamped below the new ``hw`` lie outside its range. When the
+first is more than 1 s below the new ``hw`` (a second step back of more than
+1 s, up to ``max(resume_overlap, 1 s)``), the drop lasts until a line above
+the old ``hw``. A replay that lost a line at ``hw`` without a notice and
+meets a clock step back before any line above ``hw`` never finishes: it
+drops every line below the request (``below_cursor``) until a line above
+``hw``, whose ``Gap(ring_rotated)`` range does not hold them.
 
 Costs per line (design risk 16): a timestamp conversion, a deque append and
 amortized O(1) evictions (a line read below ``hw`` goes to the heap:
-O(log n)); in a screen phase one dict lookup more; a chatty check is one
-string comparison unless the tag is ``chatty``. A resume costs O(len(W))
-once, to count the window into the phase's dict.
+O(log n)); one comparison for a step seen live; in a screen phase one dict
+lookup more; a chatty check is one string comparison unless the tag is
+``chatty``. A resume costs O(len(W)) once, to count the window into the
+phase's dict. After a step, the window of the lines read before it is kept
+(at most the caps) until a request lies above the old ``hw`` or ``hw``
+passes it by ``resume_overlap``: one window per step in that time (a line
+stored late adds one for about the overlap). A resume copies the part at or
+above its request.
 """
 
 from __future__ import annotations
@@ -125,7 +211,7 @@ from __future__ import annotations
 import heapq
 import re
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from itertools import chain
 from typing import TYPE_CHECKING, Literal
@@ -198,16 +284,30 @@ class _Plan:
 
 @dataclass(slots=True, eq=False)
 class _Phase:
-    """The screen phase of one connection (design 5.6 steps 2-3).
+    """The screen phase of one connection (design 5.6 steps 2-3, A.25).
 
     ``floor``: lines below it are ``below_cursor``. ``expected``: the window's
-    elements at or above ``floor``, with their occurrence counts. The phase
-    ends at the first line that is not a match and is above ``end_above``, or
-    when a match leaves ``remaining`` at 0; a re-anchored one only drops its
-    ``below_cursor`` rule there and keeps matching. ``position`` is ``hw`` for
-    the ring check (``kind == "resume"`` only), ``at_position`` its unmatched
-    elements. ``loose``: the expected times of each raw text, built for the
-    first unparsed line that has no time to inherit.
+    elements at or above ``floor``, with their occurrence counts
+    (``remaining`` of them unmatched). A resume's phase ends at the first
+    line above ``end_above`` (``hw``) that is not a match, with the ring
+    check; a re-anchored one only drops its ``below_cursor`` rule there, or
+    once ``last`` (the window read before the step, ``last_left`` of it
+    unmatched) was replayed, and keeps matching for its connection.
+    ``position`` is ``hw`` for the ring check (``kind == "resume"`` only),
+    ``at_position`` its unmatched elements. ``loose``: the expected times of
+    each raw text, built for the first unparsed line that has no time to
+    inherit.
+
+    A resume whose request lies at or below a line read before a clock step
+    is ``stepped``: logd returns those old lines first. ``old`` holds the old
+    windows' elements at or above ``floor`` (``old_left`` of them unmatched).
+    Until the replay reaches the new lines (``era``), a line that matches
+    neither window and is stamped at most the old hw is an old one when it
+    is stamped below ``position``, once the replay showed an old line for
+    sure (``evidence``), or when the device logged it before the clock read
+    and the replay showed a line just below ``position`` (``hinted``) or the
+    clock read was ``caught_up`` with the old hw. ``passed``: the ring check
+    was done; a stepped phase then keeps matching both windows.
     """
 
     kind: _Kind
@@ -217,10 +317,20 @@ class _Phase:
     remaining: int
     position: int
     at_position: int
-    shortened: bool
+    shortened: bool = False
     covered: bool = False  # a replayed chatty notice at or below hw
     begun: bool = False  # a line was screened in this phase
     loose: dict[str, list[int]] | None = None
+    old: dict[tuple[int, str], int] = field(default_factory=dict)
+    old_left: int = 0
+    stepped: bool = False
+    caught_up: bool = False
+    evidence: bool = False
+    hinted: bool = False
+    era: bool = False
+    passed: bool = False
+    last: dict[tuple[int, str], int] = field(default_factory=dict)
+    last_left: int = 0
 
 
 class ResumePlanner:
@@ -246,12 +356,16 @@ class ResumePlanner:
         "_gapped",
         "_hw",
         "_keep",
+        "_kept",
         "_last_read_at",
         "_last_ts",
         "_late",
         "_max_bytes",
         "_max_lines",
         "_noted",
+        "_old",
+        "_old_evicted",
+        "_old_top",
         "_overlap",
         "_pending_restart",
         "_phase",
@@ -264,6 +378,7 @@ class ResumePlanner:
         "_since",
         "_start",
         "_started",
+        "_step",
         "_window",
         "backlog_pruned",
         "device_lost",
@@ -282,6 +397,9 @@ class ResumePlanner:
     ) -> None:
         self._since = since
         self._overlap = round(overlap * US_PER_SECOND)
+        # A clock read, or a line read, this far below hw shows a step back:
+        # never less than the clock read's resolution (whole seconds).
+        self._step = max(self._overlap, CLOCK_RESOLUTION)
         self._max_lines = max_lines
         self._max_bytes = max_bytes
         self._keep = keep
@@ -322,6 +440,15 @@ class ResumePlanner:
         # A re-anchored connection restarts hw and the window at its first
         # new line.
         self._pending_restart = False
+        # After a step back, until a request lies above every line read
+        # before it or hw passes them by the overlap: the windows those lines
+        # left (counts by (timestamp, raw)), their highest time, the hw whose
+        # window was added last, and the highest time the caps evicted from
+        # them.
+        self._old: dict[tuple[int, str], int] | None = None
+        self._old_top: int | None = None
+        self._kept: int | None = None
+        self._old_evicted: int | None = None
         self._noted = False  # this connection's cap INFO was queued
         self.out: list[Gap | str] = []
         self.backlog_pruned = 0
@@ -398,7 +525,7 @@ class ResumePlanner:
             kind: _Kind | None = "start" if self._floor is not None else None
             self._plan = _Plan(kind, self._floor)
             return None
-        if clock < hw - max(self._overlap, CLOCK_RESOLUTION):
+        if clock < hw - self._step:
             last = self._last_read_at
             outage = 0.0 if last is None else max(issued - last, 0.0)
             request = clock - round(outage * US_PER_SECOND) - self._overlap
@@ -414,12 +541,17 @@ class ResumePlanner:
             )
         request = hw - self._overlap
         shortened = False
-        evicted = self._cap_evicted
-        if evicted is not None and evicted + 1 > request:
-            request = evicted + 1
-            shortened = True
+        for evicted in (self._cap_evicted, self._old_evicted):
+            # The old window lacks what the caps evicted from it too: once the
+            # new times passed that, the request skips it (a step whose clock
+            # did not move, such as a line stored late, keeps those times).
+            if evicted is not None and request <= evicted < hw:
+                request = evicted + 1
+                shortened = True
         if self._floor is not None and self._floor > request:
             request = self._floor
+        if self._old_top is not None and request > self._old_top:
+            self._drop_old()  # logd no longer returns a line read before the step
         self._plan = _Plan("resume", request, shortened=shortened)
         return None
 
@@ -467,7 +599,8 @@ class ResumePlanner:
         """
         self._last_read_at = now
         when = entry.timestamp
-        if entry.parsed and when.tzinfo is not None:
+        parsed = entry.parsed and when.tzinfo is not None
+        if parsed:
             ts = (when - _EPOCH) // _MICROSECOND
             self._last_ts = ts
         else:
@@ -481,11 +614,21 @@ class ResumePlanner:
         step = None if self._ceiling is None else self._stepped(ts, entry.raw, now)
         phase = self._phase
         if phase is not None:
-            verdict = self._screened(phase, entry, ts, settled=step is not None)
+            verdict = self._screened(phase, entry, ts, step, parsed=parsed)
             if verdict is not None:
                 return verdict
         if step == "old":
             return "deduplicated"  # logged before the clock moved back
+        hw = self._hw
+        # A line in time order (at or above hw) skips the rest at once.
+        if (
+            hw is not None
+            and ts < hw
+            and parsed
+            and step is None
+            and self._moved_back(ts)
+        ):
+            self._reanchor_live(ts)  # a clock step back seen live (design A.25)
         if entry.tag == CHATTY_TAG:
             self._chatty(entry, ts, prev)
         if step == "unread":
@@ -498,7 +641,7 @@ class ResumePlanner:
                 # The re-anchored connection's first new line: hw and the
                 # window restart from here (design 5.6).
                 self._pending_restart = False
-                self._reset_window()
+                self._restart_window()
             self._add(ts, entry.raw, nbytes)
         return "new"
 
@@ -548,20 +691,23 @@ class ResumePlanner:
         if kind == "start":
             # since=<datetime>, nothing read yet: lines below the start are
             # dropped until the first one at or above it (design A.7).
-            return _Phase(kind, request, request - 1, {}, 0, 0, 0, shortened=False)
+            return _Phase(kind, request, request - 1, {}, 0, 0, 0)
         hw = self._hw
         assert hw is not None  # noqa: S101  (a resume has read lines)
-        expected: dict[tuple[int, str], int] = {}
-        at_position = 0
-        for ts, raw, _size in chain(self._window, self._late):
-            if ts >= request:
-                key = (ts, raw)
-                expected[key] = expected.get(key, 0) + 1
-                at_position += ts == hw
-        remaining = sum(expected.values())
         if kind == "reanchor":
             clock = self._clock
             assert clock is not None  # noqa: S101  (set by clock())
+            # The window read before this step: once it was replayed, a line
+            # below the request is one the new clock stamped before it (a
+            # reader that lagged behind the step was never sent it).
+            last: dict[tuple[int, str], int] = {}
+            for ts, raw, _size in chain(self._window, self._late):
+                if ts >= request:
+                    key = (ts, raw)
+                    last[key] = last.get(key, 0) + 1
+            self._keep_old(hw)
+            assert self._old is not None  # noqa: S101  (kept just now)
+            expected = {key: n for key, n in self._old.items() if key[0] >= request}
             self._ceiling = hw if self._ceiling is None else max(hw, self._ceiling)
             self._pending_restart = True
             # The new times lie below the old start: later requests and the
@@ -571,59 +717,157 @@ class ResumePlanner:
             if self._start is not None:
                 self._start = min(self._start, request)
             # The replay is over at the first new line logged after the
-            # clock read.
+            # clock read, or once the window read before the step was.
             end_above = clock + CLOCK_RESOLUTION - 1
-            return _Phase(
-                kind, request, end_above, expected, remaining, hw, 0, shortened=False
-            )
-        return _Phase(
+            remaining = sum(expected.values())
+            phase = _Phase(kind, request, end_above, expected, remaining, hw, 0)
+            phase.last, phase.last_left = last, sum(last.values())
+            return phase
+        expected = {}
+        at_position = 0
+        for ts, raw, _size in chain(self._window, self._late):
+            if ts >= request:
+                key = (ts, raw)
+                expected[key] = expected.get(key, 0) + 1
+                at_position += ts == hw
+        phase = _Phase(
             kind,
             request,
             hw,
             expected,
-            remaining,
+            sum(expected.values()),
             hw,
             at_position,
             shortened=plan.shortened,
         )
+        top, old = self._old_top, self._old
+        if top is not None and old is not None and request <= top:
+            # logd returns the lines read before the step first (design A.25).
+            phase.stepped = True
+            phase.old = {key: n for key, n in old.items() if key[0] >= request}
+            phase.old_left = sum(phase.old.values())
+            phase.caught_up = self._clock is not None and self._clock >= top
+        return phase
 
     def _screened(
-        self, phase: _Phase, entry: LogEntry, ts: int, *, settled: bool
+        self,
+        phase: _Phase,
+        entry: LogEntry,
+        ts: int,
+        step: Literal["old", "unread"] | None,
+        *,
+        parsed: bool,
     ) -> Verdict | None:
         """The phase's verdict on a line; None: not the phase's to drop.
 
-        ``settled``: a line logged before the clock moved back, which the
-        caller drops or delivers; it never ends the phase.
+        ``step``: a line logged before the clock moved back, which the caller
+        drops or delivers; it never ends the phase.
         """
         self._begin(phase)
         if ts < phase.floor:
+            if phase.stepped:
+                phase.era = True  # the new lines below the request
+            if parsed and step is None and self._moved_back(ts):
+                return None  # the replay is over: a step seen live
             return "below_cursor"
-        key = (ts, entry.raw)
+        if self._match(phase, (ts, entry.raw)):
+            return "deduplicated"
+        if step is not None:
+            phase.evidence = True
+            return None
+        return self._unmatched(phase, entry, ts)
+
+    def _match(self, phase: _Phase, key: tuple[int, str]) -> bool:
+        """Whether the line is a replayed element of the window or an old one."""
         count = phase.expected.get(key)
         if count:
             self._matched(phase, key, count)
-            return "deduplicated"
-        if settled:
-            return None
-        if ts > phase.end_above:
-            self._passed(phase, ts)
-            return None
-        if phase.kind == "resume" and chatty_lines(entry) is not None:
+            phase.era = True
+            return True
+        count = phase.old.get(key)
+        if count:
+            self._matched_old(phase, key, count)
+            return True
+        return False
+
+    def _unmatched(self, phase: _Phase, entry: LogEntry, ts: int) -> Verdict | None:
+        """A line at or above the floor that matches no window."""
+        above = ts > phase.end_above
+        if (
+            not above
+            and not phase.passed
+            and phase.kind == "resume"
+            and chatty_lines(entry) is not None
+        ):
             phase.covered = True  # logd pruned lines we read: it holds the position
+            phase.era = True  # a notice of the new lines, which a stepped one reached
+            if ts == phase.position:
+                phase.at_position = 0
             return "deduplicated"
+        if phase.stepped and not phase.era and self._old_line(phase, ts):
+            return "deduplicated"  # read before the step (design A.25)
+        if above:
+            self._passed(phase, ts)
         return None
+
+    def _old_line(self, phase: _Phase, ts: int) -> bool:
+        """Whether a line that matches no window is dropped as an old one.
+
+        The replay of a stepped resume returns the old lines first (from the
+        first one at or above the request, in arrival order), then the new
+        ones, and logd returns no new line before the old ones it holds: a
+        new line ahead of every line of the new window means that the ring
+        lost all of them, and the ring check at the first line above the new
+        hw that is not dropped reports that. A line above the old hw is not an
+        old one: the replay is past them. At most the old hw, the line is old
+        when:
+
+        - it is stamped below the new hw (else a line stored late, or one
+          after a second small step, logged after the lines read since the
+          step that the ring lost);
+        - the replay showed an old line for sure: a match of an old window,
+          a line above every time the clock can show, or a line more than
+          1 s below the new hw (the device's lines stored late were about
+          86 ms late);
+        - or the device logged it before the clock read or within its
+          second (stamped below N + 1 s), and the replay showed a line less
+          than 1 s below the new hw or the clock read was at or above the old
+          hw (every line up to the old hw was then logged before it). From N
+          + 1 s on it can be a line logged after the clock read.
+        """
+        top = self._old_top
+        if top is None or ts > top:
+            phase.era = True
+            return False
+        position = phase.position
+        if ts < position:
+            if ts < position - CLOCK_RESOLUTION:
+                phase.evidence = True
+            else:
+                phase.hinted = True
+            return True
+        if phase.evidence:
+            return True
+        clock = self._clock
+        return (
+            (phase.hinted or phase.caught_up)
+            and clock is not None
+            and ts < clock + CLOCK_RESOLUTION
+        )
 
     def _passed(self, phase: _Phase, ts: int) -> None:
         """The first new line above the phase's end, at ``ts``.
 
         A resume's phase ends with the ring check (design 5.6 step 3). A
         re-anchored one only drops its below_cursor rule: the old window stays
-        matched for the whole connection, also above the clock read.
+        matched for the whole connection, also above the clock read. So does
+        a stepped resume's: old lines can still follow the line that ended it.
         """
         if phase.kind == "reanchor":
             phase.floor, phase.end_above = _LOWEST, _HIGHEST
+            if not phase.remaining:
+                self._phase = None
             return
-        self._phase = None
         if phase.kind == "resume" and phase.at_position and not phase.covered:
             self.out.append(
                 Gap(
@@ -633,6 +877,29 @@ class ResumePlanner:
                     reason="ring_rotated",
                 )
             )
+        if phase.stepped and (phase.remaining or phase.old_left):
+            # Old lines can still follow the line that ended it, and the new
+            # lines below the request after them.
+            phase.end_above = _HIGHEST
+            phase.passed = phase.era = True
+            phase.at_position = 0
+            return
+        self._phase = None
+
+    def _over(self, phase: _Phase) -> bool:
+        """Whether the phase's replay of the lines read before is over.
+
+        A resume's is over once every line at hw was replayed (or covered by
+        a chatty notice), every element was, or a line above hw came; a
+        re-anchored one's once its new lines began (its below_cursor rule
+        ends with the replay of the window read before the step, or at the
+        first new line logged after the clock read).
+        """
+        if phase.kind == "resume":
+            return phase.passed or not phase.at_position or not phase.remaining
+        if phase.kind == "reanchor":
+            return not self._pending_restart
+        return True
 
     def _begin(self, phase: _Phase) -> None:
         if not phase.begun:
@@ -641,27 +908,48 @@ class ResumePlanner:
                 self.overlap_shortened += 1  # this resume took place
 
     def _matched(self, phase: _Phase, key: tuple[int, str], count: int) -> None:
-        """A replayed element of the window: one occurrence fewer."""
+        """A replayed element of the window: one occurrence fewer.
+
+        The phase goes on (design A.25): a resume's ends at the first line
+        above hw, a re-anchored one's with its connection, or once it has
+        nothing left to match or drop. A re-anchored one drops its
+        below_cursor rule once the window read before the step was replayed:
+        the lines below the request that follow were never read.
+        """
         phase.expected[key] = count - 1
         phase.remaining -= 1
         if key[0] == phase.position:
             phase.at_position -= 1
-        if not phase.remaining:
+        last = phase.last.get(key)
+        if last:
+            phase.last[key] = last - 1
+            phase.last_left -= 1
+            if not phase.last_left:
+                phase.floor, phase.end_above = _LOWEST, _HIGHEST
+        if not phase.remaining and phase.floor == _LOWEST and not phase.old_left:
+            self._phase = None
+
+    def _matched_old(self, phase: _Phase, key: tuple[int, str], count: int) -> None:
+        """A replayed line of an old window: proof of the old lines."""
+        phase.old[key] = count - 1
+        phase.old_left -= 1
+        phase.evidence = True
+        if not phase.remaining and phase.floor == _LOWEST and not phase.old_left:
             self._phase = None
 
     def _unstamped(self, phase: _Phase, entry: LogEntry) -> Verdict:
         """An unparsed line before any parsed one of a screened connection.
 
         It has no time to inherit, but the window holds it under the time it
-        inherited when it was read: a raw text the phase still expects is a
-        replay, matched at its lowest expected time, which the next unparsed
-        lines inherit.
+        inherited when it was read: a raw text the phase still expects (in
+        the window, or in an old one) is a replay, matched at its lowest
+        expected time, which the next unparsed lines inherit.
         """
         self._begin(phase)
         loose = phase.loose
         if loose is None:
             loose = phase.loose = {}
-            for (ts, raw), count in phase.expected.items():
+            for (ts, raw), count in chain(phase.expected.items(), phase.old.items()):
                 if count:
                     loose.setdefault(raw, []).extend([ts] * count)
             for stamps in loose.values():
@@ -676,7 +964,90 @@ class ResumePlanner:
                 self._last_ts = self._prev_ts = ts
                 self._matched(phase, key, count)
                 return "deduplicated"
+            count = phase.old.get(key)
+            if count:
+                self._last_ts = self._prev_ts = ts
+                self._matched_old(phase, key, count)
+                return "deduplicated"
         return "new"
+
+    # -- clock steps -------------------------------------------------------------------
+
+    def _moved_back(self, ts: int) -> bool:
+        """Whether a line the screen did not drop shows a clock step back.
+
+        It is stamped below ``hw - max(resume_overlap, 1 s)`` and read outside
+        a replay of the lines read before (design A.25): the bound of the
+        resume's clock check. A line stored that late is taken for a step
+        too; the device's out-of-order lines seen so far were about 86 ms
+        late.
+        """
+        hw = self._hw
+        if hw is None or ts >= hw - self._step or self._pending_restart:
+            return False
+        phase = self._phase
+        return phase is None or self._over(phase)
+
+    def _reanchor_live(self, ts: int) -> None:
+        """A clock step back seen live at a line stamped ``ts``: re-anchor there.
+
+        ``Gap(clock_moved_back, after=hw, before=ts)`` at once, and the rules
+        of the resume's re-anchor: the old window is kept for the replays of
+        later connections, the old hw is the ceiling, the start and the
+        floor of later requests drop to this line's request, and hw and the
+        window restart at the line, which the caller delivers.
+        """
+        hw = self._hw
+        assert hw is not None  # noqa: S101  (checked by _moved_back)
+        self.out.append(
+            Gap(
+                after=moment(hw),
+                before=moment(ts),
+                lost=None,
+                reason="clock_moved_back",
+            )
+        )
+        self._gapped = hw
+        self._keep_old(hw)
+        self._ceiling = hw if self._ceiling is None else max(hw, self._ceiling)
+        low = ts - self._overlap
+        if self._floor is not None:
+            self._floor = min(self._floor, low)
+        if self._start is not None:
+            self._start = min(self._start, low)
+        phase = self._phase
+        if phase is not None:
+            # Its replay is over, but what it still expects can follow: it
+            # only matches from now on.
+            phase.floor, phase.end_above = _LOWEST, _HIGHEST
+            phase.passed = phase.era = True
+            phase.at_position = 0
+            if not phase.remaining and not phase.old_left:
+                self._phase = None
+        self._restart_window()
+
+    def _restart_window(self) -> None:
+        """hw and the window restart at a step; the old one keeps its caps' bound."""
+        evicted, old = self._cap_evicted, self._old_evicted
+        if evicted is not None and (old is None or evicted > old):
+            self._old_evicted = evicted
+        self._reset_window()
+
+    def _drop_old(self) -> None:
+        """No request reaches a line read before the step any more."""
+        self._old = self._old_top = self._kept = self._old_evicted = None
+
+    def _keep_old(self, hw: int) -> None:
+        """Keep the window of the lines read before a step for later replays."""
+        if self._kept == hw:
+            return  # an earlier attempt at this step kept it already
+        old = {} if self._old is None else self._old
+        for ts, raw, _size in chain(self._window, self._late):
+            key = (ts, raw)
+            old[key] = old.get(key, 0) + 1
+        self._old = old
+        self._old_top = hw if self._old_top is None else max(hw, self._old_top)
+        self._kept = hw
 
     def _replayed(self, ts: int, raw: str) -> bool:
         """A pre-step line at the highest time delivered: one of those delivered."""
@@ -721,6 +1092,11 @@ class ResumePlanner:
         if hw is None or ts >= hw:
             hw = self._hw = ts
             window.append((ts, raw, nbytes))
+            top = self._old_top
+            if top is not None and ts - self._overlap > top:
+                # Every later request lies above the lines read before the
+                # step (a re-anchor's below them: the ceiling covers those).
+                self._drop_old()
         elif ts >= hw - self._overlap:
             heapq.heappush(late, (ts, raw, nbytes))
         else:

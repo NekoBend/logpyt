@@ -23,6 +23,12 @@ bounded in both modes (design 5.10): the open groups hold at most
 each entry's ``raw`` line plus one byte), and the least recently extended group
 is closed early (``"evicted"``) to stay within them. An entry larger than
 ``max_total_bytes`` by itself is delivered alone at once.
+
+A stream delivers a group when it closes, but emits a `logpyt.Gap` when it
+finds it: a Gap found while a connection reads (a chatty notice's
+``"device_reported"``, or a ``"clock_moved_back"`` seen in a line) can come
+before the group that holds its ``after`` line, as before lines still held
+for package attribution.
 """
 
 from __future__ import annotations

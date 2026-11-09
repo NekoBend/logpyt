@@ -77,6 +77,24 @@ class Gap:
         before: Device timestamp of the first line read after it, if known.
         lost: Number of lost lines when logd reported it; None when unknown.
         reason: How the loss was detected.
+
+    ``"clock_moved_back"``: the device clock stepped back by more than
+    ``max(resume_overlap, 1 s)``, seen at a resume's clock read (``before``
+    is that clock) or in a line read (``before`` is its time; a line stored
+    that late counts as a step too). ``after`` is the highest time read
+    before, so ``before`` is below ``after``; lines stamped between them may
+    be missing or, if read before the step, delivered again. A step from
+    before the capture counts as well while the device's ring still holds
+    it, because the capture reads across it: the Gap is reported, and
+    ``assert_complete()`` fails, although nothing was lost.
+
+    A Gap found while a connection reads (a chatty notice's
+    ``"device_reported"``, or a ``"clock_moved_back"`` seen in a line) is
+    emitted when it is found, so lines read before it can come after it:
+    those still held for package attribution (``where`` with
+    `logpyt.filters.Package`, at most ``package_hold``, design 5.8) and, with
+    ``group_by``, the group that holds its ``after`` line, which is delivered
+    when it closes.
     """
 
     after: datetime | None
@@ -114,15 +132,23 @@ class StreamStats:
             ``StateChange.connection`` numbers); an attempt may end before
             adb logcat starts.
         reconnects: Reconnects after a connection ended (section 5.6).
-        stall_resumes: Deliberate disconnects of a stalled reader (section 5.6).
+        stall_resumes: Deliberate disconnects of a stalled reader (section
+            5.6); the resume that follows counts in ``reconnects``. A reader
+            that logd ended after falling behind (status 1 soon after reading
+            was paused, design A.6) resumes the same way but counts only in
+            ``reconnects``.
         backpressure_seconds: Total time intake was closed for a full outbox.
         lines: Framed stdout lines.
         stderr_lines: Framed stderr lines.
         delivered: Entries handed to the consumer; a group counts its members.
         filtered: Lines the ``where`` condition rejected, plus the flush marker
             and logcat's own buffer divider lines.
-        deduplicated: Resume replays recognised in the resume window.
-        below_cursor: Resume lines older than the ``-T`` request (section 5.6).
+        deduplicated: Resume replays recognised in the resume window, and
+            after a clock step back the lines read before it that logd
+            returns again (section 5.6).
+        below_cursor: Resume lines older than the ``-T`` request (section
+            5.6), and with ``since=<datetime>`` the first connection's lines
+            below that time (design A.7).
         before_start: With ``since="now"``: lines up to and including the start
             marker; no other counter but ``lines`` includes them.
         undelivered: Entries discarded by ``kill()``, a detached consumer or a
