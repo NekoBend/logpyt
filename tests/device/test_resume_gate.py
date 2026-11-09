@@ -42,6 +42,7 @@ from logpyt import AsyncLogStream, LogStream, StreamConfig, StreamStats, Tag
 from tests.conftest import wait_until
 from tests.device.resume_gate import (
     GATE_SECONDS,
+    OVERWRITE_BATCH,
     SLACK,
     STALL_SECONDS,
     WAIT,
@@ -59,6 +60,9 @@ if TYPE_CHECKING:
     from logpyt import LogEntry
 
 API_WITH_NOTICES = 24  # FINDINGS.md check 6: 36 writes no chatty notices
+# Design A.25: on 36 no two writer lines shared a microsecond, in over 900 000
+# lines, 80 000 lines/s included, so no burst can collide there.
+API_WITH_COLLISIONS = 24
 SINCE_TAG = "lpsince"
 
 
@@ -81,8 +85,9 @@ def test_sequence_has_no_duplicates(
 ) -> None:
     """F1-6 resume gate (design 9.4): across 10 disconnects that keep the ring,
     no seq is delivered twice, every burst comes exactly K times or lies in a
-    Gap, at least one burst had a same-microsecond collision (A.9), and no
-    disconnect left a ring_rotated or clock_moved_back Gap.
+    Gap, at least one burst had a same-microsecond collision where the level's
+    clock lets them happen (A.9, A.25), and no disconnect left a ring_rotated
+    or clock_moved_back Gap.
     """
     capture, report, stream, made = run_resume_gate(bench, GATE_SECONDS)
 
@@ -95,7 +100,8 @@ def test_sequence_has_no_duplicates(
         record_property("left_out", "server_restart (no LOGPYT_VM_SSH/LOGPYT_VM_ADB)")
     assert report.failures == []
     assert [g.reason for g in capture.gaps if g.reason != "device_reported"] == []
-    assert report.collided_bursts >= 1
+    if bench.ctx.api == API_WITH_COLLISIONS:
+        assert report.collided_bursts >= 1
     assert stats.deduplicated > 0
     assert stats.reconnects >= len(made)
     assert stream.outcome is None
@@ -111,7 +117,10 @@ def test_stalled_consumer_overwrite_is_reported(
     inside a Gap.
     """
     capture, report, stream = run_overwrite_gate(
-        bench, STALL_SECONDS, stall_timeout=1.0
+        bench,
+        STALL_SECONDS,
+        stall_timeout=1.0,
+        batch=OVERWRITE_BATCH.get(bench.ctx.api, 10),
     )
 
     stats = stream.stats
@@ -134,7 +143,10 @@ def test_stalled_consumer_without_stall_rule_is_recorded(
     a prefix, then EOF and status 1, an ordinary end without ``reconnect``).
     """
     capture, report, stream = run_overwrite_gate(
-        bench, STALL_SECONDS, stall_timeout=None
+        bench,
+        STALL_SECONDS,
+        stall_timeout=None,
+        batch=OVERWRITE_BATCH.get(bench.ctx.api, 10),
     )
 
     outcome = stream.outcome
