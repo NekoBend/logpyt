@@ -384,7 +384,9 @@ class StreamConfig(
             Lines held for package attribution count against the buffer too, so
             they alone can close the intake (see ``package_hold``).
         reconnect: The reconnect policy; None ends the run at the first
-            unrequested connection end.
+            unrequested connection end, except an end that logd caused while
+            the reader was behind (design A.6), which resumes without an
+            attempt, like a stall resume.
         resume_overlap: Seconds of overlap requested when resuming.
         resume_window_lines: Cap on the lines kept to deduplicate a resume.
         resume_window_bytes: Cap on the bytes kept to deduplicate a resume.

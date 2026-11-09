@@ -30,6 +30,12 @@ Cases (each row is repeated ``--repeat`` times and reports the median):
     a dropping stream loses entries of a burst larger than its queue on any
     machine, and a stream with backpressure delivers all of them, in about
     ``lines * slow-us``.
+``live-format``
+    ``throughput`` with lines in the live wire format, each with its own time,
+    which is what enters the resume window (design 5.6, risk 16). The other
+    cases' lines have no zone, so they never reach the window: comparing them
+    with ``bench/BASELINE-2.x.md`` leaves out its cost per line. The fraction
+    holds ``--lines`` below 1,000,000.
 
 Run from the repository root, so that ``tests`` is importable::
 
@@ -90,6 +96,7 @@ MIN_LINES_PER_SECOND = 10_000.0
 POLL_SECONDS = 0.005
 
 _LINE = threadtime("m{i}")
+_LIVE_LINE = "2026-11-04 05:11:16.{i:06d} +0000 10065  1234  1234 I Tag: m{i}\n"
 # Fake adb signal: every line of the backlog is in the pipe (or already read).
 _WRITTEN = "written"
 _EXIT_INTERRUPTED = 130
@@ -236,8 +243,9 @@ class SyncDriver:
             probe.hit()
 
         # 3.0's defaults are lossless: backpressure never drops an entry, and
-        # a stall resume drops its replay (design 5.6), so the window's cost
-        # per line is measured too.
+        # a stall resume drops its replay (design 5.6). The window's cost per
+        # line shows only in the live-format case: other lines have no zone,
+        # so they never enter the window, and a replay of them is not dropped.
         del lossless
         return LogStream(StreamConfig(adb_path=adb_path), on_item=on_entry)
 
@@ -318,6 +326,7 @@ class Case:
     lossless: bool
     sizes: tuple[int, ...]
     consumer_cost: float = 0.0  # seconds of busy CPU per delivered entry
+    line: str = _LINE  # the template of the backlog's lines
 
     @property
     def label(self) -> str:
@@ -351,7 +360,7 @@ def measure(driver: Driver, case: Case, count: int) -> Sample:
     """
     probe = DeliveryProbe(count, case.consumer_cost)
     with fake_adb_session() as fake:
-        fake.logcat(run(lines(count, _LINE), touch(_WRITTEN), hang=True))
+        fake.logcat(run(lines(count, case.line), touch(_WRITTEN), hang=True))
         started = time.perf_counter()
         driver.run(
             fake.path,
@@ -404,7 +413,7 @@ def environment_line(repeat: int) -> str:
 # -- entry point ---------------------------------------------------------------
 
 
-_CASE_NAMES = ("throughput", "burst", "slow-burst")
+_CASE_NAMES = ("throughput", "burst", "slow-burst", "live-format")
 
 
 def _positive_int(text: str) -> int:
@@ -483,6 +492,9 @@ def run_benchmark(args: argparse.Namespace) -> None:
             lossless=False,
             sizes=bursts,
             consumer_cost=args.slow_us / 1e6,
+        ),
+        "live-format": Case(
+            "live-format", lossless=True, sizes=(args.lines,), line=_LIVE_LINE
         ),
     }
     print(environment_line(args.repeat))

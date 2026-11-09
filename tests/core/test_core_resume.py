@@ -11,14 +11,22 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 
-from logpyt._core.protocol import Deliver, Diagnostic, Kill, RunCommand, Spawn
+from logpyt._core.protocol import (
+    Deliver,
+    Diagnostic,
+    Kill,
+    RunCommand,
+    Spawn,
+    StopRequest,
+)
 from logpyt._core.resume import micros, moment
 from logpyt.adb import _MARKER_TAG, _AdbResult
 from logpyt.config import Reconnect
-from logpyt.exceptions import AdbExitError
+from logpyt.exceptions import AdbExitError, ReadTimeoutError
 from logpyt.filters import Package
 from logpyt.groupers import GroupBy
 from logpyt.models import LogEntry, LogGroup
@@ -157,9 +165,28 @@ def test_clock_step_back_reanchors_with_the_host_outage() -> None:
     seconds, micro = divmod(request, US)
     assert spawn_T(harness) == f"{seconds}.{micro:06d}"
     harness.spawned()
-    harness.stdout(at("a", HW) + at("now", stepped * US) + at("old", HW - US))
+    harness.stdout(at("old", HW - US) + at("now", stepped * US) + at("a", HW))
     assert harness.messages() == ["a", "now"]
     assert harness.core.stats().deduplicated == 2
+
+
+def test_outage_runs_to_the_issue_time_of_the_clock_read() -> None:
+    """Design A.25: the outage ends when the clock command was issued, not when it
+    answered; the answer's delay is not a time the device logged unread lines."""
+    harness = Harness.make(reconnect=Reconnect(delay=5.0))
+    harness.running(at("a", HW))
+    started = harness.now
+    harness.end_connection(1)
+    harness.advance(5.0)  # the backoff: the clock read is issued now
+    issued = harness.now
+    harness.advance(3.0)
+    stepped = CLOCK - 3600
+
+    harness.answer("clock", clock(stepped))
+
+    request = stepped * US - round((issued - started) * US) - 2 * US
+    seconds, micro = divmod(request, US)
+    assert spawn_T(harness) == f"{seconds}.{micro:06d}"
 
 
 def test_live_clock_step_back_reports_a_gap_before_the_line() -> None:
@@ -403,6 +430,183 @@ def test_end_without_backpressure_is_an_ordinary_end() -> None:
     harness.end_connection(1)
 
     assert harness.core.state is S.FAILED
+
+
+def _behind(**fields: Any) -> Harness:  # noqa: ANN401
+    """A running connection whose outbox was full, reopened 0.5 s ago."""
+    harness = Harness.make(
+        buffer_entries=4,
+        stall_timeout=5.0,
+        reconnect=Reconnect(delay=1.0, max_attempts=3),
+        **fields,
+    )
+    harness.running(at("a", HW) + at("b", HW + 1) + at("c", HW + 2) + at("d", HW + 3))
+    harness.advance(0.5)
+    harness.consume()
+    return harness
+
+
+def test_status_1_after_backpressure_is_the_control() -> None:
+    harness = _behind()
+
+    harness.end_connection(1)
+
+    assert harness.changes()[-2] == StateChange(S.RUNNING, S.RECONNECTING, 1, None)
+    assert harness.core.stats().reconnects == 1
+
+
+def test_status_255_after_backpressure_is_an_ordinary_end() -> None:
+    """A.6 is status 1 only: 255 is a disconnect (FINDINGS.md check 4), with its
+    error, its backoff and no reconnect counted yet."""
+    harness = _behind()
+
+    harness.end_connection(255)
+
+    assert harness.core.state is S.RECONNECTING
+    assert isinstance(harness.changes()[-1].error, AdbExitError)
+    assert harness.core.stats().reconnects == 0
+
+
+def test_read_timeout_ended_with_status_1_stays_a_timeout() -> None:
+    """A.6 needs no cause from the core: an adb the read timeout killed that ends
+    with status 1 (from memory, any kill on Windows) is still a read timeout."""
+    harness = _behind(read_timeout=2.0)
+    assert [cmd for cmd in harness.advance(2.0) if isinstance(cmd, Kill)]
+
+    harness.end_connection(1)
+
+    assert harness.core.state is S.RECONNECTING
+    assert isinstance(harness.changes()[-1].error, ReadTimeoutError)
+    assert harness.core.stats().reconnects == 0
+
+
+# -- a line cut at the end of a connection ---------------------------------------------
+
+
+def test_stall_kill_cuts_a_line_and_the_replay_returns_it() -> None:
+    """A stall kill under a flood cuts adb's write in a line. The resume's replay
+    returns the whole line, so the cut one is dropped and counted: it moves no
+    hw, enters no window, and neither reaches the consumer nor costs a Gap
+    (design A.25, 4.4: a stall resume without a gap keeps a capture complete)."""
+    harness = Harness.make(buffer_entries=4, stall_timeout=1.0)
+    whole = at("e", HW + 4)
+    harness.running(
+        at("a", HW) + at("b", HW + 1) + at("c", HW + 2) + at("d", HW + 3) + whole[:40]
+    )
+    harness.advance(1.0)  # stall: Kill(c)
+
+    harness.end_connection(-9)
+
+    assert harness.core.stats().deduplicated == 1
+    assert harness.core._planner.cursor == HW + 3
+    harness.consume()
+    harness.answer("clock", clock())
+    harness.spawned()
+    replay = at("a", HW) + at("b", HW + 1) + at("c", HW + 2) + at("d", HW + 3)
+    harness.stdout(replay + whole + at("f", HW + 5))
+    harness.consume()
+    assert harness.messages() == ["a", "b", "c", "d", "e", "f"]
+    assert harness.gaps() == []
+    stats = harness.core.stats()
+    assert stats.incomplete == ()
+    assert stats.lines == stats.delivered + stats.deduplicated
+
+
+def test_cut_line_of_a_connection_that_reconnects_is_dropped() -> None:
+    """The same at any end the run resumes from."""
+    harness = Harness.make(reconnect=Reconnect(delay=1.0)).running(at("a", HW))
+    whole = at("message", HW + 1)
+    harness.stdout(whole[:-4])
+
+    reconnect(harness)
+    harness.stdout(at("a", HW) + whole)
+
+    assert harness.messages() == ["a", "message"]
+    assert harness.gaps() == []
+    assert harness.core.stats().incomplete == ()
+
+
+def test_cut_line_at_a_resume_after_backpressure_is_dropped() -> None:
+    """A.6 resumes also without reconnect, so the replay returns the whole line."""
+    harness = Harness.make(buffer_entries=4, stall_timeout=5.0, reconnect=None)
+    harness.running(at("a", HW) + at("b", HW + 1) + at("c", HW + 2) + at("d", HW + 3))
+    harness.advance(0.5)
+    harness.consume()
+    whole = at("e", HW + 4)
+    harness.stdout(whole[:-1])
+
+    harness.end_connection(1)
+
+    assert harness.core.state is S.CONNECTING
+    assert harness.messages() == ["a", "b", "c", "d"]
+    assert harness.core.stats().deduplicated == 1
+    harness.answer("clock", clock())
+    harness.spawned()
+    harness.stdout(at("d", HW + 3) + whole)
+    assert harness.messages() == ["a", "b", "c", "d", "e"]
+
+
+def test_cut_line_of_a_run_that_ends_is_emitted() -> None:
+    """Design 5.5: the partial last line of a run that ends here is emitted, also
+    when it ends FAILED."""
+    harness = Harness.make(stall_timeout=1.0).running(at("a", HW))
+    harness.stdout(at("b", HW + 1)[:-1])
+
+    harness.end_connection(1)
+
+    assert harness.core.state is S.FAILED
+    assert harness.messages() == ["a", "b"]
+    assert harness.core.stats().deduplicated == 0
+
+
+def test_cut_line_of_a_stopping_run_is_emitted() -> None:
+    harness = Harness.make(reconnect=Reconnect(delay=1.0)).running(at("a", HW))
+    harness.stdout(at("b", HW + 1)[:-1])
+    harness.send(StopRequest())
+
+    harness.end_connection(0)
+
+    assert harness.messages() == ["a", "b"]
+
+
+def test_cut_line_before_the_start_marker_counts_in_before_start() -> None:
+    harness = Harness.make(since="now", reconnect=Reconnect(delay=1.0))
+    harness.connecting_spawned()
+    harness.stdout(at("old", HW)[:30])
+
+    harness.end_connection(255)
+
+    stats = harness.core.stats()
+    assert (stats.lines, stats.before_start, stats.deduplicated) == (1, 1, 0)
+
+
+def test_replay_counts_no_truncated_and_no_unparsed() -> None:
+    """Only a line of the capture counts: a replay of a cut or an unparsed line
+    does not add to the counters."""
+    harness = Harness.make(reconnect=Reconnect(delay=1.0), max_line_bytes=4096)
+    lines = at("a", HW) + b"no header at all\n" + at("x" * 5000, HW + 1)
+    harness.running(lines)
+    stats = harness.core.stats()
+    assert (stats.truncated, stats.unparsed) == (1, 1)
+
+    reconnect(harness)
+    harness.stdout(lines)
+
+    stats = harness.core.stats()
+    assert (stats.truncated, stats.unparsed, stats.deduplicated) == (1, 1, 3)
+
+
+def test_cut_line_below_since_is_no_reason_of_incompleteness() -> None:
+    """A line below since= is dropped before the capture starts: it says nothing
+    about the capture, cut or not (design 4.4)."""
+    harness = Harness.make(since=moment(HW), max_line_bytes=4096)
+    harness.connecting_spawned()
+
+    harness.stdout(at("x" * 5000, HW - US) + b"no header\n" + at("a", HW))
+
+    stats = harness.core.stats()
+    assert (stats.truncated, stats.unparsed, stats.below_cursor) == (0, 0, 2)
+    assert stats.incomplete == ()
 
 
 # -- since, the window, the INFO -------------------------------------------------------

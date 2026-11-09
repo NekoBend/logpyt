@@ -38,7 +38,14 @@ from tests.conftest import (
     wait_until,
     waiting_for_device,
 )
-from tests.fake_adb import device_stamp
+from tests.fake_adb import (
+    _EXIT_HANG_LIMIT,
+    DeviceLog,
+    _Stream,
+    _tail_request,
+    device_dir,
+    device_stamp,
+)
 
 if TYPE_CHECKING:
     from logpyt.models import LogEntry
@@ -892,9 +899,26 @@ def test_overwritten_position_ends_a_stalled_reader_with_eof(fake_adb: FakeAdb) 
     assert stderr == b"logcat: Unexpected EOF!\n"
 
 
+def test_append_before_the_first_write_is_no_overrun(
+    fake_adb: FakeAdb, capsysbinary: pytest.CaptureFixture[bytes]
+) -> None:
+    """A reader that starts at the ring's oldest entry has fallen behind nothing
+    when an append overwrites that entry before its first write."""
+    fake_adb.device(ring=3)
+    fake_adb.device_log("a", "b", "c", at=_T0)
+    reader = _Stream(fake_adb.state, {"lines": 4}, {"ring": 3}, os.getpid())
+    reader.start(None)
+    fake_adb.device_log("d", at=_T0 + 1)
+
+    reader.run()
+
+    assert _messages(capsysbinary.readouterr().out) == ["a", "b", "c", "d"]
+
+
 def test_caught_up_reader_keeps_up_with_a_large_append(fake_adb: FakeAdb) -> None:
     """A reader that wrote every entry is not behind: one append larger than
-    the ring reaches it whole, and it goes on following."""
+    the ring, within one write of a stream, reaches it whole, and it goes on
+    following."""
     fake_adb.device(ring=100)
     fake_adb.device_log("0", at=_T0)
     fake_adb.logcat(run(stream(ready="ready", lines=102)))
@@ -910,6 +934,161 @@ def test_caught_up_reader_keeps_up_with_a_large_append(fake_adb: FakeAdb) -> Non
         _end(proc)
 
     assert [int(text) for text in _messages(first + rest)] == list(range(102))
+
+
+def test_append_above_a_write_and_the_ring_ends_a_caught_up_reader(
+    fake_adb: FakeAdb,
+) -> None:
+    """The limit of that rule (the module docs): after its first write such a
+    reader has entries left, and the ring has overwritten them."""
+    fake_adb.device(ring=300)
+    fake_adb.device_log("0", at=_T0)
+    fake_adb.logcat(run(stream(ready="ready", lines=1001)))
+    proc = _reader(fake_adb)
+    try:
+        fake_adb.wait_for("ready")
+        assert proc.stdout is not None
+        first = proc.stdout.readline()
+        fake_adb.device_log(*[str(i) for i in range(1, 1001)], at=_T0 + 1)
+        rest = proc.stdout.read()
+        assert proc.wait(timeout=TIMEOUT) == 1
+    finally:
+        _end(proc)
+
+    assert len(_messages(first + rest)) < 1001
+
+
+def test_idle_stream_ends_at_the_hang_limit(
+    fake_adb: FakeAdb, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stream with nothing to write is bounded like a hanging run: on Windows an
+    orphan has no other way to end (the module docs)."""
+    fake_adb.device()
+    monkeypatch.setattr("tests.fake_adb._HANG_LIMIT", 0.1)
+    monkeypatch.setattr("tests.fake_adb._orphaned", lambda _parent: False)
+    idle = _Stream(fake_adb.state, {}, {}, os.getpid())
+    idle.start(None)
+
+    with pytest.raises(SystemExit) as ended:
+        idle.run()
+
+    idle.log.close()
+    assert ended.value.code == _EXIT_HANG_LIMIT
+
+
+def test_device_clock_runs_with_the_host(fake_adb: FakeAdb) -> None:
+    fake_adb.device()
+    fake_adb.device_clock(_T0)
+    first = fake_adb.device_now()
+
+    time.sleep(0.1)
+
+    assert fake_adb.device_now() - first >= 50_000
+    assert fake_adb.device_now() - first < 60_000_000
+
+
+def test_shell_log_takes_the_stepped_device_clock(fake_adb: FakeAdb) -> None:
+    """Its entry carries the device clock, one reading for the printed stamp and
+    the stored time: ``-T`` goes by the stored one, the stream by the stamp."""
+    fake_adb.device()
+    fake_adb.device_clock(_T0)
+    fake_adb.step_clock(-3600)
+    argv = adb._log_marker_argv(fake_adb.path, None, "start-0123abcd")
+
+    adb._parse_log_marker(adb._run_adb(argv, timeout=TIMEOUT))
+
+    ((stored, text),) = fake_adb.device_entries()
+    assert _T0 - 3600_000_000 <= stored <= _T0 - 3540_000_000
+    assert text.startswith(device_stamp(stored))
+
+
+def test_shell_log_takes_its_priority(fake_adb: FakeAdb) -> None:
+    fake_adb.device()
+
+    _adb(fake_adb, "shell", "log", "-p", "warn", "-t", "Some", "hello")
+
+    ((_stored, text),) = fake_adb.device_entries()
+    assert text.endswith(" W Some: hello")
+
+
+def test_T_above_every_entry_prints_nothing_until_the_next_append(  # noqa: N802
+    fake_adb: FakeAdb,
+) -> None:
+    fake_adb.device()
+    fake_adb.device_log("old", at=_T0)
+    fake_adb.logcat(run(stream(ready="ready", lines=1)))
+    proc = _reader(fake_adb, "-T", _T(_T0 + 5_000_000))
+    try:
+        fake_adb.wait_for("ready")
+        fake_adb.device_log("new", at=_T0 + 1)  # later entries follow, also lower
+        stdout, _ = proc.communicate(timeout=TIMEOUT)
+    finally:
+        _end(proc)
+
+    assert _messages(stdout) == ["new"]
+
+
+def test_T_fraction_is_read_as_a_fraction() -> None:  # noqa: N802
+    assert _tail_request(["-T", "12.5"]) == ("time", 12_500_000)
+    assert _tail_request(["-T", "12.000123"]) == ("time", 12_000_123)
+    assert _tail_request(["-T", "12"]) == ("count", 12)
+    assert _tail_request([]) is None
+
+
+def test_stream_is_ready_only_after_the_backlog_was_read(fake_adb: FakeAdb) -> None:
+    """``ready`` means the reader wrote the ring: more than a pipe holds stays
+    unwritten until someone reads it."""
+    fake_adb.device()
+    payload = "x" * 1000
+    fake_adb.device_log(*[f"{i} {payload}" for i in range(300)], at=_T0)
+    fake_adb.logcat(run(stream(ready="ready", lines=301)))
+    proc = _reader(fake_adb)
+    try:
+        time.sleep(0.3)  # time to run ahead, if it could
+        assert not (fake_adb.state / "signals" / "ready").exists()
+        assert proc.stdout is not None
+        backlog = [proc.stdout.readline() for _ in range(300)]
+        fake_adb.wait_for("ready")
+        fake_adb.device_log("last", at=_T0 + 1)
+        stdout, _ = proc.communicate(timeout=TIMEOUT)
+    finally:
+        _end(proc)
+
+    assert len(backlog) == 300
+    assert _messages(stdout) == ["last"]
+
+
+def test_device_log_holds_back_a_partial_record(fake_adb: FakeAdb) -> None:
+    """A reader sees whole entries: bytes after the last newline wait for it."""
+    fake_adb.device()
+    fake_adb.device_log("a", at=_T0)
+    log = DeviceLog(fake_adb.state)
+    try:
+        ((_, _, first),) = log.poll()
+        assert first.endswith(b": a")
+        with (device_dir(fake_adb.state) / "log.txt").open("ab") as file:
+            file.write(b"1 5 par")
+            file.flush()
+            assert log.poll() == []
+            file.write(b"tial\n")
+        assert log.poll() == [(1, 5, b"partial")]
+    finally:
+        log.close()
+
+
+def test_device_expire_renumbers_the_later_entries(fake_adb: FakeAdb) -> None:
+    fake_adb.device()
+    for i in range(5):
+        fake_adb.device_log(str(i), at=_T0 + i)
+
+    fake_adb.device_expire(1, 2)
+    fake_adb.device_log("after", at=_T0 + 9)
+
+    log = DeviceLog(fake_adb.state)
+    try:
+        assert [index for index, _, _ in log.poll()] == list(range(5))
+    finally:
+        log.close()
 
 
 def test_overrun_skip_goes_on_at_the_oldest_entry(fake_adb: FakeAdb) -> None:
