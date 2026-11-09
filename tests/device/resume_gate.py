@@ -52,7 +52,11 @@ STALL_SECONDS = float(os.environ.get("LOGPYT_GATE_STALL", "60"))
 DISCONNECTS = 10  # design 9.4: 10 disconnects per run
 BURST = 8  # K byte-identical burst lines after each seq line
 PERIOD = 0.01  # the writer's pause between seq lines (10 ms)
-OVERWRITE_BATCH = 10  # seq lines per pause in the overwrite gate: about 870/s
+# Seq lines per pause in the overwrite gate, per level. Fast enough to fill the
+# outbox in seconds and wrap the ring within 30 s (9.4), slow enough to lose
+# nothing on the device. API 24's ring held about 11 000 writer lines: about 870
+# lines/s. API 36's compresses and held over 200 000: about 8000 lines/s.
+OVERWRITE_BATCH = {24: 10, 36: 160}
 WAIT = 60.0  # bound of every wait for the device or the stream
 # Below the watchdog of the gate tests (their marker), which exits pytest
 # without finalizers: the run, the stop and the analysis.
@@ -439,7 +443,7 @@ def run_resume_gate(
 
 
 def run_overwrite_gate(
-    bench: Bench, stall: float, *, stall_timeout: float | None
+    bench: Bench, stall: float, *, stall_timeout: float | None, batch: int = 10
 ) -> tuple[Capture, Report, LogStream[LogEntry]]:
     """The overwrite gate: a writer fast enough to wrap the ring within 30 s,
     and a consumer that stalls for ``stall`` seconds, then drains (9.4)."""
@@ -458,12 +462,7 @@ def run_overwrite_gate(
     stream.start()
     try:
         stream.wait_running(WAIT)
-        # Fast enough to fill the outbox in seconds and wrap the ring within
-        # 30 s (9.4), slow enough to lose nothing on the device: lossless at
-        # 1700 lines/s on API 24, with no reader behind.
-        bench.start_writer(
-            rid, count=5_000_000, burst=0, pause=True, batch=OVERWRITE_BATCH
-        )
+        bench.start_writer(rid, count=50_000_000, burst=0, pause=True, batch=batch)
         wait_until(capture.stalled.is_set, timeout=WAIT)
         wait_until(capture.resumed.is_set, timeout=stall + WAIT)
         _pace_plain(time.monotonic() + 10)  # the writer runs on past the stall
