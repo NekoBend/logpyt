@@ -261,9 +261,13 @@ def writer_command(rid: str, *, count: int, burst: int, pause: bool) -> str:
     stop = f"/data/local/tmp/lp-stop-{rid}"
     bursts = "".join(f"echo burst={rid}-$i; " for _ in range(burst))
     sleep = f"sleep {PERIOD}; " if pause else ""
+    # logwrapper can exit at its child's exit without reading what the pipe
+    # still holds: under a flood the last lines were lost in 1 of 3 runs on API
+    # 24, so the end line waits for the pipe to drain and logwrapper for it.
     loop = (
         f"i=0; while [ $i -lt {count} ] && [ ! -e {stop} ]; do "
-        f"echo seq={rid}-$i; {bursts}{sleep}i=$((i+1)); done; echo end={rid}-$i"
+        f"echo seq={rid}-$i; {bursts}{sleep}i=$((i+1)); done; "
+        f"sleep 1; echo end={rid}-$i; sleep 1"
     )
     return f"rm -f {stop}; nohup logwrapper sh -c '{loop}' > /dev/null 2>&1 &"
 
