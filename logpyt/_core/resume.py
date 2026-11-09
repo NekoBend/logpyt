@@ -114,11 +114,19 @@ the window restart at the line. Without it, a step during a connection
 followed by an outage that ends after the clock caught up would replay the
 lines read since the step with no Gap (the resume's clock check sees no
 step). A line stored that late is taken for a step too: the device's
-out-of-order lines recorded so far were about 86 ms late. So is a step from
-before the capture while the ring still holds it (a backlog or the first
-lines of a run read across it): the Gap is reported and the capture counts
-as incomplete although nothing was lost, until logd rotates the step out
-(user decision, design A.25: not told apart from a step during the capture).
+out-of-order lines recorded so far were about 86 ms late.
+
+A step from before the capture (user decision, design A.25): the ring can
+still hold a backward step that happened before the first clock read, and a
+backlog or the first lines of a run read across it. Nothing is lost then, so
+when the line at ``hw`` was logged before that read (stamped below ``N0 + 1 s``,
+or above every time that clock could show when the line was read), the stream
+re-anchors the same way with no Gap, and ``S`` stays. A clock read that shows
+the clock moved back since ``N0`` is always reported. Cost: a step during the
+capture goes unreported when no line stamped from ``N0 + 1 s`` on was read
+before it (its first second, or a device silent since the start) and the next
+clock read does not show it; a device clock stepped forward during the capture
+makes a later step look old in the same way.
 
 After a step (seen live or at a resume), until a request lies above the old
 ``hw`` (the highest line read before it), a resume's ``-T`` lies below lines
@@ -280,6 +288,7 @@ class _Plan:
     kind: _Kind | None  # None: no screen phase (backlog, or before the marker)
     request: int | None  # T_req or the start position; None reads the backlog
     shortened: bool = False  # the caps moved the request (overlap_shortened)
+    silent: bool = False  # a re-anchor at a step from before the capture
 
 
 @dataclass(slots=True, eq=False)
@@ -352,9 +361,12 @@ class ResumePlanner:
         "_ceiling",
         "_clock",
         "_clock_at",
+        "_first_at",
+        "_first_clock",
         "_floor",
         "_gapped",
         "_hw",
+        "_hw_at",
         "_keep",
         "_kept",
         "_last_read_at",
@@ -379,6 +391,7 @@ class ResumePlanner:
         "_start",
         "_started",
         "_step",
+        "_step_reported",
         "_window",
         "backlog_pruned",
         "device_lost",
@@ -427,6 +440,12 @@ class ResumePlanner:
         self._plan = _Plan(None, None)
         self._phase: _Phase | None = None
         self._gapped: int | None = None  # the hw a clock_moved_back Gap named
+        # The capture's first clock read and when it was issued: a line at hw
+        # logged before it is on the far side of a step from before the capture.
+        self._first_clock: int | None = None
+        self._first_at = 0.0
+        self._hw_at = 0.0  # when the line at hw was read (host-monotonic)
+        self._step_reported = False  # a step during the capture was reported
         # After a re-anchor, until the device clock passes it: the highest
         # timestamp read before the step.
         self._ceiling: int | None = None
@@ -516,7 +535,10 @@ class ResumePlanner:
             self._reset_window()
             self.out = [item for item in self.out if not isinstance(item, str)]
             self._plan = _Plan(None, clock - US_PER_SECOND)
+            self._first_clock, self._first_at = clock, issued
             return None
+        if self._first_clock is None:
+            self._first_clock, self._first_at = clock, issued
         if self._start is None:
             self._start = clock  # since="backlog": S is the first clock read
         hw = self._hw
@@ -529,10 +551,12 @@ class ResumePlanner:
             last = self._last_read_at
             outage = 0.0 if last is None else max(issued - last, 0.0)
             request = clock - round(outage * US_PER_SECOND) - self._overlap
-            self._plan = _Plan("reanchor", request)
-            if self._gapped == hw:
-                return None  # an earlier attempt reported this step already
+            silent = self._predates(hw) and not self._clock_fell(clock, issued)
+            self._plan = _Plan("reanchor", request, silent=silent)
+            if silent or self._gapped == hw:
+                return None  # from before the capture, or reported already
             self._gapped = hw
+            self._step_reported = True
             return Gap(
                 after=moment(hw),
                 before=moment(clock),
@@ -582,10 +606,22 @@ class ResumePlanner:
                 self._add(ts, entry.raw, nbytes)
 
     def marker(self, entry: LogEntry, nbytes: int, now: float) -> None:
-        """The start marker was read: ``S`` is its timestamp (design 5.6)."""
+        """The start marker was read: ``S`` is its timestamp (design 5.6).
+
+        Lines ahead of it stamped above it by more than the step bound lie on
+        the far side of a step from before the capture (design A.25): the
+        marker restarts the window, so it is windowed, and later requests stay
+        at or above it, because the lines ahead of it were not all windowed.
+        """
+        ts = self._stamp(entry)
+        hw = self._hw
+        stepped = ts is not None and hw is not None and ts < hw - self._step
+        if stepped:
+            assert ts is not None  # noqa: S101  (narrowed above)
+            self._reanchor_live(ts, report=False)
         self.before_start(entry, nbytes, now)
         self._started = True
-        self._floor = self._plan.request
+        self._floor = ts if stepped else self._plan.request
         self._start = self._prev_ts if self._prev_ts is not None else self._floor
 
     def screen(self, entry: LogEntry, nbytes: int, now: float) -> Verdict:
@@ -628,7 +664,8 @@ class ResumePlanner:
             and step is None
             and self._moved_back(ts)
         ):
-            self._reanchor_live(ts)  # a clock step back seen live (design A.25)
+            # A clock step back seen live (design A.25).
+            self._reanchor_live(ts, report=not self._predates(hw))
         if entry.tag == CHATTY_TAG:
             self._chatty(entry, ts, prev)
         if step == "unread":
@@ -714,7 +751,7 @@ class ResumePlanner:
             # chatty notices go by the re-anchored request instead.
             if self._floor is not None:
                 self._floor = min(self._floor, request)
-            if self._start is not None:
+            if self._start is not None and not plan.silent:
                 self._start = min(self._start, request)
             # The replay is over at the first new line logged after the
             # clock read, or once the window read before the step was.
@@ -988,32 +1025,60 @@ class ResumePlanner:
         phase = self._phase
         return phase is None or self._over(phase)
 
-    def _reanchor_live(self, ts: int) -> None:
+    def _predates(self, hw: int) -> bool:
+        """Whether the line at ``hw`` was logged before the capture (design A.25).
+
+        It is stamped below the first clock read's second, or above every time
+        that clock could show when the line was read. Once a step during the
+        capture was reported, times below the first read are the capture's.
+        """
+        first = self._first_clock
+        if first is None or self._step_reported:
+            return False
+        if hw < first + CLOCK_RESOLUTION:
+            return True
+        elapsed = max(self._hw_at - self._first_at, 0.0)
+        newest = first + CLOCK_RESOLUTION + CLOCK_SLACK
+        return hw > newest + round(elapsed * US_PER_SECOND)
+
+    def _clock_fell(self, clock: int, issued: float) -> bool:
+        """Whether a clock read shows the clock moved back since the first one."""
+        first = self._first_clock
+        if first is None:
+            return False
+        elapsed = max(issued - self._first_at, 0.0)
+        return clock < first + round(elapsed * US_PER_SECOND) - self._step
+
+    def _reanchor_live(self, ts: int, *, report: bool = True) -> None:
         """A clock step back seen live at a line stamped ``ts``: re-anchor there.
 
         ``Gap(clock_moved_back, after=hw, before=ts)`` at once, and the rules
         of the resume's re-anchor: the old window is kept for the replays of
         later connections, the old hw is the ceiling, the start and the
         floor of later requests drop to this line's request, and hw and the
-        window restart at the line, which the caller delivers.
+        window restart at the line, which the caller delivers. A step from
+        before the capture (``report`` False) has no Gap, and ``S`` stays:
+        what lies below it is not this capture's.
         """
         hw = self._hw
-        assert hw is not None  # noqa: S101  (checked by _moved_back)
-        self.out.append(
-            Gap(
-                after=moment(hw),
-                before=moment(ts),
-                lost=None,
-                reason="clock_moved_back",
+        assert hw is not None  # noqa: S101  (checked by the callers)
+        if report:
+            self.out.append(
+                Gap(
+                    after=moment(hw),
+                    before=moment(ts),
+                    lost=None,
+                    reason="clock_moved_back",
+                )
             )
-        )
-        self._gapped = hw
+            self._gapped = hw
+            self._step_reported = True
         self._keep_old(hw)
         self._ceiling = hw if self._ceiling is None else max(hw, self._ceiling)
         low = ts - self._overlap
         if self._floor is not None:
             self._floor = min(self._floor, low)
-        if self._start is not None:
+        if report and self._start is not None:
             self._start = min(self._start, low)
         phase = self._phase
         if phase is not None:
@@ -1091,6 +1156,7 @@ class ResumePlanner:
         window, late = self._window, self._late
         if hw is None or ts >= hw:
             hw = self._hw = ts
+            self._hw_at = self._last_read_at or 0.0
             window.append((ts, raw, nbytes))
             top = self._old_top
             if top is not None and ts - self._overlap > top:

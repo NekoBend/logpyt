@@ -428,17 +428,20 @@ def test_live_clock_step_then_caught_up_outage_reports_one_gap(
     t = fake_adb.device_now()
     fake_adb.device_log("a0", at=t - 3 * US)  # outside the window at the step
     fake_adb.device_log("a", at=t - US // 2)
-    fake_adb.device_log("b", at=t)
     records: list[object] = []
     stream_ = _open(driver, records)
     driver.start(stream_)
+    _read(records, 2)
+    # Past the first clock read's second, and a time the device clock can show:
+    # a line of the capture, so the step after it is reported (design A.25).
+    fake_adb.device_log("b", at=fake_adb.device_now() + US)
     _read(records, 3)
     fake_adb.step_clock(-3600)
     fake_adb.device_log("c1", "c2")
     _read(records, 5)
     fake_adb.release("cut")
     wait_until(lambda: len(fake_adb.calls("date")) >= 2, timeout=TIMEOUT)
-    fake_adb.step_clock(3600 + 2)  # the clock has caught up: past b
+    fake_adb.step_clock(3600 + 3)  # the clock has caught up: past b
     fake_adb.device_log("o1", "o2")
     fake_adb.release("caught-up")
     resumed = _logcat_calls(fake_adb, 2)[1]
@@ -463,6 +466,46 @@ def test_live_clock_step_then_caught_up_outage_reports_one_gap(
     assert stats.gaps == 1
     _assert_conserved(stream_)
     assert fake_adb.survivors() == []
+
+
+@pytest.mark.parametrize("since", ["backlog", "now"])
+def test_step_from_before_the_capture_gives_no_gap(
+    driver: Driver, fake_adb: FakeAdb, since: str
+) -> None:
+    """The ring holds a backward clock step from before the capture (an
+    emulator that synced its clock after booting): the capture reads across
+    it and nothing is lost, so no Gap and a complete capture (user decision,
+    design A.25). A reconnect replays no line, the old ones above every time
+    the device clock can show included.
+    """
+    fake_adb.device()
+    fake_adb.date(run(clock()))
+    fake_adb.logcat(run(stream(until="cut"), exit_code=255), run(stream()))
+    t = fake_adb.device_now()
+    fake_adb.device_log("old", at=t + 3600 * US)  # stamped before the sync
+    fake_adb.device_log("synced", at=t - 2 * US)
+    records: list[object] = []
+    stream_ = _open(driver, records, since=since, reconnect=Reconnect(delay=0.01))
+    driver.start(stream_)
+    expected = ["old", "synced"] if since == "backlog" else []
+    _read(records, len(expected))
+    driver.wait_running(stream_)
+    fake_adb.device_log("a", at=fake_adb.device_now() + US)
+    expected.append("a")
+    wait_until(lambda: _messages(records) == expected, timeout=TIMEOUT)
+    fake_adb.release("cut")
+    _logcat_calls(fake_adb, 2)
+    fake_adb.device_log("b", at=fake_adb.device_now() + US)
+    expected.append("b")
+    wait_until(lambda: "b" in _messages(records), timeout=TIMEOUT)
+    driver.stop(stream_)
+    driver.join(stream_)
+
+    assert _messages(records) == expected
+    assert _gaps(records) == []
+    assert stream_.stats.gaps == 0
+    assert stream_.stats.complete
+    _assert_conserved(stream_)
 
 
 def test_late_line_after_the_replayed_window_is_below_cursor(

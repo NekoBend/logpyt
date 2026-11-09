@@ -167,12 +167,13 @@ def test_live_clock_step_back_reports_a_gap_before_the_line() -> None:
     connection is a clock step seen live: Gap(clock_moved_back) right before
     it, the line delivered; the next resume requests the new times and drops
     the replay of both eras (design 5.6, A.25)."""
-    harness = Harness.make(reconnect=Reconnect(delay=1.0)).running(at("a", HW))
-    stepped = HW - 3600 * US
+    hw = (CLOCK + 1) * US  # past the first clock read's second: the capture's
+    harness = Harness.make(reconnect=Reconnect(delay=1.0)).running(at("a", hw))
+    stepped = hw - 3600 * US
 
     harness.stdout(at("b", stepped))
 
-    gap = Gap(moment(HW), moment(stepped), lost=None, reason="clock_moved_back")
+    gap = Gap(moment(hw), moment(stepped), lost=None, reason="clock_moved_back")
     emitted = records(harness)
     assert emitted.index(gap) == len(emitted) - 2  # right before "b"
     assert isinstance(emitted[-1], LogEntry)
@@ -183,7 +184,7 @@ def test_live_clock_step_back_reports_a_gap_before_the_line() -> None:
     reconnect(harness, stepped // US + 5)
     seconds, micro = divmod(stepped - 2 * US, US)
     assert spawn_T(harness) == f"{seconds}.{micro:06d}"
-    harness.stdout(at("a", HW) + at("b", stepped) + at("c", stepped + US))
+    harness.stdout(at("a", hw) + at("b", stepped) + at("c", stepped + US))
     assert harness.messages() == ["a", "b", "c"]
     stats = harness.core.stats()
     assert (stats.gaps, stats.deduplicated, stats.below_cursor) == (1, 2, 0)
@@ -198,8 +199,8 @@ def test_gap_found_mid_connection_precedes_the_open_group(found: str) -> None:
     harness = Harness.make(
         reconnect=Reconnect(delay=1.0),
         group_by=GroupBy(keys=("tag",), gap_ms=60_000.0, idle_flush_ms=None),
-    ).running(at("a", CLOCK * US))  # after S, the first clock read
-    t = CLOCK * US
+    ).running(at("a", (CLOCK + 1) * US))  # past the first clock read's second
+    t = (CLOCK + 1) * US
     line_ = chatty(3, t + 5) if found == "device_reported" else at("b", t - 3600 * US)
 
     harness.stdout(line_)
@@ -207,7 +208,7 @@ def test_gap_found_mid_connection_precedes_the_open_group(found: str) -> None:
     emitted = records(harness)
     (gap,) = [record for record in emitted if isinstance(record, Gap)]
     assert gap.reason == found
-    assert gap.after == moment(CLOCK * US)  # the time of "a"
+    assert gap.after == moment(t)  # the time of "a"
     (group,) = [record for record in emitted if isinstance(record, LogGroup)]
     assert [entry.message for entry in group] == ["a"]
     assert emitted.index(gap) < emitted.index(group)
@@ -221,7 +222,7 @@ def test_gap_found_mid_connection_precedes_held_lines(found: str) -> None:
     ``after`` time comes after the Gap (documented on Gap)."""
     harness = Harness.make(where=Package(APP), reconnect=Reconnect(delay=1.0))
     harness.connecting_spawned()
-    t = CLOCK * US  # after S, the first clock read
+    t = (CLOCK + 1) * US  # past the first clock read's second
     harness.stdout(at("a", t))  # held while the first lookup runs
     found_in = (
         chatty(5, t + 10) if found == "device_reported" else at("b", t - 3600 * US)

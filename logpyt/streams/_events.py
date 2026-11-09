@@ -84,9 +84,10 @@ class Gap:
     that late counts as a step too). ``after`` is the highest time read
     before, so ``before`` is below ``after``; lines stamped between them may
     be missing or, if read before the step, delivered again. A step from
-    before the capture counts as well while the device's ring still holds
-    it, because the capture reads across it: the Gap is reported, and
-    ``assert_complete()`` fails, although nothing was lost.
+    before the capture that the device's ring still holds gives no Gap,
+    because nothing was lost (design A.25). A step during the capture can go
+    unreported too when no line stamped from one second after the first
+    clock read on was read before it, and the next clock read does not show it.
 
     A Gap found while a connection reads (a chatty notice's
     ``"device_reported"``, or a ``"clock_moved_back"`` seen in a line) is

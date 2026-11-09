@@ -112,7 +112,8 @@ def test_writer_command_is_one_detached_loop() -> None:
     assert "'" not in loop
     assert loop.count("echo burst=0123abcd-$i;") == 3
     assert "sleep 0.01;" in loop
-    assert re.search(r"echo end=0123abcd-\$i$", loop)
+    # logwrapper can exit without reading what the pipe still holds (A.25).
+    assert re.search(r"; sleep 1; echo end=0123abcd-\$i; sleep 1$", loop)
 
 
 def test_notice_times_by_the_replaced_lines() -> None:
