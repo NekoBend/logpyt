@@ -75,3 +75,33 @@ jobs:
           py=smoke/bin/python
           [ -x "$py" ] || py=smoke/Scripts/python.exe
           "$py" -I -c "import importlib.metadata as m, logpyt; assert m.version('logpyt') == logpyt.__version__, (m.version('logpyt'), logpyt.__version__); assert 'site-packages' in logpyt.__file__, logpyt.__file__; print('logpyt', logpyt.__version__, 'from', logpyt.__file__)"
+
+  soak-smoke:
+    name: soak-smoke (ubuntu-latest, py3.14)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Soak smoke (120 s per driver)
+        env:
+          LOGPYT_SOAK_SECONDS: "120"
+          LOGPYT_SOAK_OUT: ${{ runner.temp }}/soak
+        # each test carries @pytest.mark.watchdog(duration + 180) = 300 s (A.5)
+        run: uv run pytest -q -s -m soak tests/soak
+
+      - name: Keep the soak samples
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-smoke
+          path: ${{ runner.temp }}/soak
