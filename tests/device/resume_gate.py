@@ -52,6 +52,7 @@ STALL_SECONDS = float(os.environ.get("LOGPYT_GATE_STALL", "60"))
 DISCONNECTS = 10  # design 9.4: 10 disconnects per run
 BURST = 8  # K byte-identical burst lines after each seq line
 PERIOD = 0.01  # the writer's pause between seq lines (10 ms)
+OVERWRITE_BATCH = 10  # seq lines per pause in the overwrite gate: about 870/s
 WAIT = 60.0  # bound of every wait for the device or the stream
 # Below the watchdog of the gate tests (their marker), which exits pytest
 # without finalizers: the run, the stop and the analysis.
@@ -234,7 +235,9 @@ class Bench(Protocol):
     serial: str | None
     kinds: tuple[str, ...]  # the disconnects it can make
 
-    def start_writer(self, rid: str, *, count: int, burst: int, pause: bool) -> None:
+    def start_writer(
+        self, rid: str, *, count: int, burst: int, pause: bool, batch: int = 1
+    ) -> None:
         """Start a detached writer of ``count`` seq lines (see the module docs)."""
         ...
 
@@ -256,17 +259,26 @@ class Bench(Protocol):
         ...
 
 
-def writer_command(rid: str, *, count: int, burst: int, pause: bool) -> str:
-    """The device shell command of a detached writer (one line per echo)."""
+def writer_command(
+    rid: str, *, count: int, burst: int, pause: bool, batch: int = 1
+) -> str:
+    """The device shell command of a detached writer (one line per echo).
+
+    ``batch`` seq lines come before each pause. A writer without a pause runs
+    at about 130 000 lines/s and loses most of them on the device, before any
+    reader (liblog; FINDINGS.md check 6, and a plain adb logcat on API 24 read
+    128 206 of about 1.2 million), so a gate that judges every line paces it.
+    """
     stop = f"/data/local/tmp/lp-stop-{rid}"
     bursts = "".join(f"echo burst={rid}-$i; " for _ in range(burst))
     sleep = f"sleep {PERIOD}; " if pause else ""
+    seqs = "".join(f"echo seq={rid}-$i; {bursts}i=$((i+1)); " for _ in range(batch))
     # logwrapper can exit at its child's exit without reading what the pipe
     # still holds: under a flood the last lines were lost in 1 of 3 runs on API
     # 24, so the end line waits for the pipe to drain and logwrapper for it.
     loop = (
         f"i=0; while [ $i -lt {count} ] && [ ! -e {stop} ]; do "
-        f"echo seq={rid}-$i; {bursts}{sleep}i=$((i+1)); done; "
+        f"{seqs}{sleep}done; "
         f"sleep 1; echo end={rid}-$i; sleep 1"
     )
     return f"rm -f {stop}; nohup logwrapper sh -c '{loop}' > /dev/null 2>&1 &"
@@ -292,10 +304,13 @@ class DeviceBench:
             raise RuntimeError(msg)
         return step
 
-    def start_writer(self, rid: str, *, count: int, burst: int, pause: bool) -> None:
-        self._shell(
-            f"writer_{rid}", writer_command(rid, count=count, burst=burst, pause=pause)
+    def start_writer(
+        self, rid: str, *, count: int, burst: int, pause: bool, batch: int = 1
+    ) -> None:
+        command = writer_command(
+            rid, count=count, burst=burst, pause=pause, batch=batch
         )
+        self._shell(f"writer_{rid}", command)
 
     def stop_writer(self, rid: str) -> None:
         self._shell(f"stop_{rid}", f"touch /data/local/tmp/lp-stop-{rid}")
@@ -443,7 +458,12 @@ def run_overwrite_gate(
     stream.start()
     try:
         stream.wait_running(WAIT)
-        bench.start_writer(rid, count=5_000_000, burst=0, pause=False)
+        # Fast enough to fill the outbox in seconds and wrap the ring within
+        # 30 s (9.4), slow enough to lose nothing on the device: lossless at
+        # 1700 lines/s on API 24, with no reader behind.
+        bench.start_writer(
+            rid, count=5_000_000, burst=0, pause=True, batch=OVERWRITE_BATCH
+        )
         wait_until(capture.stalled.is_set, timeout=WAIT)
         wait_until(capture.resumed.is_set, timeout=stall + WAIT)
         _pace_plain(time.monotonic() + 10)  # the writer runs on past the stall
